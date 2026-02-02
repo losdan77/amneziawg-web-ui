@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  amneziawg:
+    image: losdan/amneziawg-web-ui:latest
+    container_name: amneziawg-api
+    restart: unless-stopped
+    network_mode: host  # All ports accessible directly
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - /lib/modules:/lib/modules
+      - amneziawg-config:/etc/amneziawg
+    environment:
+      - NGINX_PORT=5000
+      - DEFAULT_PORT=51820
+      - DEFAULT_MTU=1420
+      - DEFAULT_SUBNET=10.0.0.0/24
+      - DEFAULT_DNS=8.8.8.8,1.1.1.1
+      - AUTO_START_SERVERS=true
+
+volumes:
+  amneziawg-config:
+    driver: local

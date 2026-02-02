@@ -1,0 +1,151 @@
+========================================
+BANDWIDTH MANAGEMENT - QUICK START GUIDE
+========================================
+
+✅ РЕАЛИЗАЦИЯ ЗАВЕРШЕНА!
+
+Что было сделано:
+-----------------
+1. Система управления bandwidth с 3 тарифами (Free, VIP, Super VIP)
+2. Веб-интерфейс для настройки тарифов
+3. Автоматическое применение лимитов через Linux tc
+4. API endpoints для управления тарифами
+5. Исправлены баги с IP адресами (переполнение и дубликаты)
+6. Исправлены line endings в shell скриптах
+7. Создан docker-compose.yml для удобного развертывания
+8. Обновлена документация
+
+Следующие шаги:
+--------------
+
+ШАJSON1: СОБЕРИТЕ DOCKER ОБРАЗ
+-------------------------------
+Откройте PowerShell в директории проекта:
+
+cd c:\Users\user1\Desktop\amneziawg-web-ui
+docker build -t losdan/amneziawg-web-ui:latest .
+
+ШАГJSON2: ЗАПУШТЕ В DOCKER HUB
+--------------------------------
+docker login
+docker push losdan/amneziawg-web-ui:latest
+
+ШАГ 3: РАЗВЕРНИТЕ НА VPS
+-------------------------
+Подключитесь к VPS и выполните:
+
+docker stop amneziawg-api
+docker rm amneziawg-api
+docker pull losdan/amneziawg-web-ui:latest
+
+docker run -d \
+  --name amneziawg-api \
+  --restart unless-stopped \
+  --privileged \
+  --device /dev/net/tun:/dev/net/tun \
+  --sysctl net.ipv4.ip_forward=1 \
+  -v /lib/modules:/lib/modules \
+  -v /etc/amneziawg:/etc/amneziawg \
+  -p 5000:5000 \
+  -p 51820-51830:51820-51830/udp \
+  losdan/amneziawg-web-ui:latest
+
+ШАГ 4: ПРОВЕРКА
+---------------
+1. Откройте браузер: http://your-vps-ip:5000
+2. Перейдите на вкладку "Bandwidth Settings"
+3. Проверьте тарифы:
+   - Free: 6 Mbit/s
+   - VIP: 50 Mbit/s  
+   - Super VIP: Unlimited
+
+ШАГ 5: ТЕСТИРОВАНИЕ
+-------------------
+1. Создайте тестовый сервер с Free тарифом
+2. Запустите сервер
+3. Создайте клиента (автоматически получит Free тариф)
+4. Скачайте конфиг и подключитесь
+5. Проверьте скорость (должно быть ~6 Mbit/s)
+6. Попробуйте изменить тариф сервера на VIP через кнопку "Change Tier"
+7. Проверьте скорость снова (должно быть ~50 Mbit/s)
+
+ВАЖНЫЕ ФАЙЛЫ:
+------------
+- IMPLEMENTATION_SUMMARY.md - Полное описание всех изменений
+- DEPLOY.md - Детальная инструкция по развертыванию
+- BANDWIDTH_SETUP.md - Руководство по настройке тарифов
+- docker-compose.yml - Альтернативный способ развертывания
+
+РЕКОМЕНДОВАННЫЕ НАСТРОЙКИ:
+--------------------------
+Free пользователи (6 Mbit/s):
+- YouTube 720p ✅
+- YouTube 1080p ❌ (будет буферизоваться)
+- Игры типа Clash Royale ✅
+- Веб-серфинг ✅
+
+VIP пользователи (50 Mbit/s):
+- YouTube 1080p ✅
+- YouTube 4K ⚠️ (возможно с задержками)
+- Стриминг HD ✅
+- Быстрые загрузки ✅
+
+Super VIP (Unlimited):
+- Без ограничений ✅
+- Полная скорость сервера ✅
+
+НАСТРОЙКА ТАРИФОВ:
+-----------------
+В веб-интерфейсе можете изменить:
+- Name: Название тарифа
+- Limit (Mbit/s): Постоянная скорость (0 = без ограничений)
+- Burst (Mbit/s): Кратковременная максимальная скорость
+
+После изменения нажмите "Update [Tier]" - лимиты применятся сразу!
+
+API ПРИМЕРЫ:
+-----------
+Получить все тарифы:
+curl http://your-vps:5000/api/bandwidth/tiers
+
+Изменить настройки тарифа Free:
+curl -X PUT http://your-vps:5000/api/bandwidth/tiers/free \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Free Plan", "limit_mbit": 10, "burst_mbit": 15}'
+
+Создать сервер с VIP тарифом:
+curl -X POST http://your-vps:5000/api/servers \
+  -H "Content-Type: application/json" \
+  -d '{"name": "VIP Server", "port": 51820, "subnet": "10.0.0.0/24", "bandwidth_tier": "vip"}'
+
+Изменить тариф сервера (применится ко всем клиентам):
+curl -X PUT http://your-vps:5000/api/servers/{server_id}/tier \
+  -H "Content-Type: application/json" \
+  -d '{"tier": "super_vip"}'
+
+TROUBLESHOOTING:
+---------------
+Если лимиты не работают:
+
+1. Проверьте логи:
+docker logs amneziawg-api
+
+2. Проверьте tc правила:
+docker exec -it amneziawg-api tc qdisc show
+
+3. Проверьте, что сервер запущен:
+docker exec -it amneziawg-api awg show
+
+4. Вручную примените правило (тест):
+docker exec -it amneziawg-api iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
+
+КОНТАКТЫ:
+---------
+Если возникли проблемы:
+1. Прочитайте DEPLOY.md (подробное руководство)
+2. Проверьте логи Docker
+3. Проверьте, что все порты открыты
+
+========================================
+УДАЧИ! 🚀
+========================================
