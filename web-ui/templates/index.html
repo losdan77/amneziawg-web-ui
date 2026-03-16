@@ -173,6 +173,34 @@
         </div>
 
         <!-- Servers List -->
+        <div class="bg-white rounded-lg shadow-md p-4 mb-4">
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-3 items-end">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">Client filter</label>
+                    <select id="clientExpiryFilter" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                        <option value="all">All clients</option>
+                        <option value="expiring_soon">Expiring soon</option>
+                        <option value="expired">Expired</option>
+                        <option value="active">Active only</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700">Soon window (days)</label>
+                    <input type="number" id="expiringSoonDays" value="14" min="1" max="365"
+                           class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                </div>
+                <div>
+                    <button id="resetClientFilterBtn"
+                            class="w-full bg-gray-500 text-white px-4 py-2 rounded-md hover:bg-gray-600 transition duration-200">
+                        Reset filter
+                    </button>
+                </div>
+                <div>
+                    <p id="clientFilterSummary" class="text-sm text-gray-600">Showing all clients</p>
+                </div>
+            </div>
+        </div>
+
         <div id="serversList" class="space-y-4">
             <div class="text-center py-8 text-gray-500">
                 Loading servers...

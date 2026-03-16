@@ -7,10 +7,12 @@ import uuid
 import base64
 import random
 import requests
+import calendar
 from flask import Flask, render_template, request, jsonify, send_file, send_from_directory
 from flask_socketio import SocketIO
 import threading
 import time
+from datetime import datetime, timezone
 
 # Get the absolute path to the current directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +26,7 @@ DEFAULT_MTU = int(os.getenv('DEFAULT_MTU', '1280'))
 DEFAULT_SUBNET = os.getenv('DEFAULT_SUBNET', '10.0.0.0/24')
 DEFAULT_PORT = int(os.getenv('DEFAULT_PORT', '51820'))
 DEFAULT_DNS = os.getenv('DEFAULT_DNS', '8.8.8.8,1.1.1.1')
+CLIENT_EXPIRATION_CHECK_INTERVAL = int(os.getenv('CLIENT_EXPIRATION_CHECK_INTERVAL', '60'))
 
 # Parse DNS servers from comma-separated string
 DNS_SERVERS = [dns.strip() for dns in DEFAULT_DNS.split(',') if dns.strip()]
@@ -77,13 +80,160 @@ socketio = SocketIO(
 
 class AmneziaManager:
     def __init__(self):
+        self.config_lock = threading.RLock()
+        self.stop_expiration_worker = threading.Event()
         self.config = self.load_config()
         self.ensure_directories()
         self.public_ip = self.detect_public_ip()
+        self.migrate_clients_expiration_fields()
 
         # Auto-start servers based on environment variable
         if AUTO_START_SERVERS:
             self.auto_start_servers()
+
+        self.start_client_expiration_worker()
+
+    def _normalize_duration_code(self, duration_code):
+        """Normalize user-provided duration to internal code."""
+        if duration_code is None:
+            return "forever"
+
+        duration_text = str(duration_code).strip().lower()
+        aliases = {
+            "1m": "1m",
+            "month": "1m",
+            "1month": "1m",
+            "3m": "3m",
+            "3months": "3m",
+            "6m": "6m",
+            "6months": "6m",
+            "12m": "12m",
+            "year": "12m",
+            "1y": "12m",
+            "12months": "12m",
+            "forever": "forever",
+            "permanent": "forever",
+            "lifetime": "forever",
+            "unlimited": "forever",
+            "navsegda": "forever",
+            "навсегда": "forever"
+        }
+        normalized = aliases.get(duration_text)
+        if not normalized:
+            raise ValueError(f"Unsupported client duration: {duration_code}")
+        return normalized
+
+    def _duration_label(self, duration_code):
+        labels = {
+            "1m": "1 month",
+            "3m": "3 months",
+            "6m": "6 months",
+            "12m": "1 year",
+            "forever": "Forever"
+        }
+        return labels.get(duration_code, "Forever")
+
+    def _add_calendar_months_utc(self, base_ts, months):
+        """Add calendar months in UTC without fixed-day approximations."""
+        dt = datetime.fromtimestamp(base_ts, tz=timezone.utc)
+        month_index = dt.month - 1 + months
+        year = dt.year + month_index // 12
+        month = month_index % 12 + 1
+        day = min(dt.day, calendar.monthrange(year, month)[1])
+        shifted = dt.replace(year=year, month=month, day=day)
+        return shifted.timestamp()
+
+    def _calculate_expires_at(self, duration_code, base_ts):
+        duration = self._normalize_duration_code(duration_code)
+        months_map = {"1m": 1, "3m": 3, "6m": 6, "12m": 12}
+        if duration == "forever":
+            return None
+        return self._add_calendar_months_utc(base_ts, months_map[duration])
+
+    def _is_client_expired(self, client_config, now_ts=None):
+        expires_at = client_config.get("expires_at")
+        if expires_at is None:
+            return False
+        now_value = now_ts if now_ts is not None else time.time()
+        return now_value >= float(expires_at)
+
+    def _sync_client_expiration_fields(self, server_client, global_client, duration_code, expires_at):
+        duration_label = self._duration_label(duration_code)
+        updates = {
+            "duration_code": duration_code,
+            "duration_label": duration_label,
+            "expires_at": expires_at
+        }
+        for key, value in updates.items():
+            server_client[key] = value
+            if global_client is not None:
+                global_client[key] = value
+
+    def migrate_clients_expiration_fields(self):
+        """Backfill expiration fields for old clients after upgrades."""
+        updated = False
+        now_ts = time.time()
+
+        for server in self.config.get("servers", []):
+            for server_client in server.get("clients", []):
+                global_client = self.config.get("clients", {}).get(server_client.get("id"))
+                raw_duration = server_client.get("duration_code") or (global_client or {}).get("duration_code") or "forever"
+                created_at = server_client.get("created_at") or (global_client or {}).get("created_at") or now_ts
+                expires_at = server_client.get("expires_at")
+                if expires_at is None and global_client is not None:
+                    expires_at = global_client.get("expires_at")
+
+                try:
+                    duration_code = self._normalize_duration_code(raw_duration)
+                except ValueError:
+                    duration_code = "forever"
+
+                if duration_code != "forever" and expires_at is None:
+                    expires_at = self._calculate_expires_at(duration_code, created_at)
+                    updated = True
+
+                if "duration_code" not in server_client or "duration_label" not in server_client or "expires_at" not in server_client:
+                    updated = True
+                if global_client is not None and (
+                    "duration_code" not in global_client or "duration_label" not in global_client or "expires_at" not in global_client
+                ):
+                    updated = True
+
+                self._sync_client_expiration_fields(server_client, global_client, duration_code, expires_at)
+
+        if updated:
+            self.save_config()
+
+    def prune_expired_clients(self):
+        """Delete expired clients and return list of removed IDs."""
+        expired_clients = []
+        now_ts = time.time()
+
+        with self.config_lock:
+            for client_id, client in list(self.config.get("clients", {}).items()):
+                if self._is_client_expired(client, now_ts):
+                    expired_clients.append((client.get("server_id"), client_id))
+
+        removed_ids = []
+        for server_id, client_id in expired_clients:
+            if server_id and self.delete_client(server_id, client_id, reason="expired"):
+                removed_ids.append(client_id)
+        return removed_ids
+
+    def client_expiration_worker(self):
+        """Background worker that removes expired clients."""
+        while not self.stop_expiration_worker.is_set():
+            try:
+                removed_ids = self.prune_expired_clients()
+                if removed_ids:
+                    print(f"Expired clients removed: {', '.join(removed_ids)}")
+            except Exception as e:
+                print(f"Failed to prune expired clients: {e}")
+            self.stop_expiration_worker.wait(CLIENT_EXPIRATION_CHECK_INTERVAL)
+
+    def start_client_expiration_worker(self):
+        worker = threading.Thread(target=self.client_expiration_worker, daemon=True)
+        worker.start()
 
     def ensure_directories(self):
         os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -171,8 +321,9 @@ class AmneziaManager:
         }
 
     def save_config(self):
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(self.config, f, indent=2)
+        with self.config_lock:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(self.config, f, indent=2)
 
     def execute_command(self, command):
         """Execute shell command and return result"""
@@ -436,7 +587,7 @@ H4 = {obfuscation_params['H4']}
         self.save_config()
         return True
 
-    def add_wireguard_client(self, server_id, client_name):
+    def add_wireguard_client(self, server_id, client_name, duration_code="forever"):
         """Add a client to a WireGuard server"""
         server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
         if not server:
@@ -458,25 +609,33 @@ H4 = {obfuscation_params['H4']}
         # Get bandwidth tier from server
         tier = server.get('bandwidth_tier', 'free')
 
+        created_at = time.time()
+        normalized_duration = self._normalize_duration_code(duration_code)
+        expires_at = self._calculate_expires_at(normalized_duration, created_at)
+
         client_config = {
             "id": client_id,
             "name": client_name,
             "server_id": server_id,
             "server_name": server["name"],
             "status": "inactive",
-            "created_at": time.time(),
+            "created_at": created_at,
             "client_private_key": client_keys["private_key"],
             "client_public_key": client_keys["public_key"],
             "preshared_key": preshared_key,
             "client_ip": client_ip,
             "bandwidth_tier": tier,
             "obfuscation_enabled": server["obfuscation_enabled"],
-            "obfuscation_params": server["obfuscation_params"]
+            "obfuscation_params": server["obfuscation_params"],
+            "duration_code": normalized_duration,
+            "duration_label": self._duration_label(normalized_duration),
+            "expires_at": expires_at,
+            "extended_count": 0
         }
 
         # Add client to server config
         client_peer_config = f"""
-# Client: {client_config['name']}
+# Client: {client_config['name']} ({client_config['id']})
 [Peer]
 PublicKey = {client_keys['public_key']}
 PresharedKey = {preshared_key}
@@ -504,7 +663,7 @@ AllowedIPs = {client_ip}/32
         config_content = self.generate_wireguard_client_config(server, client_config, include_comments=True)
         return client_config, config_content
 
-    def delete_client(self, server_id, client_id):
+    def delete_client(self, server_id, client_id, reason="manual"):
         """Delete a client from a server and update the config file"""
         server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
         if not server:
@@ -530,9 +689,42 @@ AllowedIPs = {client_ip}/32
         if server['status'] == 'running':
             self.apply_live_config(server['interface'])
             
-        print(f"Client {server['name']}:{client['name']} removed")
+        print(f"Client {server['name']}:{client['name']} removed ({reason})")
 
         return True
+
+    def extend_client(self, server_id, client_id, duration_code):
+        """Extend client expiration by duration from current expiry or now."""
+        normalized_duration = self._normalize_duration_code(duration_code)
+        now_ts = time.time()
+
+        with self.config_lock:
+            server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
+            if not server:
+                return None, "Server not found"
+
+            server_client = next((c for c in server["clients"] if c["id"] == client_id), None)
+            if not server_client:
+                return None, "Client not found"
+
+            global_client = self.config["clients"].get(client_id)
+
+            current_expires_at = server_client.get("expires_at")
+            if current_expires_at is not None:
+                base_ts = max(float(current_expires_at), now_ts)
+            else:
+                base_ts = now_ts
+
+            new_expires_at = self._calculate_expires_at(normalized_duration, base_ts)
+            self._sync_client_expiration_fields(server_client, global_client, normalized_duration, new_expires_at)
+
+            new_extended_count = int(server_client.get("extended_count", 0)) + 1
+            server_client["extended_count"] = new_extended_count
+            if global_client is not None:
+                global_client["extended_count"] = new_extended_count
+
+            self.save_config()
+            return server_client, None
     
     def rewrite_server_conf_without_client(self, server, client):
         """Rewrite the server conf file without the specified client's [Peer] block"""
@@ -544,13 +736,16 @@ AllowedIPs = {client_ip}/32
 
         new_lines = []
         skip = False
-        client_marker = f"# Client: {client['name']}"
+        client_id = client.get("id")
+        client_name = client.get("name", "")
+        old_client_marker = f"# Client: {client_name}"
+        new_client_marker = f"# Client: {client_name} ({client_id})"
 
         for line in lines:
             stripped = line.strip()
 
             # Start skipping when we find the client marker line
-            if stripped == client_marker:
+            if stripped in (old_client_marker, new_client_marker):
                 skip = True
                 continue
 
@@ -864,10 +1059,55 @@ PersistentKeepalive = 25
 
     def get_client_configs(self, server_id=None):
         """Get all client configs, optionally filtered by server"""
+        self.prune_expired_clients()
         if server_id:
             return [client for client in self.config["clients"].values()
                    if client.get("server_id") == server_id]
         return list(self.config["clients"].values())
+
+    def get_clients_expiring_within(self, days=3, include_expired=False):
+        """Return clients expiring within N days for reminder workflows."""
+        self.prune_expired_clients()
+
+        now_ts = time.time()
+        window_ts = max(int(days), 0) * 24 * 60 * 60
+        deadline_ts = now_ts + window_ts
+        results = []
+
+        for client in self.config.get("clients", {}).values():
+            expires_at = client.get("expires_at")
+            if expires_at is None:
+                continue
+
+            try:
+                expires_at = float(expires_at)
+            except (TypeError, ValueError):
+                continue
+
+            is_expired = expires_at <= now_ts
+            if is_expired and not include_expired:
+                continue
+            if not is_expired and expires_at > deadline_ts:
+                continue
+
+            results.append({
+                "client_id": client.get("id"),
+                "client_name": client.get("name"),
+                "server_id": client.get("server_id"),
+                "server_name": client.get("server_name"),
+                "client_ip": client.get("client_ip"),
+                "duration_code": client.get("duration_code"),
+                "duration_label": client.get("duration_label"),
+                "created_at": client.get("created_at"),
+                "expires_at": expires_at,
+                "expires_at_iso": datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
+                "seconds_left": int(expires_at - now_ts),
+                "days_left": round((expires_at - now_ts) / (24 * 60 * 60), 3),
+                "status": "expired" if is_expired else "active",
+            })
+
+        results.sort(key=lambda item: item["expires_at"])
+        return results
 
     def get_traffic_for_server(self, server_id):
         server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
@@ -960,8 +1200,13 @@ def get_server_clients(server_id):
 def add_client(server_id):
     data = request.json
     client_name = data.get('name', 'New Client')
+    duration_code = data.get('duration', 'forever')
 
-    result = amnezia_manager.add_wireguard_client(server_id, client_name)
+    try:
+        result = amnezia_manager.add_wireguard_client(server_id, client_name, duration_code)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
     if result:
         client_config, config_content = result
         return jsonify({
@@ -969,6 +1214,28 @@ def add_client(server_id):
             "config": config_content
         })
     return jsonify({"error": "Server not found"}), 404
+
+@app.route('/api/servers/<server_id>/clients/<client_id>/extend', methods=['POST'])
+def extend_client(server_id, client_id):
+    data = request.json or {}
+    duration_code = data.get('duration', '1m')
+
+    try:
+        client, error = amnezia_manager.extend_client(server_id, client_id, duration_code)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    if error:
+        return jsonify({"error": error}), 404
+
+    return jsonify({
+        "status": "extended",
+        "client_id": client_id,
+        "duration_code": client.get("duration_code"),
+        "duration_label": client.get("duration_label"),
+        "expires_at": client.get("expires_at"),
+        "extended_count": client.get("extended_count", 0)
+    })
 
 @app.route('/api/servers/<server_id>/clients/<client_id>', methods=['DELETE'])
 def delete_client(server_id, client_id):
@@ -1003,6 +1270,32 @@ def download_client_config(server_id, client_id):
 def get_all_clients():
     clients = amnezia_manager.get_client_configs()
     return jsonify(clients)
+
+@app.route('/api/bot/reminders/expiring-clients', methods=['GET'])
+def get_expiring_clients_for_bot():
+    """
+    Bot endpoint for renewal reminders.
+    Access control is expected at reverse proxy level (nginx auth).
+    """
+    try:
+        days = int(request.args.get('days', '3'))
+    except ValueError:
+        return jsonify({"error": "days must be integer"}), 400
+
+    if days < 0 or days > 365:
+        return jsonify({"error": "days must be between 0 and 365"}), 400
+
+    include_expired = request.args.get('include_expired', 'false').lower() in ('1', 'true', 'yes')
+    clients = amnezia_manager.get_clients_expiring_within(days=days, include_expired=include_expired)
+
+    return jsonify({
+        "days": days,
+        "include_expired": include_expired,
+        "count": len(clients),
+        "generated_at": time.time(),
+        "generated_at_iso": datetime.now(timezone.utc).isoformat(),
+        "clients": clients
+    })
 
 @app.route('/api/bandwidth/tiers', methods=['GET'])
 def get_bandwidth_tiers():
@@ -1163,6 +1456,8 @@ def get_server_info(server_id):
 
 @app.route('/api/servers', methods=['GET'])
 def get_servers():
+    amnezia_manager.prune_expired_clients()
+
     # Update server status based on actual interface state
     for server in amnezia_manager.config["servers"]:
         server["status"] = amnezia_manager.get_server_status(server["id"])

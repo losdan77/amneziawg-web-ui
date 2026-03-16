@@ -2,6 +2,8 @@
 class AmneziaApp {
     constructor() {
         this.socket = null;
+        this.clientFilterMode = 'all';
+        this.expiringSoonDays = 14;
         this.init();
     }
 
@@ -70,6 +72,41 @@ class AmneziaApp {
 
         // Form validation listeners
         this.setupFormValidation();
+
+        // Client expiration filter controls
+        const clientExpiryFilter = this.getElement('clientExpiryFilter');
+        if (clientExpiryFilter) {
+            clientExpiryFilter.addEventListener('change', (e) => {
+                this.clientFilterMode = e.target.value || 'all';
+                this.loadServers();
+            });
+        }
+
+        const expiringSoonDays = this.getElement('expiringSoonDays');
+        if (expiringSoonDays) {
+            expiringSoonDays.addEventListener('input', (e) => {
+                const parsed = parseInt(e.target.value, 10);
+                if (!Number.isNaN(parsed) && parsed > 0) {
+                    this.expiringSoonDays = parsed;
+                    this.loadServers();
+                }
+            });
+        }
+
+        const resetClientFilterBtn = this.getElement('resetClientFilterBtn');
+        if (resetClientFilterBtn) {
+            resetClientFilterBtn.addEventListener('click', () => {
+                this.clientFilterMode = 'all';
+                this.expiringSoonDays = 14;
+                if (clientExpiryFilter) {
+                    clientExpiryFilter.value = 'all';
+                }
+                if (expiringSoonDays) {
+                    expiringSoonDays.value = '14';
+                }
+                this.loadServers();
+            });
+        }
     }
 
     setupFormValidation() {
@@ -508,6 +545,7 @@ class AmneziaApp {
     loadInitialData() {
         this.loadServers();
         this.loadPublicIp();
+        setInterval(() => this.loadServers(), 30000);
     }
 
     loadPublicIp() {
@@ -536,6 +574,13 @@ class AmneziaApp {
     renderServers(servers) {
         const serversList = this.getElement('serversList');
         if (!serversList) return;
+
+        const totalClients = servers.reduce((acc, server) => acc + ((server.clients || []).length), 0);
+        const shownClients = servers.reduce((acc, server) => {
+            const serverClients = Array.isArray(server.clients) ? server.clients : [];
+            return acc + this.applyClientFilter(serverClients).length;
+        }, 0);
+        this.updateClientFilterSummary(totalClients, shownClients);
 
         if (servers.length === 0) {
             serversList.innerHTML = `
@@ -599,15 +644,22 @@ class AmneziaApp {
     }
 
     renderServerClients(serverId, clients, traffic = {}) {
+        const filteredClients = this.applyClientFilter(clients);
+
         if (clients.length === 0) {
             return '<p class="text-gray-500 text-sm">No clients yet.</p>';
         }
+
+        if (filteredClients.length === 0) {
+            return '<p class="text-gray-500 text-sm">No clients match current filter.</p>';
+        }
         
         return `
-            <h4 class="font-medium mb-2">Clients (${clients.length}):</h4>
+            <h4 class="font-medium mb-2">Clients (${filteredClients.length}/${clients.length}):</h4>
             <div class="space-y-2">
-                ${clients.map(client => {
+                ${filteredClients.map(client => {
                     const clientTraffic = traffic[client.id] || {received: '0 B', sent: '0 B'};
+                    const expirationInfo = this.getClientExpirationInfo(client);
                     return `
                     <div class="flex justify-between items-center bg-gray-50 p-3 rounded-lg hover:bg-gray-100 transition-colors duration-200">
                         <div class="flex items-center">
@@ -620,12 +672,20 @@ class AmneziaApp {
                                 <span class="font-medium">${client.name}</span>
                                 <span class="text-sm text-gray-600 ml-2">${client.client_ip}</span>
                                 ${this.getTierBadge(client.bandwidth_tier || 'free')}
+                                <span class="text-xs ${expirationInfo.colorClass}" title="${expirationInfo.tooltip}">
+                                    ${expirationInfo.text}
+                                </span>
                                 <span class="text-xs text-gray-500 ml-6" style="margin-left: 0.5cm;">
                                     ⬇️ ${clientTraffic.received} &nbsp; ⬆️ ${clientTraffic.sent}
                                 </span>
                             </div>
                         </div>
                         <div class="flex space-x-2">
+                            <button onclick="amneziaApp.openExtendClientDialog('${serverId}', '${client.id}', '${this.escapeHtml(client.name)}')"
+                                    class="bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white px-3 py-1.5 rounded-lg text-sm font-medium transition-all duration-200 shadow hover:shadow-md flex items-center"
+                                    title="Extend subscription">
+                                + Extend
+                            </button>
                             <button onclick="amneziaApp.showClientQRCode('${serverId}', '${client.id}', '${client.name}')"
                                     class="bg-gradient-to-r from-purple-500 to-indigo-500 hover:from-purple-600 hover:to-indigo-600 text-white px-3 py-1.5 rounded-lg text-sm font-medium transition-all duration-200 shadow hover:shadow-md flex items-center"
                                     title="Show QR Code">
@@ -654,6 +714,69 @@ class AmneziaApp {
                 }).join('')}
             </div>
         `;
+    }
+
+    getClientExpiryState(client) {
+        const expiresAt = client.expires_at;
+        if (expiresAt === null || expiresAt === undefined) {
+            return { kind: 'permanent', diffMs: Infinity };
+        }
+
+        const expiresMs = Number(expiresAt) * 1000;
+        const diffMs = expiresMs - Date.now();
+        if (diffMs <= 0) {
+            return { kind: 'expired', diffMs: diffMs };
+        }
+
+        const soonThresholdMs = this.expiringSoonDays * 24 * 60 * 60 * 1000;
+        if (diffMs <= soonThresholdMs) {
+            return { kind: 'expiring_soon', diffMs: diffMs };
+        }
+
+        return { kind: 'active', diffMs: diffMs };
+    }
+
+    applyClientFilter(clients) {
+        if (!Array.isArray(clients) || this.clientFilterMode === 'all') {
+            return clients;
+        }
+
+        if (this.clientFilterMode === 'expired') {
+            return clients.filter(client => this.getClientExpiryState(client).kind === 'expired');
+        }
+
+        if (this.clientFilterMode === 'expiring_soon') {
+            return clients.filter(client => this.getClientExpiryState(client).kind === 'expiring_soon');
+        }
+
+        if (this.clientFilterMode === 'active') {
+            return clients.filter(client => {
+                const state = this.getClientExpiryState(client).kind;
+                return state === 'active' || state === 'expiring_soon';
+            });
+        }
+
+        return clients;
+    }
+
+    updateClientFilterSummary(totalCount, shownCount) {
+        const summary = this.getElement('clientFilterSummary');
+        if (!summary) {
+            return;
+        }
+
+        if (this.clientFilterMode === 'all') {
+            summary.textContent = `Showing all clients (${shownCount})`;
+            return;
+        }
+
+        const modeLabels = {
+            expiring_soon: `expiring in ${this.expiringSoonDays} days`,
+            expired: 'expired clients',
+            active: 'active clients'
+        };
+        const modeLabel = modeLabels[this.clientFilterMode] || this.clientFilterMode;
+        summary.textContent = `Showing ${shownCount}/${totalCount} ${modeLabel}`;
     }
 
     loadServerClients(serverId) {
@@ -723,21 +846,222 @@ class AmneziaApp {
     }
 
     addClient(serverId) {
-        const clientName = prompt('Enter client name:');
-        if (clientName) {
-            fetch(`/api/servers/${serverId}/clients`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ name: clientName })
-            })
-            .then(() => this.loadServers())
-            .catch(error => {
-                console.error('Error adding client:', error);
-                alert('Error adding client: ' + error.message);
-            });
+        this.openAddClientDialog(serverId);
+    }
+
+    getDurationOptions(selectedValue = '1m') {
+        const options = [
+            { value: '1m', label: '1 month' },
+            { value: '3m', label: '3 months' },
+            { value: '6m', label: '6 months' },
+            { value: '12m', label: '1 year' },
+            { value: 'forever', label: 'Forever' }
+        ];
+        return options.map(option => {
+            const selected = option.value === selectedValue ? 'selected' : '';
+            return `<option value="${option.value}" ${selected}>${option.label}</option>`;
+        }).join('');
+    }
+
+    openAddClientDialog(serverId) {
+        this.closeAddClientDialog();
+        const dialogHTML = `
+            <div id="addClientDialog" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                <div class="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+                    <h3 class="text-xl font-semibold mb-4">Add Client</h3>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Client Name</label>
+                            <input id="newClientName" type="text" class="w-full border border-gray-300 rounded-md px-3 py-2" placeholder="Client name">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Access Duration</label>
+                            <select id="newClientDuration" class="w-full border border-gray-300 rounded-md px-3 py-2">
+                                ${this.getDurationOptions('1m')}
+                            </select>
+                        </div>
+                    </div>
+                    <div class="mt-6 flex justify-end space-x-3">
+                        <button onclick="amneziaApp.closeAddClientDialog()" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">
+                            Cancel
+                        </button>
+                        <button onclick="amneziaApp.confirmAddClient('${serverId}')" class="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600">
+                            Create Client
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.insertAdjacentHTML('beforeend', dialogHTML);
+    }
+
+    closeAddClientDialog() {
+        const dialog = document.getElementById('addClientDialog');
+        if (dialog) {
+            dialog.remove();
         }
+    }
+
+    confirmAddClient(serverId) {
+        const nameInput = document.getElementById('newClientName');
+        const durationSelect = document.getElementById('newClientDuration');
+        const clientName = nameInput ? nameInput.value.trim() : '';
+        const duration = durationSelect ? durationSelect.value : '1m';
+
+        if (!clientName) {
+            this.showTempMessage('Client name is required', 'error');
+            return;
+        }
+
+        fetch(`/api/servers/${serverId}/clients`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ name: clientName, duration: duration })
+        })
+        .then(async response => {
+            const data = await response.json();
+            if (!response.ok) {
+                throw new Error(data.error || `HTTP ${response.status}`);
+            }
+            return data;
+        })
+        .then(() => {
+            this.closeAddClientDialog();
+            this.showTempMessage('Client created successfully', 'success');
+            this.loadServers();
+        })
+        .catch(error => {
+            console.error('Error adding client:', error);
+            this.showTempMessage('Error adding client: ' + error.message, 'error');
+        });
+    }
+
+    openExtendClientDialog(serverId, clientId, clientName) {
+        this.closeExtendClientDialog();
+        const safeName = this.escapeHtml(clientName);
+        const dialogHTML = `
+            <div id="extendClientDialog" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                <div class="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+                    <h3 class="text-xl font-semibold mb-2">Extend Client</h3>
+                    <p class="text-sm text-gray-600 mb-4">${safeName}</p>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Extend by</label>
+                        <select id="extendClientDuration" class="w-full border border-gray-300 rounded-md px-3 py-2">
+                            ${this.getDurationOptions('1m')}
+                        </select>
+                    </div>
+                    <div class="mt-6 flex justify-end space-x-3">
+                        <button onclick="amneziaApp.closeExtendClientDialog()" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">
+                            Cancel
+                        </button>
+                        <button onclick="amneziaApp.confirmExtendClient('${serverId}', '${clientId}')" class="px-4 py-2 bg-amber-500 text-white rounded-md hover:bg-amber-600">
+                            Extend
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.insertAdjacentHTML('beforeend', dialogHTML);
+    }
+
+    closeExtendClientDialog() {
+        const dialog = document.getElementById('extendClientDialog');
+        if (dialog) {
+            dialog.remove();
+        }
+    }
+
+    confirmExtendClient(serverId, clientId) {
+        const durationSelect = document.getElementById('extendClientDuration');
+        const duration = durationSelect ? durationSelect.value : '1m';
+
+        fetch(`/api/servers/${serverId}/clients/${clientId}/extend`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ duration: duration })
+        })
+        .then(async response => {
+            const data = await response.json();
+            if (!response.ok) {
+                throw new Error(data.error || `HTTP ${response.status}`);
+            }
+            return data;
+        })
+        .then(data => {
+            this.closeExtendClientDialog();
+            const expiresText = data.expires_at ? this.formatDateTime(data.expires_at) : 'Forever';
+            this.showTempMessage(`Extended successfully. New expiry: ${expiresText}`, 'success');
+            this.loadServers();
+        })
+        .catch(error => {
+            console.error('Error extending client:', error);
+            this.showTempMessage('Error extending client: ' + error.message, 'error');
+        });
+    }
+
+    formatDateTime(unixTs) {
+        if (unixTs === null || unixTs === undefined) {
+            return 'Forever';
+        }
+        const date = new Date(Number(unixTs) * 1000);
+        if (Number.isNaN(date.getTime())) {
+            return 'Unknown';
+        }
+        return date.toLocaleString();
+    }
+
+    getClientExpirationInfo(client) {
+        const expiresAt = client.expires_at;
+        if (expiresAt === null || expiresAt === undefined) {
+            return {
+                text: 'No expiry',
+                tooltip: 'Client is permanent',
+                colorClass: 'text-green-700 bg-green-100 px-2 py-1 rounded'
+            };
+        }
+
+        const expiresMs = Number(expiresAt) * 1000;
+        const nowMs = Date.now();
+        const diffMs = expiresMs - nowMs;
+        const hours = Math.floor(diffMs / (1000 * 60 * 60));
+        const days = Math.floor(hours / 24);
+
+        let statusText = '';
+        let colorClass = 'text-blue-700 bg-blue-100 px-2 py-1 rounded';
+
+        if (diffMs <= 0) {
+            statusText = 'Expired';
+            colorClass = 'text-red-700 bg-red-100 px-2 py-1 rounded';
+        } else if (days <= 3) {
+            statusText = `Expires in ${Math.max(hours, 1)}h`;
+            colorClass = 'text-red-700 bg-red-100 px-2 py-1 rounded';
+        } else if (days <= 14) {
+            statusText = `Expires in ${days}d`;
+            colorClass = 'text-amber-700 bg-amber-100 px-2 py-1 rounded';
+        } else {
+            statusText = `Expires in ${days}d`;
+        }
+
+        return {
+            text: statusText,
+            tooltip: `Expires at ${this.formatDateTime(expiresAt)}`,
+            colorClass: colorClass
+        };
+    }
+
+    escapeHtml(text) {
+        const replacements = {
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#039;'
+        };
+        return String(text).replace(/[&<>"']/g, char => replacements[char]);
     }
 
     downloadClientConfig(serverId, clientId) {
