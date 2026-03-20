@@ -70,6 +70,23 @@ class AmneziaApp {
             this.toggleObfuscationParams(obfuscationCheckbox.checked);
         }
 
+        const serverMode = this.getElement('serverMode');
+        if (serverMode) {
+            serverMode.addEventListener('change', (e) => {
+                this.toggleUpstreamSettings(e.target.value === 'edge_linked');
+            });
+            this.toggleUpstreamSettings(serverMode.value === 'edge_linked');
+        }
+
+        const upstreamImportConfig = this.getElement('upstreamImportConfig');
+        if (upstreamImportConfig) {
+            upstreamImportConfig.addEventListener('input', () => {
+                this.hideError('upstreamImportError');
+                this.updateUpstreamConfigPreview(upstreamImportConfig.value);
+            });
+            this.updateUpstreamConfigPreview(upstreamImportConfig.value || '');
+        }
+
         // Form validation listeners
         this.setupFormValidation();
 
@@ -144,6 +161,123 @@ class AmneziaApp {
         const obfuscationParams = this.getElement('obfuscationParams');
         if (obfuscationParams) {
             obfuscationParams.style.display = show ? 'block' : 'none';
+        }
+    }
+
+    toggleUpstreamSettings(show) {
+        const upstreamSettings = this.getElement('upstreamSettings');
+        if (upstreamSettings) {
+            upstreamSettings.classList.toggle('hidden', !show);
+        }
+        const obfuscationToggleRow = this.getElement('obfuscationToggleRow');
+        const obfuscationCheckbox = this.getElement('enableObfuscation');
+        const obfuscationParams = this.getElement('obfuscationParams');
+        const obfuscationError = this.getElement('obfuscationError');
+
+        if (obfuscationToggleRow) {
+            obfuscationToggleRow.classList.toggle('hidden', show);
+        }
+        if (obfuscationCheckbox) {
+            if (show) {
+                obfuscationCheckbox.checked = true;
+                obfuscationCheckbox.disabled = true;
+            } else {
+                obfuscationCheckbox.disabled = false;
+            }
+            this.toggleObfuscationParams(show ? false : obfuscationCheckbox.checked);
+        }
+        if (obfuscationParams) {
+            obfuscationParams.classList.toggle('hidden', show);
+            const controls = obfuscationParams.querySelectorAll('input, select, textarea, button');
+            controls.forEach((control) => {
+                control.disabled = show;
+            });
+        }
+        if (obfuscationError) {
+            obfuscationError.classList.add('hidden');
+        }
+        if (show) {
+            const upstreamImportConfig = this.getElement('upstreamImportConfig');
+            this.updateUpstreamConfigPreview(upstreamImportConfig ? upstreamImportConfig.value : '');
+        }
+    }
+
+    parseAmneziaConfigPreview(configText) {
+        const text = (configText || '').trim();
+        if (!text) return null;
+
+        const sections = { Interface: {}, Peer: {} };
+        let currentSection = null;
+        text.split(/\r?\n/).forEach((raw) => {
+            const line = raw.trim();
+            if (!line || line.startsWith('#') || line.startsWith(';')) return;
+            if (line.startsWith('[') && line.endsWith(']')) {
+                const section = line.slice(1, -1).trim();
+                currentSection = sections[section] ? section : null;
+                return;
+            }
+            if (!currentSection || !line.includes('=')) return;
+            const [k, ...rest] = line.split('=');
+            sections[currentSection][k.trim()] = rest.join('=').trim();
+        });
+
+        const i = sections.Interface;
+        const p = sections.Peer;
+        const required = [
+            ['Interface', i, ['PrivateKey', 'Address', 'MTU', 'Jc', 'Jmin', 'Jmax', 'S1', 'S2', 'H1', 'H2', 'H3', 'H4']],
+            ['Peer', p, ['PublicKey', 'Endpoint', 'AllowedIPs', 'PersistentKeepalive']]
+        ];
+        for (const [name, source, keys] of required) {
+            for (const key of keys) {
+                if (!source[key]) {
+                    throw new Error(`Missing ${name}.${key}`);
+                }
+            }
+        }
+        return { interface: i, peer: p };
+    }
+
+    updateUpstreamConfigPreview(configText) {
+        const preview = this.getElement('upstreamPreview');
+        if (!preview) return;
+
+        const set = (id, value) => {
+            const el = this.getElement(id);
+            if (el) el.textContent = value;
+        };
+        const emptyView = () => {
+            set('previewEndpoint', '-');
+            set('previewAddress', '-');
+            set('previewMtu', '-');
+            set('previewAllowedIps', '-');
+            set('previewKeepalive', '-');
+            set('previewPresharedKey', '-');
+            set('previewObfuscation', '-');
+        };
+
+        const text = (configText || '').trim();
+        if (!text) {
+            preview.classList.add('hidden');
+            emptyView();
+            return;
+        }
+
+        try {
+            const parsed = this.parseAmneziaConfigPreview(text);
+            const i = parsed.interface;
+            const p = parsed.peer;
+            set('previewEndpoint', p.Endpoint || '-');
+            set('previewAddress', i.Address || '-');
+            set('previewMtu', i.MTU || '-');
+            set('previewAllowedIps', p.AllowedIPs || '-');
+            set('previewKeepalive', p.PersistentKeepalive || '-');
+            set('previewPresharedKey', p.PresharedKey ? 'present' : 'not set');
+            set('previewObfuscation', `Jc=${i.Jc}, Jmin=${i.Jmin}, Jmax=${i.Jmax}, S1=${i.S1}, S2=${i.S2}, H1=${i.H1}, H2=${i.H2}, H3=${i.H3}, H4=${i.H4}`);
+            preview.classList.remove('hidden');
+        } catch (error) {
+            emptyView();
+            preview.classList.remove('hidden');
+            set('previewObfuscation', `Parse error: ${error.message}`);
         }
     }
 
@@ -296,6 +430,10 @@ class AmneziaApp {
         this.hideError('subnetError');
         this.hideError('mtuError');
         this.hideError('dnsError');
+        this.hideError('upstreamEndpointError');
+        this.hideError('upstreamPublicKeyError');
+        this.hideError('upstreamLocalAddressError');
+        this.hideError('upstreamImportError');
 
         // Validate name
         const nameElement = this.getElement('serverName');
@@ -349,6 +487,23 @@ class AmneziaApp {
             }
         }
 
+        const serverModeElement = this.getElement('serverMode');
+        const serverMode = serverModeElement ? serverModeElement.value : 'standalone';
+        if (serverMode === 'edge_linked') {
+            const importedConfig = this.getElement('upstreamImportConfig')?.value?.trim() || '';
+            if (!importedConfig) {
+                this.showError('upstreamImportError', 'Paste imported EU client config for Linked Edge mode');
+                isValid = false;
+            } else {
+                try {
+                    this.parseAmneziaConfigPreview(importedConfig);
+                } catch (error) {
+                    this.showError('upstreamImportError', `Config parse error: ${error.message}`);
+                    isValid = false;
+                }
+            }
+        }
+
         return isValid;
     }
 
@@ -359,6 +514,9 @@ class AmneziaApp {
         const subnetElement = this.getElement('serverSubnet');
         const mtuElement = this.getElement('serverMTU');
         const dnsElement = this.getElement('serverDNS');
+        const upstreamEndpointElement = this.getElement('upstreamEndpoint');
+        const upstreamPublicKeyElement = this.getElement('upstreamPublicKey');
+        const upstreamLocalAddressElement = this.getElement('upstreamLocalAddress');
 
         if (nameElement) {
             nameElement.addEventListener('input', () => {
@@ -389,6 +547,24 @@ class AmneziaApp {
                 this.hideError('dnsError');
             });
         }
+
+        if (upstreamEndpointElement) {
+            upstreamEndpointElement.addEventListener('input', () => {
+                this.hideError('upstreamEndpointError');
+            });
+        }
+
+        if (upstreamPublicKeyElement) {
+            upstreamPublicKeyElement.addEventListener('input', () => {
+                this.hideError('upstreamPublicKeyError');
+            });
+        }
+
+        if (upstreamLocalAddressElement) {
+            upstreamLocalAddressElement.addEventListener('input', () => {
+                this.hideError('upstreamLocalAddressError');
+            });
+        }
     }
 
     showError(errorId, message) {
@@ -416,8 +592,13 @@ class AmneziaApp {
         const dnsElement = this.getElement('serverDNS');
         const obfuscationElement = this.getElement('enableObfuscation');
         const autoStartElement = this.getElement('autoStart');
+        const modeElement = this.getElement('serverMode');
+        const upstreamImportConfigElement = this.getElement('upstreamImportConfig');
+        const upstreamFailoverModeElement = this.getElement('upstreamFailoverMode');
+        const splitRuLocalElement = this.getElement('splitRuLocal');
 
         const bandwidthTierElement = this.getElement('bandwidthTier');
+        const mode = modeElement ? modeElement.value : 'standalone';
         
         const formData = {
             name: nameElement ? nameElement.value.trim() : 'New Server',
@@ -426,14 +607,23 @@ class AmneziaApp {
             mtu: mtuElement ? parseInt(mtuElement.value) : 1420,
             dns: dnsElement ? dnsElement.value.trim() : '8.8.8.8,1.1.1.1',
             bandwidth_tier: bandwidthTierElement ? bandwidthTierElement.value : 'free',
-            obfuscation: obfuscationElement ? obfuscationElement.checked : true,
-            auto_start: autoStartElement ? autoStartElement.checked : true
+            obfuscation: mode === 'edge_linked' ? true : (obfuscationElement ? obfuscationElement.checked : true),
+            auto_start: autoStartElement ? autoStartElement.checked : true,
+            mode: mode
         };
+
+        if (mode === 'edge_linked') {
+            formData.upstream = {
+                import_config: upstreamImportConfigElement ? upstreamImportConfigElement.value.trim() : '',
+                failover_mode: upstreamFailoverModeElement ? upstreamFailoverModeElement.value : 'fail_close',
+                split_ru_local: splitRuLocalElement ? splitRuLocalElement.checked : true
+            };
+        }
 
         console.log("Form data:", formData);
 
-        // Add obfuscation parameters if enabled
-        if (formData.obfuscation) {
+        // Add manual obfuscation parameters only for standalone mode
+        if (mode !== 'edge_linked' && formData.obfuscation) {
             formData.obfuscation_params = {
                 Jc: parseInt(this.getElement('paramJc')?.value || '8'),
                 Jmin: parseInt(this.getElement('paramJmin')?.value || '8'),
@@ -482,6 +672,8 @@ class AmneziaApp {
             // Reset form
             const serverForm = this.getElement('serverForm');
             if (serverForm) serverForm.reset();
+            const currentMode = this.getElement('serverMode')?.value === 'edge_linked';
+            this.toggleUpstreamSettings(currentMode);
 
             this.loadServers();
         })
@@ -601,9 +793,13 @@ class AmneziaApp {
                         </h3>
                         <p class="text-sm text-gray-600">
                             ID: ${server.id} | Port: ${server.port} | Subnet: ${server.subnet}
+                            | Mode: ${server.mode || 'standalone'}
                             ${server.obfuscation_enabled ? '| 🔒 Obfuscated' : ''}
                         </p>
                         <p class="text-sm text-gray-500">Public IP: ${server.public_ip}</p>
+                        ${server.mode === 'edge_linked' && server.upstream ? `<p class="text-xs text-gray-500">Upstream: ${server.upstream.endpoint} via ${server.upstream.interface}</p>` : ''}
+                        ${server.mode === 'edge_linked' ? `<p class="text-xs text-gray-500">Failover: ${server.linked_failover_mode || 'fail_close'} | Routing: ${server.routing_state || 'upstream'} | Egress: ${server.egress_interface || 'eth+'}</p>` : ''}
+                        ${server.mode === 'edge_linked' ? `<p class="text-xs text-gray-500">Split RU local: ${(server.upstream && server.upstream.split_ru_local !== false) ? 'enabled' : 'disabled'}</p>` : ''}
                     </div>
                     <div class="flex items-center space-x-2">
                         <span class="px-3 py-1 rounded-full text-sm ${
@@ -627,6 +823,11 @@ class AmneziaApp {
                     <button onclick="amneziaApp.changeServerTier('${server.id}', '${server.bandwidth_tier || 'free'}')" class="bg-orange-500 text-white px-3 py-1 rounded hover:bg-orange-600">
                         Change Tier
                     </button>
+                    ${server.mode === 'edge_linked' ? `
+                    <button onclick="amneziaApp.changeFailoverMode('${server.id}', '${server.linked_failover_mode || 'fail_close'}')" class="bg-indigo-500 text-white px-3 py-1 rounded hover:bg-indigo-600">
+                        Change Failover
+                    </button>
+                    ` : ''}
                     <button onclick="amneziaApp.showServerConfig('${server.id}')" class="bg-purple-500 text-white px-3 py-1 rounded hover:bg-purple-600">
                         Show Config
                     </button>
@@ -1546,6 +1747,71 @@ class AmneziaApp {
         .catch(error => {
             console.error('Error updating server tier:', error);
             this.showTempMessage('Error updating server tier', 'error');
+        });
+    }
+
+    changeFailoverMode(serverId, currentMode) {
+        const selectedFailClose = currentMode === 'fail_close' ? 'selected' : '';
+        const selectedFailOpen = currentMode === 'fail_open' ? 'selected' : '';
+        const dialogHTML = `
+            <div id="changeFailoverDialog" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+                <div class="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+                    <h3 class="text-xl font-semibold mb-4">Change Failover Policy</h3>
+                    <p class="text-sm text-gray-600 mb-4">Applies only to Linked Edge servers</p>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Failover Mode</label>
+                        <select id="newFailoverMode" class="w-full border border-gray-300 rounded-md px-3 py-2">
+                            <option value="fail_close" ${selectedFailClose}>Fail close (strict EU egress)</option>
+                            <option value="fail_open" ${selectedFailOpen}>Fail open (fallback to local RU egress)</option>
+                        </select>
+                    </div>
+                    <div class="mt-6 flex justify-end space-x-3">
+                        <button onclick="amneziaApp.closeChangeFailoverDialog()" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">
+                            Cancel
+                        </button>
+                        <button onclick="amneziaApp.confirmChangeFailoverMode('${serverId}')" class="px-4 py-2 bg-indigo-500 text-white rounded-md hover:bg-indigo-600">
+                            Save
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.insertAdjacentHTML('beforeend', dialogHTML);
+    }
+
+    closeChangeFailoverDialog() {
+        const dialog = document.getElementById('changeFailoverDialog');
+        if (dialog) {
+            dialog.remove();
+        }
+    }
+
+    confirmChangeFailoverMode(serverId) {
+        const mode = document.getElementById('newFailoverMode')?.value || 'fail_close';
+        this.closeChangeFailoverDialog();
+
+        fetch(`/api/servers/${serverId}/failover`, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ mode })
+        })
+        .then(response => {
+            if (!response.ok) {
+                return response.json().then(err => {
+                    throw new Error(err.error || 'Failed to update failover mode');
+                });
+            }
+            return response.json();
+        })
+        .then(() => {
+            this.showTempMessage('Failover mode updated', 'success');
+            this.loadServers();
+        })
+        .catch(error => {
+            console.error('Error updating failover mode:', error);
+            this.showTempMessage(`Error: ${error.message}`, 'error');
         });
     }
 

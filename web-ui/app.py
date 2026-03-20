@@ -8,6 +8,8 @@ import base64
 import random
 import requests
 import calendar
+import ipaddress
+import socket
 from flask import Flask, render_template, request, jsonify, send_file, send_from_directory
 from flask_socketio import SocketIO
 import threading
@@ -27,6 +29,12 @@ DEFAULT_SUBNET = os.getenv('DEFAULT_SUBNET', '10.0.0.0/24')
 DEFAULT_PORT = int(os.getenv('DEFAULT_PORT', '51820'))
 DEFAULT_DNS = os.getenv('DEFAULT_DNS', '8.8.8.8,1.1.1.1')
 CLIENT_EXPIRATION_CHECK_INTERVAL = int(os.getenv('CLIENT_EXPIRATION_CHECK_INTERVAL', '60'))
+LINK_HEALTH_CHECK_INTERVAL = int(os.getenv('LINK_HEALTH_CHECK_INTERVAL', '15'))
+LINK_HANDSHAKE_TIMEOUT = int(os.getenv('LINK_HANDSHAKE_TIMEOUT', '3600'))
+RU_SPLIT_CIDR_FILE = os.getenv('RU_SPLIT_CIDR_FILE', '/etc/amnezia/ru_cidrs.txt')
+RU_SPLIT_FETCH_URL = os.getenv('RU_SPLIT_FETCH_URL', 'https://www.ipdeny.com/ipblocks/data/countries/ru.zone')
+RU_SPLIT_AUTO_FETCH = os.getenv('RU_SPLIT_AUTO_FETCH', 'true').lower() == 'true'
+RU_SPLIT_INLINE_CIDRS = os.getenv('RU_SPLIT_INLINE_CIDRS', '')
 
 # Parse DNS servers from comma-separated string
 DNS_SERVERS = [dns.strip() for dns in DEFAULT_DNS.split(',') if dns.strip()]
@@ -84,14 +92,17 @@ class AmneziaManager:
         self.stop_expiration_worker = threading.Event()
         self.config = self.load_config()
         self.ensure_directories()
+        self.ru_split_cidrs = self.load_ru_split_cidrs()
         self.public_ip = self.detect_public_ip()
         self.migrate_clients_expiration_fields()
+        self.migrate_server_link_fields()
 
         # Auto-start servers based on environment variable
         if AUTO_START_SERVERS:
             self.auto_start_servers()
 
         self.start_client_expiration_worker()
+        self.start_link_health_worker()
 
     def _normalize_duration_code(self, duration_code):
         """Normalize user-provided duration to internal code."""
@@ -204,6 +215,153 @@ class AmneziaManager:
         if updated:
             self.save_config()
 
+    def migrate_server_link_fields(self):
+        """Backfill linked-server fields for backward compatibility."""
+        updated = False
+        for server in self.config.get("servers", []):
+            mode = server.get("mode", "standalone")
+            if mode not in ("standalone", "edge_linked"):
+                mode = "standalone"
+            if server.get("mode") != mode:
+                server["mode"] = mode
+                updated = True
+
+            if mode == "edge_linked":
+                upstream = server.get("upstream")
+                if not isinstance(upstream, dict):
+                    server["mode"] = "standalone"
+                    server["upstream"] = None
+                    server["egress_interface"] = "eth+"
+                    updated = True
+                    continue
+
+                if not upstream.get("interface"):
+                    upstream["interface"] = f"{server['interface']}-up"
+                    updated = True
+                if not upstream.get("config_path"):
+                    upstream["config_path"] = os.path.join(
+                        WIREGUARD_CONFIG_DIR,
+                        f"{upstream['interface']}.conf"
+                    )
+                    updated = True
+                if upstream.get("obfuscation_enabled") is not True:
+                    upstream["obfuscation_enabled"] = True
+                    updated = True
+                if not upstream.get("obfuscation_params"):
+                    upstream["obfuscation_params"] = self.generate_obfuscation_params(server.get("mtu", DEFAULT_MTU))
+                    updated = True
+                if not upstream.get("client_public_key") and upstream.get("private_key"):
+                    upstream["client_public_key"] = self.execute_command(f"echo '{upstream['private_key']}' | wg pubkey") or ""
+                    updated = True
+                if not upstream.get("table_id"):
+                    try:
+                        table_offset = int(server["id"][:2], 16) % 100
+                    except ValueError:
+                        table_offset = random.randint(1, 99)
+                    upstream["table_id"] = 200 + table_offset
+                    updated = True
+
+                if server.get("linked_failover_mode") not in ("fail_close", "fail_open"):
+                    server["linked_failover_mode"] = "fail_close"
+                    updated = True
+                if server.get("routing_state") not in ("upstream", "local"):
+                    server["routing_state"] = "upstream"
+                    updated = True
+                if "split_ru_local" not in upstream:
+                    upstream["split_ru_local"] = True
+                    updated = True
+                expected_egress = "eth+" if server.get("routing_state") == "local" else upstream["interface"]
+            else:
+                expected_egress = "eth+"
+                if server.get("linked_failover_mode") is not None:
+                    server["linked_failover_mode"] = None
+                    updated = True
+                if server.get("routing_state") is not None:
+                    server["routing_state"] = None
+                    updated = True
+
+            if server.get("egress_interface") != expected_egress:
+                server["egress_interface"] = expected_egress
+                updated = True
+
+        if updated:
+            self.save_config()
+
+    def _to_bool(self, value, default=False):
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    def _normalize_cidr_list(self, entries):
+        cidrs = []
+        seen = set()
+        for item in entries:
+            value = str(item).strip()
+            if not value:
+                continue
+            try:
+                network = ipaddress.ip_network(value, strict=False)
+            except ValueError:
+                continue
+            if network.version != 4:
+                continue
+            network_text = str(network)
+            if network_text in seen:
+                continue
+            seen.add(network_text)
+            cidrs.append(network_text)
+        return cidrs
+
+    def load_ru_split_cidrs(self):
+        """Load CIDR ranges that should use local RU egress."""
+        inline_parts = []
+        for chunk in RU_SPLIT_INLINE_CIDRS.replace(",", "\n").splitlines():
+            chunk = chunk.strip()
+            if chunk:
+                inline_parts.append(chunk)
+        if inline_parts:
+            cidrs = self._normalize_cidr_list(inline_parts)
+            print(f"Loaded RU split CIDRs from inline env: {len(cidrs)}")
+            return cidrs
+
+        file_entries = []
+        if os.path.exists(RU_SPLIT_CIDR_FILE):
+            try:
+                with open(RU_SPLIT_CIDR_FILE, "r") as f:
+                    for line in f:
+                        value = line.strip()
+                        if value and not value.startswith("#"):
+                            file_entries.append(value)
+            except Exception as e:
+                print(f"Failed reading RU split CIDR file: {e}")
+
+        cidrs = self._normalize_cidr_list(file_entries)
+        if cidrs:
+            print(f"Loaded RU split CIDRs from file: {len(cidrs)}")
+            return cidrs
+
+        if RU_SPLIT_AUTO_FETCH:
+            try:
+                response = requests.get(RU_SPLIT_FETCH_URL, timeout=15)
+                if response.status_code == 200:
+                    fetched = [line.strip() for line in response.text.splitlines() if line.strip()]
+                    cidrs = self._normalize_cidr_list(fetched)
+                    if cidrs:
+                        try:
+                            with open(RU_SPLIT_CIDR_FILE, "w") as f:
+                                f.write("\n".join(cidrs) + "\n")
+                        except Exception as e:
+                            print(f"Failed writing RU split CIDR cache: {e}")
+                        print(f"Fetched RU split CIDRs: {len(cidrs)}")
+                        return cidrs
+            except Exception as e:
+                print(f"Failed fetching RU split CIDRs: {e}")
+
+        print("RU split CIDRs are empty; split routing to local RU egress is disabled.")
+        return []
+
     def prune_expired_clients(self):
         """Delete expired clients and return list of removed IDs."""
         expired_clients = []
@@ -233,6 +391,115 @@ class AmneziaManager:
 
     def start_client_expiration_worker(self):
         worker = threading.Thread(target=self.client_expiration_worker, daemon=True)
+        worker.start()
+
+    def is_interface_running(self, interface):
+        if not interface:
+            return False
+        result = self.execute_command(f"ip link show {interface} 2>/dev/null")
+        return bool(result and "state UNKNOWN" in result)
+
+    def get_upstream_handshake_age(self, upstream_interface, upstream_public_key):
+        if not upstream_interface or not upstream_public_key:
+            return None
+        output = self.execute_command(f"/usr/bin/awg show {upstream_interface} latest-handshakes")
+        if not output:
+            return None
+
+        now_ts = int(time.time())
+        for line in output.splitlines():
+            parts = line.strip().split()
+            if len(parts) < 2:
+                continue
+            if parts[0].strip() != upstream_public_key.strip():
+                continue
+            try:
+                handshake_ts = int(parts[1].strip())
+            except ValueError:
+                return None
+            if handshake_ts <= 0:
+                return None
+            return max(0, now_ts - handshake_ts)
+        return None
+
+    def is_upstream_healthy(self, server):
+        upstream = server.get("upstream") or {}
+        upstream_interface = upstream.get("interface")
+        upstream_public_key = upstream.get("public_key")
+        if not upstream_interface or not upstream_public_key:
+            return False, None
+
+        link_state = self.execute_command(f"ip link show {upstream_interface} 2>/dev/null")
+        if not (link_state and "state UNKNOWN" in link_state):
+            return False, None
+
+        age = self.get_upstream_handshake_age(upstream_interface, upstream_public_key)
+        if age is None:
+            return False, None
+        return age <= LINK_HANDSHAKE_TIMEOUT, age
+
+    def switch_server_egress(self, server, target_state):
+        """Switch linked server egress between upstream and local."""
+        if target_state not in ("upstream", "local"):
+            return False
+        if server.get("mode") != "edge_linked":
+            return False
+
+        interface = server.get("interface")
+        subnet = server.get("subnet")
+        upstream_interface = ((server.get("upstream") or {}).get("interface"))
+        current_egress = server.get("egress_interface", "eth+")
+
+        if target_state == "upstream":
+            new_egress = upstream_interface
+            if not new_egress:
+                return False
+            if not self.start_upstream_link(server):
+                return False
+        else:
+            new_egress = "eth+"
+            self.cleanup_upstream_routing(server)
+
+        if current_egress != new_egress:
+            self.cleanup_iptables(interface, subnet, current_egress)
+            if not self.setup_iptables(interface, subnet, new_egress):
+                return False
+
+        server["egress_interface"] = new_egress
+        server["routing_state"] = target_state
+        self.save_config()
+        print(f"Linked server {server.get('name')} switched routing to {target_state}")
+        return True
+
+    def link_health_worker(self):
+        """Monitor linked servers and apply failover policy."""
+        while not self.stop_expiration_worker.is_set():
+            try:
+                for server in self.config.get("servers", []):
+                    if server.get("mode") != "edge_linked":
+                        continue
+                    if not self.is_interface_running(server.get("interface")):
+                        continue
+
+                    failover_mode = server.get("linked_failover_mode", "fail_close")
+                    healthy, handshake_age = self.is_upstream_healthy(server)
+                    if healthy:
+                        if server.get("routing_state") != "upstream":
+                            self.switch_server_egress(server, "upstream")
+                        if handshake_age is not None:
+                            print(f"Linked health OK for {server.get('name')}, handshake age={handshake_age}s")
+                    else:
+                        if failover_mode == "fail_open" and server.get("routing_state") != "local":
+                            self.switch_server_egress(server, "local")
+                            print(f"Linked health degraded for {server.get('name')}, switched to local egress")
+                        elif failover_mode == "fail_close":
+                            print(f"Linked health degraded for {server.get('name')} (fail_close active)")
+            except Exception as e:
+                print(f"Failed linked health check: {e}")
+            self.stop_expiration_worker.wait(LINK_HEALTH_CHECK_INTERVAL)
+
+    def start_link_health_worker(self):
+        worker = threading.Thread(target=self.link_health_worker, daemon=True)
         worker.start()
 
     def ensure_directories(self):
@@ -383,6 +650,215 @@ class AmneziaManager:
             "MTU": mtu
         }
 
+    def validate_obfuscation_params(self, params, mtu):
+        """Validate Amnezia obfuscation params against MTU constraints."""
+        if not isinstance(params, dict):
+            raise ValueError("Obfuscation params must be an object")
+
+        required = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
+        normalized = {}
+        for key in required:
+            if key not in params:
+                raise ValueError(f"Missing obfuscation parameter: {key}")
+            try:
+                normalized[key] = int(params[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Obfuscation parameter {key} must be integer") from exc
+
+        if normalized["Jc"] < 4 or normalized["Jc"] > 12:
+            raise ValueError("Jc must be between 4 and 12")
+        if not (normalized["Jmin"] < normalized["Jmax"] <= mtu):
+            raise ValueError(f"Jmin must be less than Jmax and Jmax <= MTU ({mtu})")
+        if not (15 <= normalized["S1"] <= 150 and normalized["S1"] <= (mtu - 148)):
+            raise ValueError(f"S1 must be in [15,150] and <= MTU-148 ({mtu - 148})")
+        if not (15 <= normalized["S2"] <= 150 and normalized["S2"] <= (mtu - 92)):
+            raise ValueError(f"S2 must be in [15,150] and <= MTU-92 ({mtu - 92})")
+        if normalized["S1"] + 56 == normalized["S2"]:
+            raise ValueError("S1 + 56 must not equal S2")
+        return normalized
+
+    def get_default_route_info(self):
+        """Return default route gateway and device."""
+        route = self.execute_command("ip -4 route show default | head -n1")
+        if not route:
+            return None, None
+
+        gateway = None
+        device = None
+        parts = route.split()
+        for idx, part in enumerate(parts):
+            if part == "via" and idx + 1 < len(parts):
+                gateway = parts[idx + 1]
+            if part == "dev" and idx + 1 < len(parts):
+                device = parts[idx + 1]
+        return gateway, device
+
+    def resolve_ipv4(self, host):
+        try:
+            return socket.gethostbyname(host)
+        except Exception:
+            return None
+
+    def parse_endpoint(self, endpoint, fallback_port=51820):
+        """Parse endpoint in host:port format."""
+        value = (endpoint or "").strip()
+        if not value:
+            return None, None
+
+        if ":" in value and value.count(":") == 1:
+            host, port_text = value.split(":")
+            try:
+                return host.strip(), int(port_text.strip())
+            except ValueError:
+                return None, None
+        return value, int(fallback_port)
+
+    def parse_amnezia_config_text(self, config_text):
+        """Parse Amnezia/WireGuard config text into interface/peer dictionaries."""
+        if not config_text or not str(config_text).strip():
+            raise ValueError("Upstream config text is empty")
+
+        sections = {"Interface": {}, "Peer": {}}
+        current_section = None
+        for raw_line in str(config_text).splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith(";"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section_name = line[1:-1].strip()
+                current_section = section_name if section_name in sections else None
+                continue
+            if "=" not in line or not current_section:
+                continue
+            key, value = line.split("=", 1)
+            sections[current_section][key.strip()] = value.strip()
+
+        interface_data = sections["Interface"]
+        peer_data = sections["Peer"]
+        if not interface_data or not peer_data:
+            raise ValueError("Upstream config must contain both [Interface] and [Peer] sections")
+
+        required_interface = ["PrivateKey", "Address"]
+        required_peer = ["PublicKey", "Endpoint"]
+        for key in required_interface:
+            if not interface_data.get(key):
+                raise ValueError(f"Upstream config missing Interface field: {key}")
+        for key in required_peer:
+            if not peer_data.get(key):
+                raise ValueError(f"Upstream config missing Peer field: {key}")
+
+        return interface_data, peer_data
+
+    def generate_upstream_config_content(self, upstream, mtu):
+        config = f"""[Interface]
+PrivateKey = {upstream['private_key']}
+Address = {upstream['local_address']}
+MTU = {mtu}
+Table = off
+"""
+
+        params = upstream.get("obfuscation_params")
+        if upstream.get("obfuscation_enabled") and params:
+            config += f"""Jc = {params['Jc']}
+Jmin = {params['Jmin']}
+Jmax = {params['Jmax']}
+S1 = {params['S1']}
+S2 = {params['S2']}
+H1 = {params['H1']}
+H2 = {params['H2']}
+H3 = {params['H3']}
+H4 = {params['H4']}
+"""
+
+        config += f"""
+[Peer]
+PublicKey = {upstream['public_key']}
+AllowedIPs = {upstream['allowed_ips']}
+Endpoint = {upstream['endpoint']}
+PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
+"""
+        if upstream.get("preshared_key"):
+            config += f"PresharedKey = {upstream['preshared_key']}\n"
+        return config
+
+    def configure_upstream_routing(self, server):
+        """Route server subnet traffic through upstream interface."""
+        upstream = server.get("upstream") or {}
+        table_id = int(upstream.get("table_id", 200))
+        server_subnet = server["subnet"]
+        upstream_interface = upstream.get("interface")
+        if not upstream_interface:
+            return False
+
+        endpoint_host, endpoint_port = self.parse_endpoint(upstream.get("endpoint"), DEFAULT_PORT)
+        if not endpoint_host:
+            return False
+
+        endpoint_ip = self.resolve_ipv4(endpoint_host) or endpoint_host
+        gateway, default_device = self.get_default_route_info()
+
+        self.execute_command(f"ip rule add from {server_subnet} table {table_id} priority {10000 + table_id} 2>/dev/null || true")
+        self.execute_command(f"ip route replace default dev {upstream_interface} table {table_id}")
+
+        if default_device:
+            if gateway:
+                self.execute_command(f"ip route replace {endpoint_ip}/32 via {gateway} dev {default_device}")
+            else:
+                self.execute_command(f"ip route replace {endpoint_ip}/32 dev {default_device}")
+        elif gateway:
+            self.execute_command(f"ip route replace {endpoint_ip}/32 via {gateway}")
+
+        split_ru_local = self._to_bool(upstream.get("split_ru_local"), True)
+        ru_route_count = 0
+        if split_ru_local and default_device and self.ru_split_cidrs:
+            for cidr in self.ru_split_cidrs:
+                if gateway:
+                    self.execute_command(f"ip route replace {cidr} via {gateway} dev {default_device} table {table_id}")
+                else:
+                    self.execute_command(f"ip route replace {cidr} dev {default_device} table {table_id}")
+                ru_route_count += 1
+
+        print(
+            f"Upstream routing configured: subnet={server_subnet}, table={table_id}, "
+            f"endpoint={endpoint_host}:{endpoint_port}, iface={upstream_interface}, "
+            f"split_ru_local={split_ru_local}, ru_routes={ru_route_count}"
+        )
+        return True
+
+    def cleanup_upstream_routing(self, server):
+        upstream = server.get("upstream") or {}
+        table_id = int(upstream.get("table_id", 200))
+        server_subnet = server.get("subnet")
+        if server_subnet:
+            self.execute_command(f"ip rule del from {server_subnet} table {table_id} priority {10000 + table_id} 2>/dev/null || true")
+        self.execute_command(f"ip route flush table {table_id} 2>/dev/null || true")
+        return True
+
+    def start_upstream_link(self, server):
+        upstream = server.get("upstream") or {}
+        upstream_interface = upstream.get("interface")
+        config_path = upstream.get("config_path")
+        if not upstream_interface or not config_path:
+            return False
+        if not os.path.exists(config_path):
+            return False
+
+        link_state = self.execute_command(f"ip link show {upstream_interface} 2>/dev/null")
+        if not (link_state and "state UNKNOWN" in link_state):
+            result = self.execute_command(f"/usr/bin/awg-quick up {upstream_interface}")
+            if result is None:
+                return False
+        return self.configure_upstream_routing(server)
+
+    def stop_upstream_link(self, server):
+        upstream = server.get("upstream") or {}
+        upstream_interface = upstream.get("interface")
+        self.cleanup_upstream_routing(server)
+        if not upstream_interface:
+            return True
+        self.execute_command(f"/usr/bin/awg-quick down {upstream_interface} 2>/dev/null || true")
+        return True
+
     def create_wireguard_server(self, server_data):
         """Create a new WireGuard server configuration with environment defaults"""
         server_name = server_data.get('name', 'New Server')
@@ -413,13 +889,22 @@ class AmneziaManager:
             if not self.is_valid_ip(dns):
                 raise ValueError(f"Invalid DNS server IP: {dns}")
 
+        mode = str(server_data.get('mode', 'standalone')).strip().lower()
+        if mode not in ('standalone', 'edge_linked'):
+            raise ValueError("mode must be 'standalone' or 'edge_linked'")
+
         # Fixed values for other settings
         enable_obfuscation = server_data.get('obfuscation', ENABLE_OBFUSCATION)
+        if mode == 'edge_linked':
+            enable_obfuscation = True
         auto_start = server_data.get('auto_start', AUTO_START_SERVERS)
 
         server_id = str(uuid.uuid4())[:6]
         interface_name = f"wg-{server_id}"
         config_path = os.path.join(WIREGUARD_CONFIG_DIR, f"{interface_name}.conf")
+
+        egress_interface = "eth+"
+        upstream_config = None
 
         # Generate server keys
         server_keys = self.generate_wireguard_keys()
@@ -428,7 +913,7 @@ class AmneziaManager:
         obfuscation_params = None
         if enable_obfuscation:
             if 'obfuscation_params' in server_data:
-                obfuscation_params = server_data['obfuscation_params']
+                obfuscation_params = self.validate_obfuscation_params(server_data['obfuscation_params'], mtu)
             else:
                 obfuscation_params = self.generate_obfuscation_params(mtu)
 
@@ -437,6 +922,99 @@ class AmneziaManager:
         network = subnet_parts[0]
         prefix = subnet_parts[1] if len(subnet_parts) > 1 else "24"
         server_ip = self.get_server_ip(network)
+
+        if mode == "edge_linked":
+            upstream_data = server_data.get("upstream") or {}
+            failover_mode = str(upstream_data.get("failover_mode", "fail_close")).strip().lower()
+            if failover_mode not in ("fail_close", "fail_open"):
+                raise ValueError("upstream.failover_mode must be fail_close or fail_open")
+            import_config_text = str(upstream_data.get("import_config", "")).strip()
+            if not import_config_text:
+                raise ValueError("Linked Edge mode requires imported EU client config")
+            split_ru_local = self._to_bool(upstream_data.get("split_ru_local"), True)
+            imported_obfuscation = {}
+            interface_cfg, peer_cfg = self.parse_amnezia_config_text(import_config_text)
+            endpoint_value = peer_cfg.get("Endpoint", "")
+            public_key_value = peer_cfg.get("PublicKey", "")
+            allowed_ips_value = peer_cfg.get("AllowedIPs", "0.0.0.0/0")
+            local_address_value = interface_cfg.get("Address", "172.31.254.2/30")
+            try:
+                keepalive_value = int(peer_cfg.get("PersistentKeepalive", 25))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("PersistentKeepalive in imported config must be integer") from exc
+            if keepalive_value < 1 or keepalive_value > 120:
+                raise ValueError("PersistentKeepalive must be between 1 and 120")
+            imported_private_key = interface_cfg.get("PrivateKey", "")
+            imported_preshared_key = peer_cfg.get("PresharedKey", "")
+            try:
+                imported_mtu = int(interface_cfg.get("MTU", mtu))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("MTU in imported config must be integer") from exc
+            if imported_mtu < 1280 or imported_mtu > 1440:
+                raise ValueError("MTU in imported config must be between 1280 and 1440")
+            mtu = imported_mtu
+            for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
+                if key in interface_cfg and str(interface_cfg.get(key)).strip():
+                    try:
+                        imported_obfuscation[key] = int(str(interface_cfg[key]).strip())
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid upstream obfuscation value for {key}") from exc
+            if len(imported_obfuscation) != 9:
+                raise ValueError("Imported config must include all obfuscation parameters (Jc..H4)")
+            imported_obfuscation = self.validate_obfuscation_params(imported_obfuscation, mtu)
+
+            endpoint_host, endpoint_port = self.parse_endpoint(endpoint_value, DEFAULT_PORT)
+
+            if not endpoint_host or not endpoint_port:
+                raise ValueError("For edge_linked mode, upstream endpoint must be in host:port format")
+            if endpoint_port < 1 or endpoint_port > 65535:
+                raise ValueError("Upstream endpoint port must be between 1 and 65535")
+            if not public_key_value:
+                raise ValueError("For edge_linked mode, upstream public key is required")
+            try:
+                ipaddress.ip_interface(local_address_value)
+            except ValueError as exc:
+                raise ValueError(f"Invalid upstream local_address: {local_address_value}") from exc
+
+            upstream_interface = f"{interface_name}-up"
+            upstream_config_path = os.path.join(WIREGUARD_CONFIG_DIR, f"{upstream_interface}.conf")
+            upstream_keys = self.generate_wireguard_keys()
+            upstream_private_key = imported_private_key or str(upstream_data.get("private_key", "")).strip() or upstream_keys["private_key"]
+            upstream_client_public_key = str(upstream_data.get("client_public_key", "")).strip()
+            if not upstream_client_public_key:
+                if upstream_private_key:
+                    upstream_client_public_key = self.execute_command(f"echo '{upstream_private_key}' | wg pubkey") or ""
+                else:
+                    upstream_client_public_key = upstream_keys["public_key"]
+            upstream_preshared_key = imported_preshared_key
+
+            # In linked mode, use imported/derived upstream obfuscation for RU entry server too.
+            obfuscation_params = dict(imported_obfuscation)
+
+            try:
+                table_offset = int(server_id[:2], 16) % 100
+            except ValueError:
+                table_offset = random.randint(1, 99)
+
+            upstream_config = {
+                "interface": upstream_interface,
+                "config_path": upstream_config_path,
+                "endpoint": f"{endpoint_host}:{endpoint_port}",
+                "public_key": public_key_value,
+                "private_key": upstream_private_key,
+                "client_public_key": upstream_client_public_key,
+                "preshared_key": upstream_preshared_key,
+                "allowed_ips": allowed_ips_value,
+                "local_address": local_address_value,
+                "persistent_keepalive": keepalive_value,
+                "obfuscation_enabled": True,
+                "obfuscation_params": imported_obfuscation,
+                "table_id": 200 + table_offset,
+                "split_ru_local": split_ru_local
+            }
+            egress_interface = upstream_interface
+        else:
+            failover_mode = None
 
         # Create WireGuard server configuration
         server_config_content = f"""[Interface]
@@ -449,7 +1027,6 @@ MTU = {mtu}
 
         # Add obfuscation parameters if enabled
         if enable_obfuscation and obfuscation_params:
-
             server_config_content += f"""Jc = {obfuscation_params['Jc']}
 Jmin = {obfuscation_params['Jmin']}
 Jmax = {obfuscation_params['Jmax']}
@@ -480,6 +1057,11 @@ H4 = {obfuscation_params['H4']}
             "obfuscation_params": obfuscation_params,
             "auto_start": auto_start,
             "dns": dns_servers,  # Store DNS servers
+            "mode": mode,
+            "upstream": upstream_config,
+            "egress_interface": egress_interface,
+            "linked_failover_mode": failover_mode,
+            "routing_state": "upstream" if mode == "edge_linked" else None,
             "clients": [],
             "created_at": time.time()
         }
@@ -487,6 +1069,10 @@ H4 = {obfuscation_params['H4']}
         # Save WireGuard config file
         with open(config_path, 'w') as f:
             f.write(server_config_content)
+
+        if upstream_config:
+            with open(upstream_config["config_path"], "w") as f:
+                f.write(self.generate_upstream_config_content(upstream_config, mtu))
 
         self.config["servers"].append(server_config)
         self.save_config()
@@ -577,6 +1163,9 @@ H4 = {obfuscation_params['H4']}
         # Remove config file
         if os.path.exists(server['config_path']):
             os.remove(server['config_path'])
+        upstream_conf_path = ((server.get("upstream") or {}).get("config_path"))
+        if upstream_conf_path and os.path.exists(upstream_conf_path):
+            os.remove(upstream_conf_path)
 
         # Remove all clients associated with this server
         self.config["clients"] = {k: v for k, v in self.config["clients"].items()
@@ -812,12 +1401,12 @@ PersistentKeepalive = 25
 """
         return config
 
-    def setup_iptables(self, interface, subnet):
+    def setup_iptables(self, interface, subnet, egress_interface="eth+"):
         """Setup iptables rules for WireGuard interface"""
         try:
             script_path = "/app/scripts/setup_iptables.sh"
             if os.path.exists(script_path):
-                result = self.execute_command(f"{script_path} {interface} {subnet}")
+                result = self.execute_command(f"{script_path} {interface} {subnet} {egress_interface}")
                 if result is not None:
                     print(f"iptables setup completed for {interface}")
                     return True
@@ -831,12 +1420,12 @@ PersistentKeepalive = 25
             print(f"Error setting up iptables for {interface}: {e}")
             return False
 
-    def cleanup_iptables(self, interface, subnet):
+    def cleanup_iptables(self, interface, subnet, egress_interface="eth+"):
         """Cleanup iptables rules for WireGuard interface"""
         try:
             script_path = "/app/scripts/cleanup_iptables.sh"
             if os.path.exists(script_path):
-                result = self.execute_command(f"{script_path} {interface} {subnet}")
+                result = self.execute_command(f"{script_path} {interface} {subnet} {egress_interface}")
                 if result is not None:
                     print(f"iptables cleanup completed for {interface}")
                     return True
@@ -945,6 +1534,33 @@ PersistentKeepalive = 25
         print(f"Server {server['name']} tier updated to {new_tier} for all {len(server['clients'])} clients")
         return True
 
+    def update_server_failover_mode(self, server_id, new_mode):
+        """Update linked server failover policy and apply immediately if possible."""
+        server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
+        if not server:
+            return False, "Server not found"
+        if server.get("mode") != "edge_linked":
+            return False, "Failover mode can be changed only for linked servers"
+
+        mode_value = str(new_mode or "").strip().lower()
+        if mode_value not in ("fail_close", "fail_open"):
+            return False, "Mode must be fail_close or fail_open"
+
+        server["linked_failover_mode"] = mode_value
+
+        # Apply immediately for running servers.
+        if self.is_interface_running(server.get("interface")):
+            healthy, _ = self.is_upstream_healthy(server)
+            if mode_value == "fail_close":
+                if healthy:
+                    self.switch_server_egress(server, "upstream")
+            else:
+                if not healthy:
+                    self.switch_server_egress(server, "local")
+
+        self.save_config()
+        return True, None
+
     def update_tier_settings(self, tier, name, limit_mbit, burst_mbit):
         """Update settings for a bandwidth tier"""
         if tier not in self.config['bandwidth_tiers']:
@@ -975,11 +1591,33 @@ PersistentKeepalive = 25
             return False
 
         try:
+            mode = server.get("mode", "standalone")
+            egress_interface = server.get("egress_interface", "eth+")
+            failover_mode = server.get("linked_failover_mode", "fail_close")
+
             # Use awg-quick to bring up the interface
             result = self.execute_command(f"/usr/bin/awg-quick up {server['interface']}")
             if result is not None:
+                if mode == "edge_linked":
+                    upstream_started = self.start_upstream_link(server)
+                    if not upstream_started:
+                        if failover_mode == "fail_open":
+                            print(f"Upstream start failed for {server['name']}, starting in local fallback mode")
+                            self.cleanup_upstream_routing(server)
+                            egress_interface = "eth+"
+                            server["egress_interface"] = egress_interface
+                            server["routing_state"] = "local"
+                        else:
+                            print(f"Failed to start upstream link for {server['name']}")
+                            self.execute_command(f"/usr/bin/awg-quick down {server['interface']} 2>/dev/null || true")
+                            return False
+                    else:
+                        egress_interface = ((server.get("upstream") or {}).get("interface")) or egress_interface
+                        server["routing_state"] = "upstream"
+                        server["egress_interface"] = egress_interface
+
                 # Setup iptables rules
-                iptables_success = self.setup_iptables(server['interface'], server['subnet'])
+                iptables_success = self.setup_iptables(server['interface'], server['subnet'], egress_interface)
 
                 server['status'] = 'running'
                 self.save_config()
@@ -1011,8 +1649,13 @@ PersistentKeepalive = 25
             return False
 
         try:
+            mode = server.get("mode", "standalone")
+            egress_interface = server.get("egress_interface", "eth+")
+
             # Cleanup iptables rules first
-            iptables_cleaned = self.cleanup_iptables(server['interface'], server['subnet'])
+            iptables_cleaned = self.cleanup_iptables(server['interface'], server['subnet'], egress_interface)
+            if mode == "edge_linked":
+                self.stop_upstream_link(server)
 
             # Use awg-quick to bring down the interface
             result = self.execute_command(f"/usr/bin/awg-quick down {server['interface']}")
@@ -1041,11 +1684,18 @@ PersistentKeepalive = 25
 
         try:
             # Check if interface exists and is up
-            result = self.execute_command(f"ip link show {server['interface']} 2>/dev/null")
-            if result and "state UNKNOWN" in result:
-                return "running"
-            else:
+            if not self.is_interface_running(server.get("interface")):
                 return "stopped"
+
+            if server.get("mode") == "edge_linked":
+                upstream_interface = ((server.get("upstream") or {}).get("interface"))
+                if not upstream_interface:
+                    return "stopped"
+                if not self.is_interface_running(upstream_interface):
+                    if server.get("linked_failover_mode") == "fail_open" and server.get("routing_state") == "local":
+                        return "running"
+                    return "stopped"
+            return "running"
         except:
             return "stopped"
 
@@ -1169,8 +1819,11 @@ def static_files(filename):
 
 @app.route('/api/servers', methods=['POST'])
 def create_server():
-    data = request.json
-    server = amnezia_manager.create_wireguard_server(data)
+    data = request.json or {}
+    try:
+        server = amnezia_manager.create_wireguard_server(data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     return jsonify(server)
 
 @app.route('/api/servers/<server_id>', methods=['DELETE'])
@@ -1198,7 +1851,7 @@ def get_server_clients(server_id):
 
 @app.route('/api/servers/<server_id>/clients', methods=['POST'])
 def add_client(server_id):
-    data = request.json
+    data = request.json or {}
     client_name = data.get('name', 'New Client')
     duration_code = data.get('duration', 'forever')
 
@@ -1209,9 +1862,14 @@ def add_client(server_id):
 
     if result:
         client_config, config_content = result
+        server = next((s for s in amnezia_manager.config['servers'] if s['id'] == server_id), None)
+        clean_config = amnezia_manager.generate_wireguard_client_config(
+            server, client_config, include_comments=False
+        ) if server else config_content
         return jsonify({
             "client": client_config,
-            "config": config_content
+            "config": config_content,
+            "clean_config": clean_config
         })
     return jsonify({"error": "Server not found"}), 404
 
@@ -1263,7 +1921,7 @@ def download_client_config(server_id, client_id):
         f.write(config_content)
         temp_path = f.name
 
-    filename = f"{client['name']}_{server['name']}.conf"
+    filename = f"{client['name']}.conf".replace("_", "")
     return send_file(temp_path, as_attachment=True, download_name=filename)
 
 @app.route('/api/clients', methods=['GET'])
@@ -1327,6 +1985,19 @@ def update_server_tier(server_id):
         return jsonify({"status": "updated", "tier": new_tier})
     return jsonify({"error": "Failed to update server tier"}), 400
 
+@app.route('/api/servers/<server_id>/failover', methods=['PUT'])
+def update_server_failover(server_id):
+    """Update linked server failover policy"""
+    data = request.json or {}
+    mode = data.get('mode')
+
+    success, error = amnezia_manager.update_server_failover_mode(server_id, mode)
+    if not success:
+        if error == "Server not found":
+            return jsonify({"error": error}), 404
+        return jsonify({"error": error}), 400
+    return jsonify({"status": "updated", "mode": mode})
+
 @app.route('/api/system/status')
 def system_status():
     status = {
@@ -1343,7 +2014,11 @@ def system_status():
             "default_mtu": DEFAULT_MTU,
             "default_subnet": DEFAULT_SUBNET,
             "default_port": DEFAULT_PORT,
-            "default_dns": DEFAULT_DNS
+            "default_dns": DEFAULT_DNS,
+            "link_health_check_interval": LINK_HEALTH_CHECK_INTERVAL,
+            "link_handshake_timeout": LINK_HANDSHAKE_TIMEOUT,
+            "ru_split_auto_fetch": RU_SPLIT_AUTO_FETCH,
+            "ru_split_cidrs_loaded": len(amnezia_manager.ru_split_cidrs)
         }
     }
     return jsonify(status)
@@ -1430,6 +2105,10 @@ def get_server_info(server_id):
 
     # Ensure MTU is included (handle both old and new servers)
     mtu_value = server.get('mtu', 1420)  # Default to 1420 if not set
+    mode_value = server.get('mode', 'standalone')
+    egress_value = server.get('egress_interface', 'eth+')
+    failover_value = server.get('linked_failover_mode')
+    routing_value = server.get('routing_state')
 
     server_info = {
         "id": server['id'],
@@ -1443,6 +2122,11 @@ def get_server_info(server_id):
         "server_ip": server['server_ip'],
         "subnet": server['subnet'],
         "mtu": mtu_value,  # Make sure MTU is included
+        "mode": mode_value,
+        "egress_interface": egress_value,
+        "linked_failover_mode": failover_value,
+        "routing_state": routing_value,
+        "upstream": server.get('upstream'),
         "obfuscation_enabled": server['obfuscation_enabled'],
         "obfuscation_params": server.get('obfuscation_params', {}),
         "clients_count": len(server['clients']),
@@ -1460,6 +2144,23 @@ def get_servers():
 
     # Update server status based on actual interface state
     for server in amnezia_manager.config["servers"]:
+        if "mode" not in server:
+            server["mode"] = "standalone"
+        if server["mode"] == "edge_linked":
+            if "linked_failover_mode" not in server or server["linked_failover_mode"] not in ("fail_close", "fail_open"):
+                server["linked_failover_mode"] = "fail_close"
+            if "routing_state" not in server or server["routing_state"] not in ("upstream", "local"):
+                server["routing_state"] = "upstream"
+            expected_egress = "eth+" if server["routing_state"] == "local" else ((server.get("upstream") or {}).get("interface"))
+            if not expected_egress:
+                expected_egress = "eth+"
+            if server.get("egress_interface") != expected_egress:
+                server["egress_interface"] = expected_egress
+        else:
+            server["linked_failover_mode"] = None
+            server["routing_state"] = None
+            if server.get("egress_interface") != "eth+":
+                server["egress_interface"] = "eth+"
         server["status"] = amnezia_manager.get_server_status(server["id"])
         # Ensure MTU is included in basic server list
         if 'mtu' not in server:
@@ -1479,13 +2180,16 @@ def iptables_test():
     if not server:
         return jsonify({"error": "Server not found"}), 404
 
+    egress_interface = server.get("egress_interface", "eth+")
+
     # Test iptables rules
     try:
         # Check if rules exist
         check_commands = [
             f"iptables -L INPUT -n | grep {server['interface']}",
             f"iptables -L FORWARD -n | grep {server['interface']}",
-            f"iptables -t nat -L POSTROUTING -n | grep {server['subnet']}"
+            f"iptables -t nat -L POSTROUTING -n | grep {server['subnet']}",
+            f"iptables -L FORWARD -n | grep {egress_interface}"
         ]
 
         results = {}
@@ -1500,6 +2204,7 @@ def iptables_test():
             "server_id": server_id,
             "server_name": server['name'],
             "interface": server['interface'],
+            "egress_interface": egress_interface,
             "subnet": server['subnet'],
             "iptables_check": results
         })

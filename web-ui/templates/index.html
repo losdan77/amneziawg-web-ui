@@ -97,11 +97,100 @@
                     </div>
                 </div>
 
+                <div class="grid grid-cols-1 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">Server Mode *</label>
+                        <select id="serverMode" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                            <option value="standalone">Standalone (direct internet egress)</option>
+                            <option value="edge_linked">Linked Edge (clients via upstream server)</option>
+                        </select>
+                        <p class="text-gray-500 text-xs mt-1">Use linked mode when this server should forward client traffic through an upstream AmneziaWG server.</p>
+                    </div>
+                </div>
+
+                <div id="upstreamSettings" class="border rounded-lg p-4 bg-gray-50 hidden">
+                    <h3 class="text-lg font-medium mb-3">Upstream Server (RU -> EU link)</h3>
+                    <div class="mb-4">
+                        <label class="block text-xs font-medium text-gray-600">Import EU client config (recommended)</label>
+                        <textarea id="upstreamImportConfig" rows="7"
+                                  placeholder="[Interface]\nPrivateKey = ...\nAddress = ...\nJc = ...\n...\n[Peer]\nPublicKey = ...\nEndpoint = ...\nAllowedIPs = 0.0.0.0/0"
+                                  class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm font-mono"></textarea>
+                        <p class="text-gray-500 text-xs mt-1">Paste client config generated on EU server. This keeps upstream obfuscation params exactly the same on both sides.</p>
+                        <p id="upstreamImportError" class="text-red-500 text-xs mt-1 hidden"></p>
+                    </div>
+                    <div class="mb-4">
+                        <label class="block text-xs font-medium text-gray-600">Failover policy</label>
+                        <select id="upstreamFailoverMode" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                            <option value="fail_close">Fail close (no local fallback, preserve EU egress policy)</option>
+                            <option value="fail_open">Fail open (fallback to local RU egress when EU link is down)</option>
+                        </select>
+                        <p class="text-gray-500 text-xs mt-1">If upstream is blocked or unstable, fail-open keeps internet working through local egress.</p>
+                    </div>
+                    <div class="mb-4">
+                        <label class="inline-flex items-center text-xs font-medium text-gray-700">
+                            <input type="checkbox" id="splitRuLocal" checked class="mr-2">
+                            Route Russian destination IP ranges via local RU egress
+                        </label>
+                        <p class="text-gray-500 text-xs mt-1">Default route remains EU. Matching RU CIDRs are routed locally from RU server.</p>
+                    </div>
+                    <div id="upstreamPreview" class="mb-4 border rounded-md p-3 bg-white hidden">
+                        <h4 class="text-sm font-semibold text-gray-700 mb-2">Parsed preview</h4>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs text-gray-700">
+                            <div><span class="font-medium">Endpoint:</span> <span id="previewEndpoint">-</span></div>
+                            <div><span class="font-medium">Address:</span> <span id="previewAddress">-</span></div>
+                            <div><span class="font-medium">MTU:</span> <span id="previewMtu">-</span></div>
+                            <div><span class="font-medium">AllowedIPs:</span> <span id="previewAllowedIps">-</span></div>
+                            <div><span class="font-medium">Keepalive:</span> <span id="previewKeepalive">-</span></div>
+                            <div><span class="font-medium">PresharedKey:</span> <span id="previewPresharedKey">-</span></div>
+                        </div>
+                        <div class="mt-2 text-xs text-gray-700">
+                            <span class="font-medium">Obfuscation:</span>
+                            <span id="previewObfuscation">-</span>
+                        </div>
+                    </div>
+                    <div id="upstreamManualFields" class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm hidden">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600">Upstream Endpoint (host:port) *</label>
+                            <input type="text" id="upstreamEndpoint" placeholder="eu-vps.example.com:51820"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                            <p id="upstreamEndpointError" class="text-red-500 text-xs mt-1 hidden">Upstream endpoint is required</p>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600">Upstream Public Key *</label>
+                            <input type="text" id="upstreamPublicKey" placeholder="Base64 public key"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                            <p id="upstreamPublicKeyError" class="text-red-500 text-xs mt-1 hidden">Upstream public key is required</p>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600">Upstream Preshared Key (optional)</label>
+                            <input type="text" id="upstreamPresharedKey" placeholder="Base64 preshared key"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600">Local Tunnel Address *</label>
+                            <input type="text" id="upstreamLocalAddress" value="172.31.254.2/30"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                            <p id="upstreamLocalAddressError" class="text-red-500 text-xs mt-1 hidden">Valid CIDR is required (e.g., 172.31.254.2/30)</p>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600">Allowed IPs</label>
+                            <input type="text" id="upstreamAllowedIps" value="0.0.0.0/0"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600">Keepalive (seconds)</label>
+                            <input type="number" id="upstreamKeepalive" value="25" min="1" max="120"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                        </div>
+                    </div>
+                    <p class="text-gray-500 text-xs mt-2">Obfuscation is always enabled for upstream link in linked mode and parsed from imported config.</p>
+                </div>
+
                 <div class="flex items-center">
                     <input type="checkbox" id="autoStart" checked class="mr-2">
                     <label class="text-sm font-medium text-gray-700">Auto-start server on creation</label>
                 </div>
-                <div class="flex items-center">
+                <div id="obfuscationToggleRow" class="flex items-center">
                     <input type="checkbox" id="enableObfuscation" checked class="mr-2">
                     <label class="text-sm font-medium text-gray-700">Enable Traffic Obfuscation</label>
                 </div>
@@ -112,7 +201,7 @@
                     <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
                         <div>
                             <label class="block text-xs font-medium text-gray-600">Jc (4-12)</label>
-                            <input type="number" id="paramJc" value="3" min="4" max="12" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                            <input type="number" id="paramJc" value="4" min="4" max="12" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
                         </div>
                         <div>
                             <label class="block text-xs font-medium text-gray-600">Jmin (recommended: 8)</label>
