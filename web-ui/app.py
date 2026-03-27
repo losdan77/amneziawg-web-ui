@@ -1177,10 +1177,26 @@ H4 = {obfuscation_params['H4']}
         return True
 
     def add_wireguard_client(self, server_id, client_name, duration_code="forever"):
-        """Add a client to a WireGuard server"""
+        """Add a client to a WireGuard server.
+
+        If a client with the same name already exists on this server, the requested
+        duration is applied like ``extend_client`` (from max(current expiry, now),
+        so expired peers are extended from today).
+        """
         server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
         if not server:
             return None
+
+        existing = next((c for c in server["clients"] if c["name"] == client_name), None)
+        if existing is not None:
+            client, err = self.extend_client(server_id, existing["id"], duration_code)
+            if err:
+                return None
+            server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
+            if not server:
+                return None
+            config_content = self.generate_wireguard_client_config(server, client, include_comments=True)
+            return client, config_content, True
 
         client_id = str(uuid.uuid4())[:6]
 
@@ -1250,7 +1266,7 @@ AllowedIPs = {client_ip}/32
         print(f"Client {client_config['name']} added")
 
         config_content = self.generate_wireguard_client_config(server, client_config, include_comments=True)
-        return client_config, config_content
+        return client_config, config_content, False
 
     def delete_client(self, server_id, client_id, reason="manual"):
         """Delete a client from a server and update the config file"""
@@ -1861,16 +1877,19 @@ def add_client(server_id):
         return jsonify({"error": str(e)}), 400
 
     if result:
-        client_config, config_content = result
+        client_config, config_content, renewal = result
         server = next((s for s in amnezia_manager.config['servers'] if s['id'] == server_id), None)
         clean_config = amnezia_manager.generate_wireguard_client_config(
             server, client_config, include_comments=False
         ) if server else config_content
-        return jsonify({
+        payload = {
             "client": client_config,
             "config": config_content,
-            "clean_config": clean_config
-        })
+            "clean_config": clean_config,
+            "renewal": renewal,
+            "action": "renewed" if renewal else "created",
+        }
+        return jsonify(payload)
     return jsonify({"error": "Server not found"}), 404
 
 @app.route('/api/servers/<server_id>/clients/<client_id>/extend', methods=['POST'])

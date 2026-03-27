@@ -1128,9 +1128,12 @@ class AmneziaApp {
             }
             return data;
         })
-        .then(() => {
+        .then((data) => {
             this.closeAddClientDialog();
-            this.showTempMessage('Client created successfully', 'success');
+            const msg = data.action === 'renewed' || data.renewal
+                ? 'Existing client found — subscription extended'
+                : 'Client created successfully';
+            this.showTempMessage(msg, 'success');
             this.loadServers();
         })
         .catch(error => {
