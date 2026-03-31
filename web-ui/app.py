@@ -102,6 +102,14 @@ class AmneziaManager:
         self.migrate_clients_expiration_fields()
         self.migrate_server_link_fields()
 
+        # Keep derived configs in sync on every startup.
+        # This ensures nginx/xray configs are regenerated after container restarts.
+        try:
+            self._write_xray_config()
+            self._write_vless_nginx_locations()
+        except Exception as e:
+            print(f"Failed initializing vless configs: {e}")
+
         # Auto-start servers based on environment variable
         if AUTO_START_SERVERS:
             self.auto_start_servers()
@@ -662,8 +670,11 @@ class AmneziaManager:
             inbound_port = vless.get("inbound_port")
             if not path or not inbound_port:
                 continue
-            # Exact match to reduce accidental exposure.
-            lines.append(f"location = {path} {{")
+            # IMPORTANT:
+            # - Use prefix match (^~) to allow xhttp internal URL variants (e.g. with trailing slash / query).
+            # - Disable basic auth for this location, otherwise clients get 401 and never reach xray.
+            lines.append(f"location ^~ {path} {{")
+            lines.append("    auth_basic off;")
             lines.append(f"    proxy_pass http://xray:{int(inbound_port)};")
             lines.append("    proxy_http_version 1.1;")
             lines.append("    proxy_set_header Host $host;")
