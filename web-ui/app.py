@@ -10,6 +10,8 @@ import requests
 import calendar
 import ipaddress
 import socket
+import re
+from urllib.parse import quote
 from flask import Flask, render_template, request, jsonify, send_file, send_from_directory
 from flask_socketio import SocketIO
 import threading
@@ -44,6 +46,9 @@ WEB_UI_PORT = 5000
 CONFIG_DIR = '/etc/amnezia'
 WIREGUARD_CONFIG_DIR = os.path.join(CONFIG_DIR, 'amneziawg')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'web_config.json')
+XRAY_CONFIG_DIR = os.path.join(CONFIG_DIR, 'xray')
+XRAY_CONFIG_FILE = os.path.join(XRAY_CONFIG_DIR, 'config.json')
+XRAY_BASE_PORT = int(os.getenv('XRAY_BASE_PORT', '8443'))
 PUBLIC_IP_SERVICE = 'http://ifconfig.me'
 ENABLE_OBFUSCATION = True
 
@@ -505,6 +510,7 @@ class AmneziaManager:
     def ensure_directories(self):
         os.makedirs(CONFIG_DIR, exist_ok=True)
         os.makedirs(WIREGUARD_CONFIG_DIR, exist_ok=True)
+        os.makedirs(XRAY_CONFIG_DIR, exist_ok=True)
         os.makedirs('/var/log/amnezia', exist_ok=True)
 
     def detect_public_ip(self):
@@ -600,6 +606,273 @@ class AmneziaManager:
         except subprocess.CalledProcessError as e:
             print(f"Command failed: {e}")
             return None
+
+    def _sanitize_label(self, value, fallback="VPN"):
+        text = str(value or "").strip()
+        if not text:
+            return fallback
+        text = re.sub(r"[\r\n\t]+", " ", text).strip()
+        return text[:64]
+
+    def _validate_domain(self, domain):
+        value = str(domain or "").strip().lower()
+        if not value:
+            raise ValueError("domain is required for VLESS server")
+        if len(value) > 253:
+            raise ValueError("domain is too long")
+        if not re.fullmatch(r"[a-z0-9.-]+", value):
+            raise ValueError("domain must contain only letters, digits, dot, and hyphen")
+        if value.startswith("-") or value.endswith("-") or ".." in value:
+            raise ValueError("domain format is invalid")
+        return value
+
+    def _normalize_vless_path(self, path):
+        value = str(path or "").strip()
+        if not value:
+            raise ValueError("path is required for VLESS xhttp")
+        if not value.startswith("/"):
+            raise ValueError("path must start with '/'")
+        if re.search(r"\s", value):
+            raise ValueError("path must not contain whitespace")
+        if len(value) > 200:
+            raise ValueError("path is too long")
+        return value
+
+    def _normalize_xhttp_mode(self, mode):
+        value = str(mode or "").strip().lower() or "stream-up"
+        allowed = {"stream-up", "stream-down", "auto"}
+        if value not in allowed:
+            raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
+        return value
+
+    def _generate_subscription_id(self):
+        return base64.urlsafe_b64encode(os.urandom(24)).decode("utf-8").rstrip("=")
+
+    def _write_vless_nginx_locations(self):
+        """
+        Generate /etc/nginx/http.d/vless_locations.conf with proxy rules to xray container.
+        This keeps nginx config in sync with stored servers list.
+        """
+        lines = []
+        for server in self.config.get("servers", []):
+            if server.get("protocol") != "vless":
+                continue
+            vless = server.get("vless") or {}
+            path = vless.get("path")
+            inbound_port = vless.get("inbound_port")
+            if not path or not inbound_port:
+                continue
+            # Exact match to reduce accidental exposure.
+            lines.append(f"location = {path} {{")
+            lines.append(f"    proxy_pass http://xray:{int(inbound_port)};")
+            lines.append("    proxy_http_version 1.1;")
+            lines.append("    proxy_set_header Host $host;")
+            lines.append("    proxy_set_header X-Real-IP $remote_addr;")
+            lines.append("    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
+            lines.append("    proxy_set_header X-Forwarded-Proto $scheme;")
+            lines.append("}")
+            lines.append("")
+
+        try:
+            with open("/etc/nginx/http.d/vless_locations.conf", "w") as f:
+                f.write("\n".join(lines))
+        except Exception as e:
+            print(f"Failed to write vless nginx locations: {e}")
+
+        # Reload nginx best-effort.
+        self.execute_command("nginx -s reload 2>/dev/null || true")
+
+    def _allocate_xray_inbound_port(self):
+        used = set()
+        for server in self.config.get("servers", []):
+            vless = server.get("vless") or {}
+            port = vless.get("inbound_port")
+            if port:
+                try:
+                    used.add(int(port))
+                except ValueError:
+                    continue
+        # Try a small range.
+        for offset in range(0, 200):
+            candidate = XRAY_BASE_PORT + offset
+            if candidate not in used:
+                return candidate
+        raise ValueError("No free xray inbound ports available")
+
+    def _write_xray_config(self):
+        """
+        Generate xray config with one inbound per VLESS server (xhttp), TLS is terminated by nginx.
+        Notes:
+        - Each inbound listens on 0.0.0.0:<inbound_port> inside docker network.
+        - Clients UUIDs are stored in web_config.json and copied into xray config here.
+        """
+        inbounds = []
+        for server in self.config.get("servers", []):
+            if server.get("protocol") != "vless":
+                continue
+            vless = server.get("vless") or {}
+            inbound_port = vless.get("inbound_port")
+            domain = vless.get("domain")
+            path = vless.get("path")
+            mode = vless.get("mode") or "stream-up"
+            host = vless.get("host") or domain
+            if not inbound_port or not domain or not path:
+                continue
+
+            clients = []
+            for client in server.get("clients", []):
+                if self._is_client_expired(client):
+                    continue
+                if not client.get("uuid"):
+                    continue
+                clients.append({"id": client["uuid"], "email": self._sanitize_label(client.get("name"), "client")})
+
+            inbounds.append({
+                "tag": f"vless-{server.get('id')}",
+                "listen": "0.0.0.0",
+                "port": int(inbound_port),
+                "protocol": "vless",
+                "settings": {
+                    "clients": clients,
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "none",
+                    "xhttpSettings": {
+                        "path": path,
+                        "mode": mode,
+                        "host": host
+                    }
+                }
+            })
+
+        config = {
+            "log": {"loglevel": "warning"},
+            "inbounds": inbounds,
+            "outbounds": [{"protocol": "freedom", "settings": {}}],
+        }
+
+        try:
+            os.makedirs(XRAY_CONFIG_DIR, exist_ok=True)
+            with open(XRAY_CONFIG_FILE, "w") as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            print(f"Failed writing xray config: {e}")
+
+    def create_vless_server(self, server_data):
+        server_name = server_data.get("name", "New VLESS Server")
+        domain = self._validate_domain(server_data.get("domain"))
+        port = int(server_data.get("port") or 443)
+        if port < 1 or port > 65535:
+            raise ValueError("port must be between 1 and 65535")
+
+        path = self._normalize_vless_path(server_data.get("path"))
+        mode = self._normalize_xhttp_mode(server_data.get("xhttp_mode") or server_data.get("mode"))
+        host = self._validate_domain(server_data.get("host") or domain)
+
+        server_id = str(uuid.uuid4())[:6]
+        subscription_id = self._generate_subscription_id()
+        inbound_port = self._allocate_xray_inbound_port()
+
+        server_config = {
+            "id": server_id,
+            "name": server_name,
+            "protocol": "vless",
+            "port": port,
+            "status": "ready",
+            "public_ip": self.public_ip,
+            "created_at": time.time(),
+            "clients": [],
+            "vless": {
+                "domain": domain,
+                "port": port,
+                "path": path,
+                "mode": mode,
+                "host": host,
+                "security": "tls",
+                "transport": "xhttp",
+                "encryption": "none",
+                "subscription_id": subscription_id,
+                "inbound_port": inbound_port,
+            },
+        }
+
+        self.config["servers"].append(server_config)
+        self.save_config()
+        self._write_xray_config()
+        self._write_vless_nginx_locations()
+        return server_config
+
+    def generate_vless_client_link(self, server, client_config):
+        vless = server.get("vless") or {}
+        domain = vless.get("domain")
+        port = int(vless.get("port") or 443)
+        path = vless.get("path") or "/"
+        mode = vless.get("mode") or "stream-up"
+        host = vless.get("host") or domain
+
+        label = self._sanitize_label(f"{server.get('name', 'Server')}-{client_config.get('name', 'Client')}")
+
+        q = (
+            f"encryption=none"
+            f"&security=tls"
+            f"&type=xhttp"
+            f"&path={quote(path, safe='')}"
+            f"&mode={quote(mode, safe='')}"
+            f"&host={quote(host, safe='')}"
+        )
+        return f"vless://{client_config['uuid']}@{domain}:{port}?{q}#{quote(label, safe='')}"
+
+    def add_vless_client(self, server_id, client_name, duration_code="forever"):
+        """Add a client to a VLESS xhttp server (link/QR only)."""
+        server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
+        if not server:
+            return None
+        if server.get("protocol") != "vless":
+            raise ValueError("Server is not a VLESS server")
+
+        existing = next((c for c in server.get("clients", []) if c.get("name") == client_name), None)
+        if existing is not None:
+            client, err = self.extend_client(server_id, existing["id"], duration_code)
+            if err:
+                return None
+            server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
+            if not server:
+                return None
+            link = self.generate_vless_client_link(server, client)
+            return client, link, True
+
+        created_at = time.time()
+        normalized_duration = self._normalize_duration_code(duration_code)
+        expires_at = self._calculate_expires_at(normalized_duration, created_at)
+
+        client_id = str(uuid.uuid4())[:6]
+        vless_uuid = str(uuid.uuid4())
+
+        client_config = {
+            "id": client_id,
+            "name": client_name,
+            "server_id": server_id,
+            "server_name": server.get("name"),
+            "status": "active",
+            "created_at": created_at,
+            "duration_code": normalized_duration,
+            "duration_label": self._duration_label(normalized_duration),
+            "expires_at": expires_at,
+            "extended_count": 0,
+            "protocol": "vless",
+            "uuid": vless_uuid,
+        }
+
+        server.setdefault("clients", []).append(client_config)
+        self.config.setdefault("clients", {})[client_id] = client_config
+        self.save_config()
+
+        self._write_xray_config()
+
+        link = self.generate_vless_client_link(server, client_config)
+        return client_config, link, False
 
     def generate_wireguard_keys(self):
         """Generate real WireGuard keys"""
@@ -1156,6 +1429,19 @@ H4 = {obfuscation_params['H4']}
         if not server:
             return False
 
+        if server.get("protocol") == "vless":
+            # Remove all clients associated with this server
+            self.config["clients"] = {
+                k: v for k, v in self.config.get("clients", {}).items()
+                if v.get("server_id") != server_id
+            }
+            # Remove the server
+            self.config["servers"] = [s for s in self.config.get("servers", []) if s.get("id") != server_id]
+            self.save_config()
+            self._write_xray_config()
+            self._write_vless_nginx_locations()
+            return True
+
         # Stop the server if running
         if server['status'] == 'running':
             self.stop_server(server_id)
@@ -1273,6 +1559,19 @@ AllowedIPs = {client_ip}/32
         server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
         if not server:
             return False
+
+        if server.get("protocol") == "vless":
+            client = next((c for c in server.get("clients", []) if c.get("id") == client_id), None)
+            if not client:
+                return False
+
+            server["clients"] = [c for c in server.get("clients", []) if c.get("id") != client_id]
+            if client_id in self.config.get("clients", {}):
+                del self.config["clients"][client_id]
+            self.save_config()
+            self._write_xray_config()
+            print(f"Client {server.get('name')}:{client.get('name')} removed ({reason})")
+            return True
 
         client = next((c for c in server["clients"] if c["id"] == client_id), None)
         if not client:
@@ -1837,7 +2136,11 @@ def static_files(filename):
 def create_server():
     data = request.json or {}
     try:
-        server = amnezia_manager.create_wireguard_server(data)
+        protocol = str(data.get("protocol") or "wireguard").strip().lower()
+        if protocol == "vless":
+            server = amnezia_manager.create_vless_server(data)
+        else:
+            server = amnezia_manager.create_wireguard_server(data)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify(server)
@@ -1850,12 +2153,18 @@ def delete_server(server_id):
 
 @app.route('/api/servers/<server_id>/start', methods=['POST'])
 def start_server(server_id):
+    server = next((s for s in amnezia_manager.config.get('servers', []) if s.get('id') == server_id), None)
+    if server and server.get("protocol") == "vless":
+        return jsonify({"error": "VLESS server lifecycle is managed externally (nginx/xray)."}), 400
     if amnezia_manager.start_server(server_id):
         return jsonify({"status": "started"})
     return jsonify({"error": "Server not found or failed to start"}), 404
 
 @app.route('/api/servers/<server_id>/stop', methods=['POST'])
 def stop_server(server_id):
+    server = next((s for s in amnezia_manager.config.get('servers', []) if s.get('id') == server_id), None)
+    if server and server.get("protocol") == "vless":
+        return jsonify({"error": "VLESS server lifecycle is managed externally (nginx/xray)."}), 400
     if amnezia_manager.stop_server(server_id):
         return jsonify({"status": "stopped"})
     return jsonify({"error": "Server not found or failed to stop"}), 404
@@ -1872,24 +2181,38 @@ def add_client(server_id):
     duration_code = data.get('duration', 'forever')
 
     try:
-        result = amnezia_manager.add_wireguard_client(server_id, client_name, duration_code)
+        server = next((s for s in amnezia_manager.config.get('servers', []) if s.get('id') == server_id), None)
+        if not server:
+            return jsonify({"error": "Server not found"}), 404
+
+        if server.get("protocol") == "vless":
+            result = amnezia_manager.add_vless_client(server_id, client_name, duration_code)
+        else:
+            result = amnezia_manager.add_wireguard_client(server_id, client_name, duration_code)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
     if result:
-        client_config, config_content, renewal = result
-        server = next((s for s in amnezia_manager.config['servers'] if s['id'] == server_id), None)
+        client_config, payload_value, renewal = result
+        if server.get("protocol") == "vless":
+            return jsonify({
+                "client": client_config,
+                "link": payload_value,
+                "renewal": renewal,
+                "action": "renewed" if renewal else "created",
+            })
+
+        config_content = payload_value
         clean_config = amnezia_manager.generate_wireguard_client_config(
             server, client_config, include_comments=False
-        ) if server else config_content
-        payload = {
+        )
+        return jsonify({
             "client": client_config,
             "config": config_content,
             "clean_config": clean_config,
             "renewal": renewal,
             "action": "renewed" if renewal else "created",
-        }
-        return jsonify(payload)
+        })
     return jsonify({"error": "Server not found"}), 404
 
 @app.route('/api/servers/<server_id>/clients/<client_id>/extend', methods=['POST'])
@@ -1930,6 +2253,14 @@ def download_client_config(server_id, client_id):
     server = next((s for s in amnezia_manager.config['servers'] if s['id'] == server_id), None)
     if not server:
         return jsonify({"error": "Server not found"}), 404
+
+    if server.get("protocol") == "vless":
+        link = amnezia_manager.generate_vless_client_link(server, client)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(link + "\n")
+            temp_path = f.name
+        filename = f"{client.get('name','client')}.txt".replace("_", "")
+        return send_file(temp_path, as_attachment=True, download_name=filename)
 
     # Use full version with comments for download
     config_content = amnezia_manager.generate_wireguard_client_config(
@@ -2024,8 +2355,11 @@ def system_status():
         "public_ip": amnezia_manager.public_ip,
         "total_servers": len(amnezia_manager.config["servers"]),
         "total_clients": len(amnezia_manager.config["clients"]),
-        "active_servers": len([s for s in amnezia_manager.config["servers"]
-                             if amnezia_manager.get_server_status(s["id"]) == "running"]),
+        "active_servers": len([
+            s for s in amnezia_manager.config["servers"]
+            if (s.get("protocol") == "wireguard" and amnezia_manager.get_server_status(s["id"]) == "running")
+            or (s.get("protocol") == "vless" and s.get("status") in ("ready", "running"))
+        ]),
         "timestamp": time.time(),
         "environment": {
             "nginx_port": NGINX_PORT,
@@ -2062,6 +2396,14 @@ def get_server_config(server_id):
     if not server:
         return jsonify({"error": "Server not found"}), 404
 
+    if server.get("protocol") == "vless":
+        return jsonify({
+            "server_id": server_id,
+            "server_name": server.get("name"),
+            "protocol": "vless",
+            "vless": server.get("vless") or {},
+        })
+
     try:
         # Read the actual config file
         if os.path.exists(server['config_path']):
@@ -2088,6 +2430,13 @@ def download_server_config(server_id):
     if not server:
         return jsonify({"error": "Server not found"}), 404
 
+    if server.get("protocol") == "vless":
+        content = json.dumps(server.get("vless") or {}, indent=2)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            f.write(content)
+            temp_path = f.name
+        return send_file(temp_path, as_attachment=True, download_name=f"{server.get('name','vless')}.json")
+
     try:
         if os.path.exists(server['config_path']):
             return send_file(
@@ -2106,6 +2455,20 @@ def get_server_info(server_id):
     server = next((s for s in amnezia_manager.config['servers'] if s['id'] == server_id), None)
     if not server:
         return jsonify({"error": "Server not found"}), 404
+
+    if server.get("protocol") == "vless":
+        vless = server.get("vless") or {}
+        return jsonify({
+            "id": server.get("id"),
+            "name": server.get("name"),
+            "protocol": "vless",
+            "port": vless.get("port", 443),
+            "status": server.get("status", "ready"),
+            "public_ip": server.get("public_ip"),
+            "clients_count": len(server.get("clients", [])),
+            "created_at": server.get("created_at"),
+            "vless": vless,
+        })
 
     # Get current status
     current_status = amnezia_manager.get_server_status(server_id)
@@ -2163,6 +2526,10 @@ def get_servers():
 
     # Update server status based on actual interface state
     for server in amnezia_manager.config["servers"]:
+        if server.get("protocol") == "vless":
+            if "status" not in server:
+                server["status"] = "ready"
+            continue
         if "mode" not in server:
             server["mode"] = "standalone"
         if server["mode"] == "edge_linked":
@@ -2242,6 +2609,18 @@ def get_client_config_both(server_id, client_id):
     if not server:
         return jsonify({"error": "Server not found"}), 404
 
+    if server.get("protocol") == "vless":
+        link = amnezia_manager.generate_vless_client_link(server, client)
+        return jsonify({
+            "server_id": server_id,
+            "client_id": client_id,
+            "client_name": client.get('name'),
+            "clean_config": link,
+            "full_config": link,
+            "clean_length": len(link),
+            "full_length": len(link)
+        })
+
     # Generate both versions
     clean_config = amnezia_manager.generate_wireguard_client_config(
         server, client, include_comments=False
@@ -2260,6 +2639,31 @@ def get_client_config_both(server_id, client_id):
         "clean_length": len(clean_config),
         "full_length": len(full_config)
     })
+
+@app.route('/api/sub/vless/<subscription_id>')
+def vless_subscription(subscription_id):
+    """Plain text subscription (one vless:// link per line)."""
+    amnezia_manager.prune_expired_clients()
+    server = next(
+        (
+            s for s in amnezia_manager.config.get("servers", [])
+            if s.get("protocol") == "vless" and (s.get("vless") or {}).get("subscription_id") == subscription_id
+        ),
+        None
+    )
+    if not server:
+        return jsonify({"error": "Subscription not found"}), 404
+
+    lines = []
+    for client in server.get("clients", []):
+        if amnezia_manager._is_client_expired(client):
+            continue
+        try:
+            lines.append(amnezia_manager.generate_vless_client_link(server, client))
+        except Exception:
+            continue
+
+    return app.response_class("\n".join(lines) + ("\n" if lines else ""), mimetype="text/plain")
     
 @app.route('/api/servers/<server_id>/traffic')
 def get_server_traffic(server_id):

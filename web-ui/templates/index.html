@@ -60,6 +60,64 @@
 
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div>
+                        <label class="block text-sm font-medium text-gray-700">Protocol *</label>
+                        <select id="serverProtocol" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                            <option value="wireguard">AmneziaWG (WireGuard)</option>
+                            <option value="vless">VLESS + XHTTP (TLS via Nginx)</option>
+                        </select>
+                        <p class="text-gray-500 text-xs mt-1">WireGuard is managed by this UI. VLESS uses external Nginx+Xray.</p>
+                    </div>
+                    <div id="vlessSubscriptionHint" class="hidden">
+                        <label class="block text-sm font-medium text-gray-700">Subscription</label>
+                        <p class="text-gray-500 text-xs mt-1">After creating server, you will get subscription URL in server card.</p>
+                    </div>
+                </div>
+
+                <div id="vlessFields" class="border rounded-lg p-4 bg-gray-50 hidden">
+                    <h3 class="text-lg font-medium mb-3">VLESS + XHTTP settings</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">Domain (SNI/Host) *</label>
+                            <input type="text" id="vlessDomain" placeholder="domain.com"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                            <p id="vlessDomainError" class="text-red-500 text-xs mt-1 hidden"></p>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">XHTTP mode</label>
+                            <select id="vlessXhttpMode" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                                <option value="stream-up" selected>stream-up</option>
+                                <option value="stream-down">stream-down</option>
+                                <option value="auto">auto</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">Secret path *</label>
+                            <div class="flex gap-2">
+                                <input type="text" id="vlessPath" placeholder="/secret-path"
+                                       class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                                <button type="button" id="genVlessPathBtn"
+                                        class="mt-1 bg-gray-500 text-white px-3 py-2 rounded-md hover:bg-gray-600 text-sm">
+                                    Generate
+                                </button>
+                            </div>
+                            <p id="vlessPathError" class="text-red-500 text-xs mt-1 hidden"></p>
+                            <p class="text-gray-500 text-xs mt-1">Used by Nginx location and Xray xhttpSettings.path</p>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700">External TLS port</label>
+                            <input type="number" id="vlessPort" value="443" min="1" max="65535"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                            <p class="text-gray-500 text-xs mt-1">Usually 443 (Nginx terminates TLS)</p>
+                        </div>
+                    </div>
+                    <p class="text-gray-500 text-xs mt-3">This UI will generate `vless://` links and subscription list. You still need to configure Nginx + Let's Encrypt + Xray separately.</p>
+                </div>
+
+                <div id="wireguardFields">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
                         <label class="block text-sm font-medium text-gray-700">Subnet *</label>
                         <input type="text" id="serverSubnet" value="10.0.0.0/24" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2"
                                placeholder="e.g., 10.0.0.0/24" required>
@@ -247,6 +305,7 @@
                     </div>
                 </div>
                 <div id="obfuscationError" class="text-red-600 text-xs mt-1 hidden"></div>
+                </div>
 
                 <div class="flex space-x-4">
                     <button type="submit" id="createButton" class="bg-blue-500 text-white px-6 py-2 rounded-md hover:bg-blue-600 transition duration-200">

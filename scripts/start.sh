@@ -6,6 +6,10 @@ chmod -R 755 /app/web-ui/
 chown :www-data /var/www/le
 chmod -R 755 /var/www/le
 
+# Ensure dynamic nginx include exists for VLESS locations.
+mkdir -p /etc/nginx/http.d
+touch /etc/nginx/http.d/vless_locations.conf
+
 lsmod | grep -E "^nf_tables|^nft_"
 nft_true=$?
 

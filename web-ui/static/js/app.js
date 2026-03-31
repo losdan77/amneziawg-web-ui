@@ -36,6 +36,21 @@ class AmneziaApp {
             });
         }
 
+        const serverProtocol = this.getElement('serverProtocol');
+        if (serverProtocol) {
+            serverProtocol.addEventListener('change', (e) => {
+                this.toggleProtocolFields(e.target.value);
+            });
+            this.toggleProtocolFields(serverProtocol.value || 'wireguard');
+        }
+
+        const genVlessPathBtn = this.getElement('genVlessPathBtn');
+        if (genVlessPathBtn) {
+            genVlessPathBtn.addEventListener('click', () => {
+                this.generateVlessPath();
+            });
+        }
+
         // Test create button
         const testCreateBtn = this.getElement('testCreateBtn');
         if (testCreateBtn) {
@@ -155,6 +170,36 @@ class AmneziaApp {
         if (errorElement) {
             errorElement.classList.add('hidden');
         }
+    }
+
+    toggleProtocolFields(protocol) {
+        const selected = (protocol || 'wireguard').toLowerCase();
+        const vlessFields = this.getElement('vlessFields');
+        const wgFields = this.getElement('wireguardFields');
+        const vlessHint = this.getElement('vlessSubscriptionHint');
+
+        const isVless = selected === 'vless';
+        if (vlessFields) vlessFields.classList.toggle('hidden', !isVless);
+        if (wgFields) wgFields.classList.toggle('hidden', isVless);
+        if (vlessHint) vlessHint.classList.toggle('hidden', !isVless);
+
+        // Adjust defaults for convenience.
+        const portInput = this.getElement('serverPort');
+        if (portInput) {
+            portInput.value = isVless ? '443' : (portInput.value || '51820');
+        }
+    }
+
+    generateVlessPath() {
+        const pathInput = this.getElement('vlessPath');
+        if (!pathInput) return;
+        const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+        let token = '';
+        for (let i = 0; i < 20; i++) {
+            token += alphabet[Math.floor(Math.random() * alphabet.length)];
+        }
+        pathInput.value = `/secret-${token}`;
+        this.hideError('vlessPathError');
     }
 
     toggleObfuscationParams(show) {
@@ -430,10 +475,14 @@ class AmneziaApp {
         this.hideError('subnetError');
         this.hideError('mtuError');
         this.hideError('dnsError');
+        this.hideError('vlessDomainError');
+        this.hideError('vlessPathError');
         this.hideError('upstreamEndpointError');
         this.hideError('upstreamPublicKeyError');
         this.hideError('upstreamLocalAddressError');
         this.hideError('upstreamImportError');
+
+        const protocol = (this.getElement('serverProtocol')?.value || 'wireguard').toLowerCase();
 
         // Validate name
         const nameElement = this.getElement('serverName');
@@ -449,6 +498,27 @@ class AmneziaApp {
         if (!port || port < 1 || port > 65535) {
             this.showError('portError', 'Port must be between 1 and 65535');
             isValid = false;
+        }
+
+        if (protocol === 'vless') {
+            const domain = (this.getElement('vlessDomain')?.value || '').trim();
+            const path = (this.getElement('vlessPath')?.value || '').trim();
+            const vlessPort = parseInt(this.getElement('vlessPort')?.value || '443', 10);
+
+            if (!domain) {
+                this.showError('vlessDomainError', 'Domain is required (must match TLS certificate)');
+                isValid = false;
+            }
+            if (!path || !path.startsWith('/')) {
+                this.showError('vlessPathError', "Path is required and must start with '/'");
+                isValid = false;
+            }
+            if (!vlessPort || vlessPort < 1 || vlessPort > 65535) {
+                this.showError('portError', 'External TLS port must be between 1 and 65535');
+                isValid = false;
+            }
+
+            return isValid;
         }
 
         // Validate subnet
@@ -598,21 +668,36 @@ class AmneziaApp {
         const splitRuLocalElement = this.getElement('splitRuLocal');
 
         const bandwidthTierElement = this.getElement('bandwidthTier');
+        const protocol = (this.getElement('serverProtocol')?.value || 'wireguard').toLowerCase();
         const mode = modeElement ? modeElement.value : 'standalone';
         
-        const formData = {
-            name: nameElement ? nameElement.value.trim() : 'New Server',
-            port: portElement ? parseInt(portElement.value) : 51820,
-            subnet: subnetElement ? subnetElement.value : '10.0.0.0/24',
-            mtu: mtuElement ? parseInt(mtuElement.value) : 1420,
-            dns: dnsElement ? dnsElement.value.trim() : '8.8.8.8,1.1.1.1',
-            bandwidth_tier: bandwidthTierElement ? bandwidthTierElement.value : 'free',
-            obfuscation: mode === 'edge_linked' ? true : (obfuscationElement ? obfuscationElement.checked : true),
-            auto_start: autoStartElement ? autoStartElement.checked : true,
-            mode: mode
-        };
+        let formData;
+        if (protocol === 'vless') {
+            formData = {
+                protocol: 'vless',
+                name: nameElement ? nameElement.value.trim() : 'New VLESS Server',
+                port: parseInt(this.getElement('vlessPort')?.value || '443', 10),
+                domain: (this.getElement('vlessDomain')?.value || '').trim(),
+                host: (this.getElement('vlessDomain')?.value || '').trim(),
+                path: (this.getElement('vlessPath')?.value || '').trim(),
+                xhttp_mode: (this.getElement('vlessXhttpMode')?.value || 'stream-up').trim(),
+            };
+        } else {
+            formData = {
+                protocol: 'wireguard',
+                name: nameElement ? nameElement.value.trim() : 'New Server',
+                port: portElement ? parseInt(portElement.value) : 51820,
+                subnet: subnetElement ? subnetElement.value : '10.0.0.0/24',
+                mtu: mtuElement ? parseInt(mtuElement.value) : 1420,
+                dns: dnsElement ? dnsElement.value.trim() : '8.8.8.8,1.1.1.1',
+                bandwidth_tier: bandwidthTierElement ? bandwidthTierElement.value : 'free',
+                obfuscation: mode === 'edge_linked' ? true : (obfuscationElement ? obfuscationElement.checked : true),
+                auto_start: autoStartElement ? autoStartElement.checked : true,
+                mode: mode
+            };
+        }
 
-        if (mode === 'edge_linked') {
+        if (protocol !== 'vless' && mode === 'edge_linked') {
             formData.upstream = {
                 import_config: upstreamImportConfigElement ? upstreamImportConfigElement.value.trim() : '',
                 failover_mode: upstreamFailoverModeElement ? upstreamFailoverModeElement.value : 'fail_close',
@@ -623,7 +708,7 @@ class AmneziaApp {
         console.log("Form data:", formData);
 
         // Add manual obfuscation parameters only for standalone mode
-        if (mode !== 'edge_linked' && formData.obfuscation) {
+        if (protocol !== 'vless' && mode !== 'edge_linked' && formData.obfuscation) {
             formData.obfuscation_params = {
                 Jc: parseInt(this.getElement('paramJc')?.value || '8'),
                 Jmin: parseInt(this.getElement('paramJmin')?.value || '8'),
@@ -672,8 +757,12 @@ class AmneziaApp {
             // Reset form
             const serverForm = this.getElement('serverForm');
             if (serverForm) serverForm.reset();
+            const currentProtocol = (this.getElement('serverProtocol')?.value || 'wireguard').toLowerCase();
+            this.toggleProtocolFields(currentProtocol);
             const currentMode = this.getElement('serverMode')?.value === 'edge_linked';
-            this.toggleUpstreamSettings(currentMode);
+            if (currentProtocol !== 'vless') {
+                this.toggleUpstreamSettings(currentMode);
+            }
 
             this.loadServers();
         })
@@ -789,21 +878,28 @@ class AmneziaApp {
                     <div>
                         <h3 class="text-lg font-semibold flex items-center gap-2">
                             ${server.name}
-                            ${this.getTierBadge(server.bandwidth_tier || 'free')}
+                            ${server.protocol === 'vless' ? '<span class="text-xs px-2 py-1 rounded bg-blue-100 text-blue-800 font-medium">VLESS</span>' : this.getTierBadge(server.bandwidth_tier || 'free')}
                         </h3>
                         <p class="text-sm text-gray-600">
-                            ID: ${server.id} | Port: ${server.port} | Subnet: ${server.subnet}
-                            | Mode: ${server.mode || 'standalone'}
-                            ${server.obfuscation_enabled ? '| 🔒 Obfuscated' : ''}
+                            ${server.protocol === 'vless'
+                                ? `ID: ${server.id} | Protocol: VLESS | TLS port: ${server.port}`
+                                : `ID: ${server.id} | Port: ${server.port} | Subnet: ${server.subnet} | Mode: ${server.mode || 'standalone'} ${server.obfuscation_enabled ? '| 🔒 Obfuscated' : ''}`
+                            }
                         </p>
                         <p class="text-sm text-gray-500">Public IP: ${server.public_ip}</p>
+                        ${server.protocol === 'vless' && server.vless ? `
+                            <p class="text-xs text-gray-500">VLESS: ${server.vless.domain}:${server.vless.port} ${server.vless.path} (${server.vless.mode})</p>
+                            <p class="text-xs text-gray-500">Subscription: <span class="font-mono">${this.getVlessSubscriptionUrl(server)}</span>
+                                <button onclick="amneziaApp.copyToClipboard('${btoa(this.getVlessSubscriptionUrl(server))}')" class="ml-2 text-blue-600 hover:text-blue-800 text-xs">Copy</button>
+                            </p>
+                        ` : ''}
                         ${server.mode === 'edge_linked' && server.upstream ? `<p class="text-xs text-gray-500">Upstream: ${server.upstream.endpoint} via ${server.upstream.interface}</p>` : ''}
                         ${server.mode === 'edge_linked' ? `<p class="text-xs text-gray-500">Failover: ${server.linked_failover_mode || 'fail_close'} | Routing: ${server.routing_state || 'upstream'} | Egress: ${server.egress_interface || 'eth+'}</p>` : ''}
                         ${server.mode === 'edge_linked' ? `<p class="text-xs text-gray-500">Split RU local: ${(server.upstream && server.upstream.split_ru_local !== false) ? 'enabled' : 'disabled'}</p>` : ''}
                     </div>
                     <div class="flex items-center space-x-2">
                         <span class="px-3 py-1 rounded-full text-sm ${
-                            server.status === 'running' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+                            (server.status === 'running' || server.status === 'ready') ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
                         }">${server.status}</span>
                         <button onclick="amneziaApp.deleteServer('${server.id}')" class="text-red-500 hover:text-red-700">
                             🗑️ Delete
@@ -811,18 +907,22 @@ class AmneziaApp {
                     </div>
                 </div>
                 <div class="space-x-2 mb-4">
+                    ${server.protocol === 'vless' ? '' : `
                     <button onclick="amneziaApp.startServer('${server.id}')" class="bg-green-500 text-white px-3 py-1 rounded hover:bg-green-600">
                         Start
                     </button>
                     <button onclick="amneziaApp.stopServer('${server.id}')" class="bg-red-500 text-white px-3 py-1 rounded hover:bg-red-600">
                         Stop
                     </button>
+                    `}
                     <button onclick="amneziaApp.addClient('${server.id}')" class="bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600">
                         Add Client
                     </button>
+                    ${server.protocol === 'vless' ? '' : `
                     <button onclick="amneziaApp.changeServerTier('${server.id}', '${server.bandwidth_tier || 'free'}')" class="bg-orange-500 text-white px-3 py-1 rounded hover:bg-orange-600">
                         Change Tier
                     </button>
+                    `}
                     ${server.mode === 'edge_linked' ? `
                     <button onclick="amneziaApp.changeFailoverMode('${server.id}', '${server.linked_failover_mode || 'fail_close'}')" class="bg-indigo-500 text-white px-3 py-1 rounded hover:bg-indigo-600">
                         Change Failover
@@ -840,8 +940,14 @@ class AmneziaApp {
 
         // Load clients for each server
         servers.forEach(server => {
-            this.loadServerClients(server.id);
+            this.loadServerClients(server.id, server.protocol || 'wireguard');
         });
+    }
+
+    getVlessSubscriptionUrl(server) {
+        const sid = server?.vless?.subscription_id;
+        if (!sid) return '';
+        return `${window.location.origin}/api/sub/vless/${sid}`;
     }
 
     renderServerClients(serverId, clients, traffic = {}) {
@@ -871,8 +977,8 @@ class AmneziaApp {
                             </div>
                             <div class="flex items-center space-x-2">
                                 <span class="font-medium">${client.name}</span>
-                                <span class="text-sm text-gray-600 ml-2">${client.client_ip}</span>
-                                ${this.getTierBadge(client.bandwidth_tier || 'free')}
+                                <span class="text-sm text-gray-600 ml-2">${client.client_ip ? client.client_ip : (client.uuid ? `UUID: ${client.uuid}` : '')}</span>
+                                ${client.client_ip ? this.getTierBadge(client.bandwidth_tier || 'free') : ''}
                                 <span class="text-xs ${expirationInfo.colorClass}" title="${expirationInfo.tooltip}">
                                     ${expirationInfo.text}
                                 </span>
@@ -980,11 +1086,18 @@ class AmneziaApp {
         summary.textContent = `Showing ${shownCount}/${totalCount} ${modeLabel}`;
     }
 
-    loadServerClients(serverId) {
-        Promise.all([
-            fetch(`/api/servers/${serverId}/clients`).then(res => res.json()),
-            fetch(`/api/servers/${serverId}/traffic`).then(res => res.ok ? res.json() : {})
-        ]).then(([clients, traffic]) => {
+    loadServerClients(serverId, protocol = 'wireguard') {
+        const proto = (protocol || 'wireguard').toLowerCase();
+        const requests = [
+            fetch(`/api/servers/${serverId}/clients`).then(res => res.json())
+        ];
+        if (proto !== 'vless') {
+            requests.push(fetch(`/api/servers/${serverId}/traffic`).then(res => res.ok ? res.json() : {}));
+        } else {
+            requests.push(Promise.resolve({}));
+        }
+
+        Promise.all(requests).then(([clients, traffic]) => {
             const clientsContainer = this.getElement(`clients-${serverId}`);
             if (clientsContainer) {
                 clientsContainer.innerHTML = this.renderServerClients(serverId, clients, traffic);
@@ -1460,7 +1573,7 @@ class AmneziaApp {
                             <div class="lg:w-2/5">
                                 <div class="bg-white p-6 rounded-xl border-2 border-gray-100 shadow-inner">
                                     <div id="qrcode" class="flex justify-center mb-4"></div>
-                                    <p class="text-center text-sm text-gray-500">Scan with WireGuard app</p>
+                                    <p class="text-center text-sm text-gray-500">Scan with your app (HAPP/WireGuard)</p>
                                 </div>
                                 <!-- Download QR Code button outside the box -->
                                 <div class="mt-4 text-center">
@@ -1639,13 +1752,17 @@ class AmneziaApp {
     }
 
     copyToClipboard(text) {
-        // Decode base64 text if it's the JSON data
+        // Decode base64 text if provided (e.g. Copy JSON / subscription URL)
         try {
             const decodedText = atob(text);
-            const jsonData = JSON.parse(decodedText);
-            text = jsonData.config_content || decodedText;
+            try {
+                const jsonData = JSON.parse(decodedText);
+                text = jsonData.config_content || decodedText;
+            } catch (e) {
+                text = decodedText;
+            }
         } catch (e) {
-            // If it's not base64 JSON, use the text as is
+            // If it's not base64, use the text as is
         }
 
         navigator.clipboard.writeText(text).then(() => {
