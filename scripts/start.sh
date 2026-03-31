@@ -52,7 +52,7 @@ if [ -n "$SSL_EMAIL" ] && [ "$SSL_DOMAIN" ]; then
 
     if [ "$cert_valid" -eq 0 ]; then
         sed -i \
-            -e "1,/listen $NGINX_PORT;/ s/listen $NGINX_PORT;/listen $NGINX_PORT ssl;/" \
+            -e "1,/listen $NGINX_PORT;/ s/listen $NGINX_PORT;/listen $NGINX_PORT ssl http2;/" \
             -e "1,/server_name _;/ s/server_name _;/server_name $SSL_DOMAIN;/" \
             -e "/server_name $SSL_DOMAIN;/a\\
     # SSL certificate configuration\\

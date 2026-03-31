@@ -35,6 +35,6 @@ ENV NGINX_PORT=80
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:$NGINX_PORT/status || exit 1
+    CMD sh -lc 'curl -fk "https://localhost:$NGINX_PORT/status" || curl -f "http://localhost:$NGINX_PORT/status"'
 
 ENTRYPOINT ["/app/scripts/start.sh"]
