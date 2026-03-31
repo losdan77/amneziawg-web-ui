@@ -572,12 +572,20 @@ class AmneziaManager:
     def auto_start_servers(self):
         """Auto-start servers that have config files and were running before"""
         print("Checking for existing servers to auto-start...")
-        for server in self.config["servers"]:
-            if os.path.exists(server['config_path']):
-                current_status = self.get_server_status(server['id'])
+        for server in self.config.get("servers", []):
+            # Only WireGuard/AmneziaWG servers are started by this container.
+            if server.get("protocol") != "wireguard":
+                continue
+
+            config_path = server.get("config_path")
+            if not config_path:
+                continue
+
+            if os.path.exists(config_path):
+                current_status = self.get_server_status(server.get('id'))
                 if current_status == 'stopped' and server.get('auto_start', True):
-                    print(f"Auto-starting server: {server['name']}")
-                    self.start_server(server['id'])
+                    print(f"Auto-starting server: {server.get('name')}")
+                    self.start_server(server.get('id'))
 
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
