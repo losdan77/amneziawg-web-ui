@@ -666,7 +666,7 @@ class AmneziaManager:
 
     def _write_vless_nginx_locations(self):
         """
-        Generate /etc/nginx/http.d/vless_locations.conf with proxy rules to xray container.
+        Generate /etc/nginx/vless_locations.inc with proxy rules to xray container.
         This keeps nginx config in sync with stored servers list.
         """
         lines = []
@@ -693,7 +693,7 @@ class AmneziaManager:
             lines.append("")
 
         try:
-            with open("/etc/nginx/http.d/vless_locations.conf", "w") as f:
+            with open("/etc/nginx/vless_locations.inc", "w") as f:
                 f.write("\n".join(lines))
         except Exception as e:
             print(f"Failed to write vless nginx locations: {e}")

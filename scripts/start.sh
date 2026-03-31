@@ -7,8 +7,7 @@ chown :www-data /var/www/le
 chmod -R 755 /var/www/le
 
 # Ensure dynamic nginx include exists for VLESS locations.
-mkdir -p /etc/nginx/http.d
-touch /etc/nginx/http.d/vless_locations.conf
+touch /etc/nginx/vless_locations.inc
 
 lsmod | grep -E "^nf_tables|^nft_"
 nft_true=$?
