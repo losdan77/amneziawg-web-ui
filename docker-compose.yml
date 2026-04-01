@@ -39,7 +39,7 @@ services:
       - XRAY_BASE_PORT=8443
 
   xray:
-    image: teddysun/xray:latest
+    image: teddysun/xray:26.3.27
     container_name: amneziawg-xray
     restart: unless-stopped
     volumes:
