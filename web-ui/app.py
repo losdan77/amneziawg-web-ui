@@ -709,6 +709,39 @@ class AmneziaManager:
                 out.append(n)
         return out
 
+    def _parse_x25519_cli_output(self, out, exit_code=None):
+        """
+        Parse `xray x25519` stdout/stderr. Newer cores label the public key as
+        `Password (PublicKey):` (see XTLS/Xray-core); older builds use `PublicKey:`.
+        Do not use `Hash32` as pbk — it is not the x25519 public key.
+        """
+        text = (out or "").strip()
+        token = r"([A-Za-z0-9+/=_-]+)"
+        priv_patterns = (
+            rf"Private\s*[Kk]ey\s*:\s*{token}",
+            rf"PrivateKey\s*:\s*{token}",
+        )
+        pub_patterns = (
+            rf"Password\s*\(\s*Public\s*[Kk]ey\s*\)\s*:\s*{token}",
+            rf"Public\s*[Kk]ey\s*:\s*{token}",
+        )
+        priv = None
+        pub = None
+        for pat in priv_patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                priv = m.group(1).strip()
+                break
+        for pat in pub_patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                pub = m.group(1).strip()
+                break
+        if not priv or not pub:
+            hint = exit_code if exit_code is not None else "?"
+            raise ValueError(f"xray x25519 failed or returned unexpected output (exit {hint}): {text[:400]!r}")
+        return priv, pub
+
     def _generate_reality_keypair(self):
         try:
             r = subprocess.run(
@@ -723,11 +756,7 @@ class AmneziaManager:
                 "xray binary not found; rebuild the image so /usr/bin/xray is available for REALITY key generation"
             ) from e
         out = (r.stdout or "") + "\n" + (r.stderr or "")
-        priv_m = re.search(r"Private[keyK]ey:\s*([A-Za-z0-9+/=_-]+)", out)
-        pub_m = re.search(r"Public[keyK]ey:\s*([A-Za-z0-9+/=_-]+)", out)
-        if not priv_m or not pub_m:
-            raise ValueError(f"xray x25519 failed or returned unexpected output (exit {r.returncode}): {out[:400]!r}")
-        return priv_m.group(1).strip(), pub_m.group(1).strip()
+        return self._parse_x25519_cli_output(out, r.returncode)
 
     def _generate_reality_short_id(self):
         return secrets.token_hex(4)
@@ -839,7 +868,8 @@ class AmneziaManager:
                     "security": "reality",
                     "realitySettings": {
                         "show": False,
-                        "dest": reality_dest,
+                        # `target` is the current RealityObject name; `dest` is a compatible alias (XTLS docs).
+                        "target": reality_dest,
                         "xver": 0,
                         "serverNames": server_names,
                         "privateKey": priv,
@@ -955,6 +985,7 @@ class AmneziaManager:
             fp = vless.get("reality_fingerprint") or "chrome"
             pbk = vless.get("reality_public_key") or ""
             sid = vless.get("reality_short_id") or ""
+            # `spx` maps to client reality spiderX (/); improves compatibility with REALITY-capable apps (HAPP, v2rayN, etc.).
             q = (
                 "encryption=none"
                 "&security=reality"
@@ -966,6 +997,7 @@ class AmneziaManager:
                 f"&fp={quote(fp, safe='')}"
                 f"&pbk={quote(pbk, safe='')}"
                 f"&sid={quote(sid, safe='')}"
+                f"&spx={quote('/', safe='')}"
                 "&flow="
             )
         else:
