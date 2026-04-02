@@ -6,6 +6,7 @@ import tempfile
 import uuid
 import base64
 import random
+import secrets
 import requests
 import calendar
 import ipaddress
@@ -661,6 +662,76 @@ class AmneziaManager:
             raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
         return value
 
+    def _vless_is_reality(self, vless):
+        """REALITY+XHTTP terminates TLS in Xray; legacy mode uses Nginx TLS + xhttp with security none."""
+        if not vless:
+            return False
+        if vless.get("security") == "reality":
+            return True
+        return bool(vless.get("reality_private_key"))
+
+    def _normalize_reality_dest(self, dest):
+        raw = str(dest or "").strip()
+        if not raw:
+            raw = "www.microsoft.com:443"
+        if ":" in raw:
+            host_part, port_part = raw.rsplit(":", 1)
+            host_part = host_part.strip().lower()
+            try:
+                port = int(port_part.strip())
+            except ValueError as e:
+                raise ValueError("reality dest port must be an integer") from e
+        else:
+            host_part = raw.strip().lower()
+            port = 443
+        if not host_part:
+            raise ValueError("reality dest host is required")
+        if not re.fullmatch(r"[a-z0-9.-]+", host_part):
+            raise ValueError("reality dest host must contain only letters, digits, dot, and hyphen")
+        if port < 1 or port > 65535:
+            raise ValueError("reality dest port must be between 1 and 65535")
+        return f"{host_part}:{port}", host_part
+
+    def _reality_server_names_for_host(self, hostname):
+        h = str(hostname or "").strip().lower()
+        if not h:
+            return ["www.microsoft.com", "microsoft.com"]
+        names = [h]
+        if h.startswith("www.") and len(h) > 4:
+            names.append(h[4:])
+        else:
+            names.append("www." + h)
+        out = []
+        seen = set()
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                out.append(n)
+        return out
+
+    def _generate_reality_keypair(self):
+        try:
+            r = subprocess.run(
+                ["xray", "x25519"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except FileNotFoundError as e:
+            raise ValueError(
+                "xray binary not found; rebuild the image so /usr/bin/xray is available for REALITY key generation"
+            ) from e
+        out = (r.stdout or "") + "\n" + (r.stderr or "")
+        priv_m = re.search(r"Private[keyK]ey:\s*([A-Za-z0-9+/=_-]+)", out)
+        pub_m = re.search(r"Public[keyK]ey:\s*([A-Za-z0-9+/=_-]+)", out)
+        if not priv_m or not pub_m:
+            raise ValueError(f"xray x25519 failed or returned unexpected output (exit {r.returncode}): {out[:400]!r}")
+        return priv_m.group(1).strip(), pub_m.group(1).strip()
+
+    def _generate_reality_short_id(self):
+        return secrets.token_hex(4)
+
     def _generate_subscription_id(self):
         return base64.urlsafe_b64encode(os.urandom(24)).decode("utf-8").rstrip("=")
 
@@ -674,6 +745,8 @@ class AmneziaManager:
             if server.get("protocol") != "vless":
                 continue
             vless = server.get("vless") or {}
+            if self._vless_is_reality(vless):
+                continue
             path = vless.get("path")
             inbound_port = vless.get("inbound_port")
             if not path or not inbound_port:
@@ -724,10 +797,9 @@ class AmneziaManager:
 
     def _write_xray_config(self):
         """
-        Generate xray config with one inbound per VLESS server (xhttp), TLS is terminated by nginx.
-        Notes:
-        - Each inbound listens on 0.0.0.0:<inbound_port> inside docker network.
-        - Clients UUIDs are stored in web_config.json and copied into xray config here.
+        Generate xray config with one inbound per VLESS server.
+        - Legacy (security=tls): xhttp with security none; TLS is terminated by nginx in front.
+        - REALITY: xhttp + security reality; TLS is handled by Xray (publish inbound_port on the host).
         """
         inbounds = []
         for server in self.config.get("servers", []):
@@ -750,6 +822,46 @@ class AmneziaManager:
                     continue
                 clients.append({"id": client["uuid"], "email": self._sanitize_label(client.get("name"), "client")})
 
+            if self._vless_is_reality(vless):
+                reality_dest = vless.get("reality_dest") or "www.microsoft.com:443"
+                server_names = vless.get("reality_server_names") or self._reality_server_names_for_host(
+                    reality_dest.split(":")[0]
+                )
+                short_ids = vless.get("reality_short_ids")
+                if not short_ids:
+                    sid = vless.get("reality_short_id") or ""
+                    short_ids = ["", sid] if sid else [""]
+                priv = vless.get("reality_private_key")
+                if not priv:
+                    continue
+                stream_settings = {
+                    "network": "xhttp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "show": False,
+                        "dest": reality_dest,
+                        "xver": 0,
+                        "serverNames": server_names,
+                        "privateKey": priv,
+                        "shortIds": short_ids,
+                    },
+                    "xhttpSettings": {
+                        "path": path,
+                        "mode": mode,
+                        "host": host,
+                    },
+                }
+            else:
+                stream_settings = {
+                    "network": "xhttp",
+                    "security": "none",
+                    "xhttpSettings": {
+                        "path": path,
+                        "mode": mode,
+                        "host": host,
+                    },
+                }
+
             inbounds.append({
                 "tag": f"vless-{server.get('id')}",
                 "listen": "0.0.0.0",
@@ -759,15 +871,7 @@ class AmneziaManager:
                     "clients": clients,
                     "decryption": "none"
                 },
-                "streamSettings": {
-                    "network": "xhttp",
-                    "security": "none",
-                    "xhttpSettings": {
-                        "path": path,
-                        "mode": mode,
-                        "host": host
-                    }
-                }
+                "streamSettings": stream_settings,
             })
 
         config = {
@@ -786,13 +890,14 @@ class AmneziaManager:
     def create_vless_server(self, server_data):
         server_name = server_data.get("name", "New VLESS Server")
         domain = self._validate_domain(server_data.get("domain"))
-        port = int(server_data.get("port") or 443)
-        if port < 1 or port > 65535:
-            raise ValueError("port must be between 1 and 65535")
-
         path = self._normalize_vless_path(server_data.get("path"))
         mode = self._normalize_xhttp_mode(server_data.get("xhttp_mode") or server_data.get("mode"))
         host = self._validate_domain(server_data.get("host") or domain)
+        reality_dest, dest_host = self._normalize_reality_dest(server_data.get("reality_dest"))
+        server_names = self._reality_server_names_for_host(dest_host)
+        priv, pub = self._generate_reality_keypair()
+        short_id = self._generate_reality_short_id()
+        short_ids = ["", short_id]
 
         server_id = str(uuid.uuid4())[:6]
         subscription_id = self._generate_subscription_id()
@@ -802,22 +907,29 @@ class AmneziaManager:
             "id": server_id,
             "name": server_name,
             "protocol": "vless",
-            "port": port,
+            "port": inbound_port,
             "status": "ready",
             "public_ip": self.public_ip,
             "created_at": time.time(),
             "clients": [],
             "vless": {
                 "domain": domain,
-                "port": port,
+                "port": inbound_port,
                 "path": path,
                 "mode": mode,
                 "host": host,
-                "security": "tls",
+                "security": "reality",
                 "transport": "xhttp",
                 "encryption": "none",
                 "subscription_id": subscription_id,
                 "inbound_port": inbound_port,
+                "reality_dest": reality_dest,
+                "reality_server_names": server_names,
+                "reality_private_key": priv,
+                "reality_public_key": pub,
+                "reality_short_id": short_id,
+                "reality_short_ids": short_ids,
+                "reality_fingerprint": "chrome",
             },
         }
 
@@ -830,21 +942,41 @@ class AmneziaManager:
     def generate_vless_client_link(self, server, client_config):
         vless = server.get("vless") or {}
         domain = vless.get("domain")
-        port = int(vless.get("port") or 443)
+        port = int(vless.get("port") or vless.get("inbound_port") or 443)
         path = vless.get("path") or "/"
         mode = vless.get("mode") or "stream-up"
         host = vless.get("host") or domain
 
         label = self._sanitize_label(f"{server.get('name', 'Server')}-{client_config.get('name', 'Client')}")
 
-        q = (
-            f"encryption=none"
-            f"&security=tls"
-            f"&type=xhttp"
-            f"&path={quote(path, safe='')}"
-            f"&mode={quote(mode, safe='')}"
-            f"&host={quote(host, safe='')}"
-        )
+        if self._vless_is_reality(vless):
+            names = vless.get("reality_server_names") or []
+            sni = names[0] if names else "www.microsoft.com"
+            fp = vless.get("reality_fingerprint") or "chrome"
+            pbk = vless.get("reality_public_key") or ""
+            sid = vless.get("reality_short_id") or ""
+            q = (
+                "encryption=none"
+                "&security=reality"
+                "&type=xhttp"
+                f"&path={quote(path, safe='')}"
+                f"&mode={quote(mode, safe='')}"
+                f"&host={quote(host, safe='')}"
+                f"&sni={quote(sni, safe='')}"
+                f"&fp={quote(fp, safe='')}"
+                f"&pbk={quote(pbk, safe='')}"
+                f"&sid={quote(sid, safe='')}"
+                "&flow="
+            )
+        else:
+            q = (
+                "encryption=none"
+                "&security=tls"
+                "&type=xhttp"
+                f"&path={quote(path, safe='')}"
+                f"&mode={quote(mode, safe='')}"
+                f"&host={quote(host, safe='')}"
+            )
         return f"vless://{client_config['uuid']}@{domain}:{port}?{q}#{quote(label, safe='')}"
 
     def add_vless_client(self, server_id, client_name, duration_code="forever"):
@@ -2178,7 +2310,7 @@ def delete_server(server_id):
 def start_server(server_id):
     server = next((s for s in amnezia_manager.config.get('servers', []) if s.get('id') == server_id), None)
     if server and server.get("protocol") == "vless":
-        return jsonify({"error": "VLESS server lifecycle is managed externally (nginx/xray)."}), 400
+        return jsonify({"error": "VLESS is handled by the Xray sidecar; no start action in the UI."}), 400
     if amnezia_manager.start_server(server_id):
         return jsonify({"status": "started"})
     return jsonify({"error": "Server not found or failed to start"}), 404
@@ -2187,7 +2319,7 @@ def start_server(server_id):
 def stop_server(server_id):
     server = next((s for s in amnezia_manager.config.get('servers', []) if s.get('id') == server_id), None)
     if server and server.get("protocol") == "vless":
-        return jsonify({"error": "VLESS server lifecycle is managed externally (nginx/xray)."}), 400
+        return jsonify({"error": "VLESS is handled by the Xray sidecar; no stop action in the UI."}), 400
     if amnezia_manager.stop_server(server_id):
         return jsonify({"status": "stopped"})
     return jsonify({"error": "Server not found or failed to stop"}), 404

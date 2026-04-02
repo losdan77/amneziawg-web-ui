@@ -83,8 +83,9 @@ services:
             sleep 2
           fi
         done
-    expose:
-      - "8443"
+    ports:
+      # VLESS+REALITY+XHTTP: each server listens on XRAY_BASE_PORT+N — publish the range on the host firewall.
+      - "8443-8642:8443-8642/tcp"
 
 volumes:
   amnezia-data:

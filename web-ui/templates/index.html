@@ -51,7 +51,7 @@
                                placeholder="My VPN Server" required>
                         <p id="nameError" class="text-red-500 text-xs mt-1 hidden">Server name is required</p>
                     </div>
-                    <div>
+                    <div id="wgServerPortGroup">
                         <label class="block text-sm font-medium text-gray-700">Port *</label>
                         <input type="number" id="serverPort" value="51820" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2" required>
                         <p id="portError" class="text-red-500 text-xs mt-1 hidden">Port is required</p>
@@ -63,9 +63,9 @@
                         <label class="block text-sm font-medium text-gray-700">Protocol *</label>
                         <select id="serverProtocol" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
                             <option value="wireguard">AmneziaWG (WireGuard)</option>
-                            <option value="vless">VLESS + XHTTP (TLS via Nginx)</option>
+                            <option value="vless">VLESS + REALITY + XHTTP (Xray)</option>
                         </select>
-                        <p class="text-gray-500 text-xs mt-1">WireGuard is managed by this UI. VLESS uses external Nginx+Xray.</p>
+                        <p class="text-gray-500 text-xs mt-1">WireGuard is managed by this UI. VLESS uses the Xray container (REALITY TLS + XHTTP).</p>
                     </div>
                     <div id="vlessSubscriptionHint" class="hidden">
                         <label class="block text-sm font-medium text-gray-700">Subscription</label>
@@ -74,12 +74,13 @@
                 </div>
 
                 <div id="vlessFields" class="border rounded-lg p-4 bg-gray-50 hidden">
-                    <h3 class="text-lg font-medium mb-3">VLESS + XHTTP settings</h3>
+                    <h3 class="text-lg font-medium mb-3">VLESS + REALITY + XHTTP</h3>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div>
-                            <label class="block text-sm font-medium text-gray-700">Domain (SNI/Host) *</label>
-                            <input type="text" id="vlessDomain" placeholder="domain.com"
+                            <label class="block text-sm font-medium text-gray-700">Client address (your domain) *</label>
+                            <input type="text" id="vlessDomain" placeholder="vpn.example.com"
                                    class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                            <p class="text-gray-500 text-xs mt-1">Must resolve to this server; used in vless:// and HTTP Host for XHTTP.</p>
                             <p id="vlessDomainError" class="text-red-500 text-xs mt-1 hidden"></p>
                         </div>
                         <div>
@@ -103,16 +104,17 @@
                                 </button>
                             </div>
                             <p id="vlessPathError" class="text-red-500 text-xs mt-1 hidden"></p>
-                            <p class="text-gray-500 text-xs mt-1">Used by Nginx location and Xray xhttpSettings.path</p>
+                            <p class="text-gray-500 text-xs mt-1">Xray xhttpSettings.path (must match in client)</p>
                         </div>
                         <div>
-                            <label class="block text-sm font-medium text-gray-700">External TLS port</label>
-                            <input type="number" id="vlessPort" value="443" min="1" max="65535"
+                            <label class="block text-sm font-medium text-gray-700">REALITY mask (dest)</label>
+                            <input type="text" id="vlessRealityDest" placeholder="www.microsoft.com:443"
                                    class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
-                            <p class="text-gray-500 text-xs mt-1">Usually 443 (Nginx terminates TLS)</p>
+                            <p class="text-gray-500 text-xs mt-1">host:port of a real TLS site (default if empty). Server names are derived automatically.</p>
+                            <p id="vlessRealityDestError" class="text-red-500 text-xs mt-1 hidden"></p>
                         </div>
                     </div>
-                    <p class="text-gray-500 text-xs mt-3">This UI will generate `vless://` links and subscription list. You still need to configure Nginx + Let's Encrypt + Xray separately.</p>
+                    <p class="text-gray-500 text-xs mt-3">After create, open the TCP port shown on the server card on your firewall (docker-compose publishes 8443–8642 to Xray). Subscription and QR use the same vless:// format as HAPP / v2rayNG.</p>
                 </div>
 
                 <div id="wireguardFields">

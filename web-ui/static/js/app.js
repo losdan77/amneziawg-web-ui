@@ -183,10 +183,13 @@ class AmneziaApp {
         if (wgFields) wgFields.classList.toggle('hidden', isVless);
         if (vlessHint) vlessHint.classList.toggle('hidden', !isVless);
 
+        const wgPortGroup = this.getElement('wgServerPortGroup');
+        if (wgPortGroup) wgPortGroup.classList.toggle('hidden', isVless);
+
         // Adjust defaults for convenience.
         const portInput = this.getElement('serverPort');
-        if (portInput) {
-            portInput.value = isVless ? '443' : (portInput.value || '51820');
+        if (portInput && !isVless) {
+            portInput.value = portInput.value || '51820';
         }
     }
 
@@ -477,6 +480,7 @@ class AmneziaApp {
         this.hideError('dnsError');
         this.hideError('vlessDomainError');
         this.hideError('vlessPathError');
+        this.hideError('vlessRealityDestError');
         this.hideError('upstreamEndpointError');
         this.hideError('upstreamPublicKeyError');
         this.hideError('upstreamLocalAddressError');
@@ -492,29 +496,30 @@ class AmneziaApp {
             isValid = false;
         }
 
-        // Validate port
-        const portElement = this.getElement('serverPort');
-        const port = portElement ? parseInt(portElement.value) : 0;
-        if (!port || port < 1 || port > 65535) {
-            this.showError('portError', 'Port must be between 1 and 65535');
-            isValid = false;
+        if (protocol !== 'vless') {
+            const portElement = this.getElement('serverPort');
+            const port = portElement ? parseInt(portElement.value) : 0;
+            if (!port || port < 1 || port > 65535) {
+                this.showError('portError', 'Port must be between 1 and 65535');
+                isValid = false;
+            }
         }
 
         if (protocol === 'vless') {
             const domain = (this.getElement('vlessDomain')?.value || '').trim();
             const path = (this.getElement('vlessPath')?.value || '').trim();
-            const vlessPort = parseInt(this.getElement('vlessPort')?.value || '443', 10);
+            const realityDest = (this.getElement('vlessRealityDest')?.value || '').trim();
 
             if (!domain) {
-                this.showError('vlessDomainError', 'Domain is required (must match TLS certificate)');
+                this.showError('vlessDomainError', 'Domain is required (must resolve to this server)');
                 isValid = false;
             }
             if (!path || !path.startsWith('/')) {
                 this.showError('vlessPathError', "Path is required and must start with '/'");
                 isValid = false;
             }
-            if (!vlessPort || vlessPort < 1 || vlessPort > 65535) {
-                this.showError('portError', 'External TLS port must be between 1 and 65535');
+            if (realityDest && !/^[a-z0-9.-]+(?::\d+)?$/i.test(realityDest)) {
+                this.showError('vlessRealityDestError', 'REALITY dest: use host or host:port (e.g. www.microsoft.com:443)');
                 isValid = false;
             }
 
@@ -676,11 +681,11 @@ class AmneziaApp {
             formData = {
                 protocol: 'vless',
                 name: nameElement ? nameElement.value.trim() : 'New VLESS Server',
-                port: parseInt(this.getElement('vlessPort')?.value || '443', 10),
                 domain: (this.getElement('vlessDomain')?.value || '').trim(),
                 host: (this.getElement('vlessDomain')?.value || '').trim(),
                 path: (this.getElement('vlessPath')?.value || '').trim(),
                 xhttp_mode: (this.getElement('vlessXhttpMode')?.value || 'stream-up').trim(),
+                reality_dest: (this.getElement('vlessRealityDest')?.value || '').trim(),
             };
         } else {
             formData = {
@@ -882,13 +887,13 @@ class AmneziaApp {
                         </h3>
                         <p class="text-sm text-gray-600">
                             ${server.protocol === 'vless'
-                                ? `ID: ${server.id} | Protocol: VLESS | TLS port: ${server.port}`
+                                ? `ID: ${server.id} | VLESS+REALITY+XHTTP | client TCP port: ${server.port}`
                                 : `ID: ${server.id} | Port: ${server.port} | Subnet: ${server.subnet} | Mode: ${server.mode || 'standalone'} ${server.obfuscation_enabled ? '| 🔒 Obfuscated' : ''}`
                             }
                         </p>
                         <p class="text-sm text-gray-500">Public IP: ${server.public_ip}</p>
                         ${server.protocol === 'vless' && server.vless ? `
-                            <p class="text-xs text-gray-500">VLESS: ${server.vless.domain}:${server.vless.port} ${server.vless.path} (${server.vless.mode})</p>
+                            <p class="text-xs text-gray-500">VLESS: ${server.vless.domain}:${server.vless.port} ${server.vless.path} (${server.vless.mode})${server.vless.security === 'reality' && server.vless.reality_dest ? ` · REALITY dest ${server.vless.reality_dest}` : ''}</p>
                             <p class="text-xs text-gray-500">Subscription: <span class="font-mono">${this.getVlessSubscriptionUrl(server)}</span>
                                 <button onclick="amneziaApp.copyToClipboard('${btoa(this.getVlessSubscriptionUrl(server))}')" class="ml-2 text-blue-600 hover:text-blue-800 text-xs">Copy</button>
                             </p>

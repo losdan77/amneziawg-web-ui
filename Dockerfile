@@ -1,4 +1,8 @@
+FROM teddysun/xray:26.3.27 AS xray_tools
 FROM amneziavpn/amneziawg-go:latest
+
+# Used by the Web UI to run `xray x25519` when creating VLESS REALITY servers (must match xray service image tag).
+COPY --from=xray_tools /usr/bin/xray /usr/bin/xray
 
 # Install dependencies for web UI
 RUN apk update && apk add \
