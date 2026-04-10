@@ -75,23 +75,37 @@
 
                 <div id="vlessFields" class="border rounded-lg p-4 bg-gray-50 hidden">
                     <h3 class="text-lg font-medium mb-3">VLESS + REALITY + XHTTP</h3>
+
+                    <!-- Port 443 stream routing toggle -->
+                    <div class="mb-4 p-3 rounded-lg bg-blue-50 border border-blue-200">
+                        <label class="inline-flex items-center text-sm font-medium text-blue-800">
+                            <input type="checkbox" id="vlessUseStream" checked class="mr-2 h-4 w-4">
+                            Использовать порт 443 (обход белых списков)
+                        </label>
+                        <p class="text-blue-700 text-xs mt-1">
+                            <strong>Рекомендуется.</strong> nginx stream проксирует внешний :443 к Xray по SNI. Нужен SSL (SSL_DOMAIN).
+                            Без галочки — Xray слушает напрямую на порту 8443+ (обходит только DPI, не белые списки).
+                        </p>
+                    </div>
+
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div>
                             <label class="block text-sm font-medium text-gray-700">Client address (your domain) *</label>
                             <input type="text" id="vlessDomain" placeholder="vpn.example.com"
                                    class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
-                            <p class="text-gray-500 text-xs mt-1">Must resolve to this server; used in vless:// and HTTP Host for XHTTP.</p>
+                            <p class="text-gray-500 text-xs mt-1">Должен резолвиться на этот сервер; используется в vless:// и HTTP Host.</p>
                             <p id="vlessDomainError" class="text-red-500 text-xs mt-1 hidden"></p>
                         </div>
                         <div>
                             <label class="block text-sm font-medium text-gray-700">XHTTP mode</label>
                             <select id="vlessXhttpMode" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
-                                <option value="stream-up" selected>stream-up</option>
+                                <option value="auto" selected>auto (рекомендуется — HAPP/v2rayN)</option>
+                                <option value="stream-up">stream-up</option>
                                 <option value="stream-down">stream-down</option>
-                                <option value="auto">auto</option>
                             </select>
                         </div>
                     </div>
+
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
                         <div>
                             <label class="block text-sm font-medium text-gray-700">Secret path *</label>
@@ -104,17 +118,53 @@
                                 </button>
                             </div>
                             <p id="vlessPathError" class="text-red-500 text-xs mt-1 hidden"></p>
-                            <p class="text-gray-500 text-xs mt-1">Xray xhttpSettings.path (must match in client)</p>
                         </div>
                         <div>
-                            <label class="block text-sm font-medium text-gray-700">REALITY mask (dest)</label>
-                            <input type="text" id="vlessRealityDest" placeholder="www.microsoft.com:443"
-                                   class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
-                            <p class="text-gray-500 text-xs mt-1">host:port of a real TLS site (default if empty). Server names are derived automatically.</p>
-                            <p id="vlessRealityDestError" class="text-red-500 text-xs mt-1 hidden"></p>
+                            <label class="block text-sm font-medium text-gray-700">TLS fingerprint</label>
+                            <select id="vlessFingerprint" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                                <option value="chrome" selected>chrome (по умолчанию)</option>
+                                <option value="firefox">firefox</option>
+                                <option value="safari">safari</option>
+                                <option value="ios">ios (для iPhone/iPad)</option>
+                                <option value="android">android</option>
+                                <option value="edge">edge</option>
+                                <option value="random">random</option>
+                            </select>
+                            <p class="text-gray-500 text-xs mt-1">Какой браузер имитирует TLS-хэндшейк. ios/safari — для Apple-устройств.</p>
                         </div>
                     </div>
-                    <p class="text-gray-500 text-xs mt-3">After create, open the TCP port shown on the server card on your firewall (docker-compose publishes 8443–8642 to Xray). Subscription and QR use the same vless:// format as HAPP / v2rayNG.</p>
+
+                    <div class="mt-4">
+                        <label class="block text-sm font-medium text-gray-700">REALITY mask (dest) — маскировка под сайт</label>
+                        <div class="flex gap-2">
+                            <input type="text" id="vlessRealityDest" placeholder="web.max.ru:443"
+                                   list="sniPresetList"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                            <button type="button" id="loadSniPresetsBtn"
+                                    class="mt-1 bg-indigo-500 text-white px-3 py-2 rounded-md hover:bg-indigo-600 text-sm whitespace-nowrap">
+                                Пресеты SNI
+                            </button>
+                        </div>
+                        <datalist id="sniPresetList"></datalist>
+                        <p class="text-gray-500 text-xs mt-1">
+                            host:port реального TLS-сайта (REALITY будет маскироваться под него).
+                            <strong>Для белых списков</strong> — выбирайте сайты из белого списка вашего ISP
+                            (госуслуги, сбербанк, vk.com и т.п.).
+                        </p>
+                        <p id="vlessRealityDestError" class="text-red-500 text-xs mt-1 hidden"></p>
+                    </div>
+
+                    <!-- SNI presets panel (hidden by default) -->
+                    <div id="sniPresetsPanel" class="hidden mt-3 border border-indigo-200 rounded-lg bg-indigo-50 p-3">
+                        <p class="text-indigo-800 text-xs font-medium mb-2">Рекомендуемые SNI для обхода белых списков в России:</p>
+                        <div id="sniPresetsList" class="grid grid-cols-1 md:grid-cols-2 gap-1 text-xs"></div>
+                    </div>
+
+                    <p class="text-gray-500 text-xs mt-3">
+                        <strong>Режим stream (порт 443):</strong> никаких дополнительных правил файрвола не нужно — трафик идёт через уже открытый :443.
+                        <strong>Режим direct (порт 8443+):</strong> откройте порт, показанный на карточке сервера (docker-compose публикует 8443–8642 к Xray).
+                        Подписка и QR совместимы с HAPP / v2rayNG / Nekoray.
+                    </p>
                 </div>
 
                 <div id="wireguardFields">

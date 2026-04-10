@@ -37,6 +37,9 @@ services:
       - SSL_DOMAIN=${SSL_DOMAIN:-}
       - AUTO_START_SERVERS=true
       - XRAY_BASE_PORT=8443
+      # Internal-only ports for stream-routed REALITY inbounds (port-443 whitelist bypass mode).
+      # nginx stream proxies from external :443 to xray:9443+ by SNI — no host-port publishing needed.
+      - XRAY_STREAM_BASE_PORT=9443
 
   xray:
     image: teddysun/xray:26.3.27
@@ -84,8 +87,12 @@ services:
           fi
         done
     ports:
-      # VLESS+REALITY+XHTTP: each server listens on XRAY_BASE_PORT+N — publish the range on the host firewall.
+      # Direct VLESS+REALITY+XHTTP (no stream routing): each server listens on XRAY_BASE_PORT+N.
+      # Open these on your host firewall when use_stream=false.
       - "8443-8642:8443-8642/tcp"
+      # Stream-routed VLESS servers (port-443 whitelist bypass) use ports 9443-9642 INTERNALLY ONLY.
+      # nginx stream in the web-ui container proxies external :443 → xray:9443+N by SNI.
+      # No host-port mapping needed for 9443-9642.
 
 volumes:
   amnezia-data:

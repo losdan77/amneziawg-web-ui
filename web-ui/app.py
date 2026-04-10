@@ -50,8 +50,31 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, 'web_config.json')
 XRAY_CONFIG_DIR = os.path.join(CONFIG_DIR, 'xray')
 XRAY_CONFIG_FILE = os.path.join(XRAY_CONFIG_DIR, 'config.json')
 XRAY_BASE_PORT = int(os.getenv('XRAY_BASE_PORT', '8443'))
+# Ports 9443-9642: internal-only Xray inbounds for stream-routed (port-443) REALITY servers.
+# These are NOT published to the host; nginx stream proxies from external :443 by SNI.
+XRAY_STREAM_BASE_PORT = int(os.getenv('XRAY_STREAM_BASE_PORT', '9443'))
+NGINX_STREAM_CONFIG_FILE = '/etc/nginx/stream_reality.conf'
 PUBLIC_IP_SERVICE = 'http://ifconfig.me'
 ENABLE_OBFUSCATION = True
+
+# Curated list of Russian / globally accessible domains suitable as REALITY mask targets.
+# Requirements: TLS 1.3, stable, reachable from EU VPS, likely on Russian ISP white-lists.
+REALITY_SNI_PRESETS = [
+    {"host": "www.gosuslugi.ru:443",  "desc": "Госуслуги — правительство РФ, 100% в белых списках"},
+    {"host": "esia.gosuslugi.ru:443", "desc": "ЕСИА / Госуслуги — авторизация"},
+    {"host": "mos.ru:443",            "desc": "Mos.ru — портал Москвы"},
+    {"host": "www.sberbank.ru:443",   "desc": "Сбербанк"},
+    {"host": "www.tbank.ru:443",      "desc": "Т-Банк (Тинькофф)"},
+    {"host": "vk.com:443",            "desc": "ВКонтакте"},
+    {"host": "ok.ru:443",             "desc": "Одноклассники"},
+    {"host": "mail.ru:443",           "desc": "Mail.ru"},
+    {"host": "yandex.ru:443",         "desc": "Яндекс"},
+    {"host": "ria.ru:443",            "desc": "РИА Новости — государственное СМИ"},
+    {"host": "1tv.ru:443",            "desc": "Первый канал"},
+    {"host": "web.max.ru:443",        "desc": "Max (VK стриминг) — высокий трафик"},
+    {"host": "www.microsoft.com:443", "desc": "Microsoft — нейтральный, для ISP без белых списков"},
+    {"host": "www.apple.com:443",     "desc": "Apple"},
+]
 
 print(f"Base directory: {BASE_DIR}")
 print(f"Template directory: {TEMPLATE_DIR}")
@@ -108,6 +131,7 @@ class AmneziaManager:
         try:
             self._write_xray_config()
             self._write_vless_nginx_locations()
+            self._write_vless_stream_config()
         except Exception as e:
             print(f"Failed initializing vless configs: {e}")
 
@@ -824,6 +848,112 @@ class AmneziaManager:
                 return candidate
         raise ValueError("No free xray inbound ports available")
 
+    def _allocate_xray_stream_inbound_port(self):
+        """Allocate an internal-only port for stream-routed (port 443) REALITY inbounds.
+
+        These ports (9443+) are never published to the host; nginx stream proxies to them
+        from external :443 based on the TLS SNI of the ClientHello.
+        """
+        used = set()
+        for server in self.config.get("servers", []):
+            vless = server.get("vless") or {}
+            if vless.get("use_stream"):
+                port = vless.get("inbound_port")
+                if port:
+                    try:
+                        used.add(int(port))
+                    except ValueError:
+                        continue
+        for offset in range(0, 200):
+            candidate = XRAY_STREAM_BASE_PORT + offset
+            if candidate not in used:
+                return candidate
+        raise ValueError("No free xray stream inbound ports available")
+
+    def _write_vless_stream_config(self):
+        """Generate /etc/nginx/stream_reality.conf for port-443 REALITY SNI routing.
+
+        For every stream-routed VLESS server (use_stream=True), maps each of its
+        reality_server_names to the server's internal Xray inbound port so that
+        nginx stream forwards the raw TLS connection to the right Xray inbound.
+        Non-REALITY SNIs (web-UI domain etc.) fall through to nginx HTTPS on :4443.
+        """
+        # Map: mask_hostname -> xray_inbound_port (last writer wins for same hostname)
+        sni_to_port: dict = {}
+        for server in self.config.get("servers", []):
+            if server.get("protocol") != "vless":
+                continue
+            vless = server.get("vless") or {}
+            if not self._vless_is_reality(vless) or not vless.get("use_stream"):
+                continue
+            inbound_port = vless.get("inbound_port")
+            if not inbound_port:
+                continue
+            for sn in (vless.get("reality_server_names") or []):
+                sni_to_port[sn] = int(inbound_port)
+
+        # Group unique ports for upstream blocks (multiple SNIs can share the same Xray port).
+        port_set: set = set(sni_to_port.values())
+
+        if not sni_to_port:
+            # Check if there is already a stream block present (written by start.sh for SSL).
+            # If so, keep the structural skeleton with no REALITY entries.
+            try:
+                with open(NGINX_STREAM_CONFIG_FILE) as f:
+                    existing = f.read()
+                if "stream {" not in existing:
+                    # SSL not configured yet — leave the file as a comment.
+                    return
+                # Reconstruct the block with an empty map (no REALITY entries).
+                content = self._build_stream_conf({}, set())
+            except OSError:
+                return
+        else:
+            content = self._build_stream_conf(sni_to_port, port_set)
+
+        try:
+            with open(NGINX_STREAM_CONFIG_FILE, "w") as f:
+                f.write(content)
+            self.execute_command("nginx -s reload 2>/dev/null || true")
+        except Exception as e:
+            print(f"Failed writing nginx stream config: {e}")
+
+    def _build_stream_conf(self, sni_to_port: dict, port_set: set) -> str:
+        """Render the nginx stream{} block from the SNI→port mapping."""
+        map_lines = []
+        for sn, port in sorted(sni_to_port.items()):
+            map_lines.append(f"        {sn}   xray_{port};")
+
+        upstream_blocks = []
+        for port in sorted(port_set):
+            upstream_blocks.append(
+                f"    upstream xray_{port} {{\n        server xray:{port};\n    }}"
+            )
+
+        map_body = "\n".join(map_lines) if map_lines else ""
+        upstreams = "\n".join(upstream_blocks)
+
+        return (
+            "stream {\n"
+            "    map $ssl_preread_server_name $backend_443 {\n"
+            "        hostnames;\n"
+            + (f"{map_body}\n" if map_body else "")
+            + "        # <REALITY_ENTRIES> — do not remove this marker; web UI uses it\n"
+            "        default   nginx_https_4443;\n"
+            "    }\n\n"
+            "    upstream nginx_https_4443 {\n"
+            "        server 127.0.0.1:4443;\n"
+            "    }\n"
+            + (f"\n{upstreams}\n" if upstreams else "")
+            + "\n"
+            "    server {\n"
+            "        listen 443;\n"
+            "        ssl_preread on;\n"
+            "        proxy_pass $backend_443;\n"
+            "    }\n"
+            "}\n"
+        )
+
     def _write_xray_config(self):
         """
         Generate xray config with one inbound per VLESS server.
@@ -859,7 +989,8 @@ class AmneziaManager:
                 short_ids = vless.get("reality_short_ids")
                 if not short_ids:
                     sid = vless.get("reality_short_id") or ""
-                    short_ids = ["", sid] if sid else [""]
+                    # Only include non-empty short IDs (empty string = no auth required, security risk)
+                    short_ids = [sid] if sid else [""]
                 priv = vless.get("reality_private_key")
                 if not priv:
                     continue
@@ -927,24 +1058,45 @@ class AmneziaManager:
         server_names = self._reality_server_names_for_host(dest_host)
         priv, pub = self._generate_reality_keypair()
         short_id = self._generate_reality_short_id()
-        short_ids = ["", short_id]
+        # Non-empty shortId only: the empty string allows unauthenticated connections.
+        short_ids = [short_id]
+
+        # Fingerprint: which TLS client fingerprint Xray impersonates. chrome is the safest
+        # default; iOS users may benefit from ios/safari.
+        _valid_fps = {"chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized"}
+        fingerprint = str(server_data.get("fingerprint") or "chrome").strip().lower()
+        if fingerprint not in _valid_fps:
+            fingerprint = "chrome"
+
+        # use_stream=True: Xray listens on an internal-only port; nginx stream proxies
+        # external :443 to it based on the REALITY mask-domain SNI.  This is required for
+        # ISPs that use whitelist-based blocking (port 443 + whitelisted SNI = allowed).
+        use_stream = bool(server_data.get("use_stream", True))
 
         server_id = str(uuid.uuid4())[:6]
         subscription_id = self._generate_subscription_id()
-        inbound_port = self._allocate_xray_inbound_port()
+        if use_stream:
+            inbound_port = self._allocate_xray_stream_inbound_port()
+            client_port = 443
+        else:
+            inbound_port = self._allocate_xray_inbound_port()
+            client_port = inbound_port
 
         server_config = {
             "id": server_id,
             "name": server_name,
             "protocol": "vless",
-            "port": inbound_port,
+            # top-level port is the client-facing port (443 for stream mode, inbound_port otherwise)
+            "port": client_port,
             "status": "ready",
             "public_ip": self.public_ip,
             "created_at": time.time(),
             "clients": [],
             "vless": {
                 "domain": domain,
-                "port": inbound_port,
+                # client_port: what vless:// URIs advertise (443 in stream mode)
+                "port": client_port,
+                "client_port": client_port,
                 "path": path,
                 "mode": mode,
                 "host": host,
@@ -952,14 +1104,16 @@ class AmneziaManager:
                 "transport": "xhttp",
                 "encryption": "none",
                 "subscription_id": subscription_id,
+                # inbound_port: what Xray actually listens on (9443+ in stream mode)
                 "inbound_port": inbound_port,
+                "use_stream": use_stream,
                 "reality_dest": reality_dest,
                 "reality_server_names": server_names,
                 "reality_private_key": priv,
                 "reality_public_key": pub,
                 "reality_short_id": short_id,
                 "reality_short_ids": short_ids,
-                "reality_fingerprint": "chrome",
+                "reality_fingerprint": fingerprint,
             },
         }
 
@@ -967,12 +1121,20 @@ class AmneziaManager:
         self.save_config()
         self._write_xray_config()
         self._write_vless_nginx_locations()
+        self._write_vless_stream_config()
         return server_config
 
     def generate_vless_client_link(self, server, client_config):
         vless = server.get("vless") or {}
         domain = vless.get("domain")
-        port = int(vless.get("port") or vless.get("inbound_port") or 443)
+        # Use client_port (the port clients actually connect to).
+        # For stream-routed servers this is 443; for direct servers it's the inbound port.
+        port = int(
+            vless.get("client_port")
+            or vless.get("port")
+            or vless.get("inbound_port")
+            or 443
+        )
         path = vless.get("path") or "/"
         mode = vless.get("mode") or "stream-up"
         host = vless.get("host") or domain
@@ -1627,6 +1789,7 @@ H4 = {obfuscation_params['H4']}
             self.save_config()
             self._write_xray_config()
             self._write_vless_nginx_locations()
+            self._write_vless_stream_config()
             return True
 
         # Stop the server if running
@@ -2826,6 +2989,12 @@ def get_client_config_both(server_id, client_id):
         "clean_length": len(clean_config),
         "full_length": len(full_config)
     })
+
+@app.route('/api/vless/sni-presets')
+def vless_sni_presets():
+    """Return curated REALITY mask-domain presets for the UI."""
+    return jsonify(REALITY_SNI_PRESETS)
+
 
 @app.route('/api/sub/vless/<subscription_id>')
 def vless_subscription(subscription_id):

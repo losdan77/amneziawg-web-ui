@@ -51,6 +51,13 @@ class AmneziaApp {
             });
         }
 
+        const loadSniPresetsBtn = this.getElement('loadSniPresetsBtn');
+        if (loadSniPresetsBtn) {
+            loadSniPresetsBtn.addEventListener('click', () => {
+                this.toggleSniPresetsPanel();
+            });
+        }
+
         // Test create button
         const testCreateBtn = this.getElement('testCreateBtn');
         if (testCreateBtn) {
@@ -203,6 +210,55 @@ class AmneziaApp {
         }
         pathInput.value = `/secret-${token}`;
         this.hideError('vlessPathError');
+    }
+
+    async toggleSniPresetsPanel() {
+        const panel = this.getElement('sniPresetsPanel');
+        if (!panel) return;
+        if (!panel.classList.contains('hidden')) {
+            panel.classList.add('hidden');
+            return;
+        }
+        await this.loadSniPresets();
+        panel.classList.remove('hidden');
+    }
+
+    async loadSniPresets() {
+        const listEl = this.getElement('sniPresetsList');
+        const datalist = this.getElement('sniPresetList');
+        if (!listEl) return;
+        if (listEl.dataset.loaded === '1') return;
+        try {
+            const resp = await fetch('/api/vless/sni-presets');
+            if (!resp.ok) return;
+            const presets = await resp.json();
+            listEl.innerHTML = '';
+            if (datalist) datalist.innerHTML = '';
+            presets.forEach(p => {
+                // Clickable preset button
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'text-left p-2 rounded hover:bg-indigo-100 border border-indigo-100 cursor-pointer';
+                btn.innerHTML = `<span class="font-mono text-indigo-700">${p.host}</span><br><span class="text-gray-500">${p.desc}</span>`;
+                btn.addEventListener('click', () => {
+                    const destInput = this.getElement('vlessRealityDest');
+                    if (destInput) destInput.value = p.host;
+                    const panel = this.getElement('sniPresetsPanel');
+                    if (panel) panel.classList.add('hidden');
+                });
+                listEl.appendChild(btn);
+                // Also add to datalist for native autocomplete
+                if (datalist) {
+                    const opt = document.createElement('option');
+                    opt.value = p.host;
+                    opt.label = p.desc;
+                    datalist.appendChild(opt);
+                }
+            });
+            listEl.dataset.loaded = '1';
+        } catch (e) {
+            console.error('Failed to load SNI presets', e);
+        }
     }
 
     toggleObfuscationParams(show) {
@@ -678,14 +734,17 @@ class AmneziaApp {
         
         let formData;
         if (protocol === 'vless') {
+            const vlessDomainVal = (this.getElement('vlessDomain')?.value || '').trim();
             formData = {
                 protocol: 'vless',
                 name: nameElement ? nameElement.value.trim() : 'New VLESS Server',
-                domain: (this.getElement('vlessDomain')?.value || '').trim(),
-                host: (this.getElement('vlessDomain')?.value || '').trim(),
+                domain: vlessDomainVal,
+                host: vlessDomainVal,
                 path: (this.getElement('vlessPath')?.value || '').trim(),
-                xhttp_mode: (this.getElement('vlessXhttpMode')?.value || 'stream-up').trim(),
+                xhttp_mode: (this.getElement('vlessXhttpMode')?.value || 'auto').trim(),
                 reality_dest: (this.getElement('vlessRealityDest')?.value || '').trim(),
+                fingerprint: (this.getElement('vlessFingerprint')?.value || 'chrome').trim(),
+                use_stream: this.getElement('vlessUseStream')?.checked ?? true,
             };
         } else {
             formData = {
@@ -892,8 +951,14 @@ class AmneziaApp {
                             }
                         </p>
                         <p class="text-sm text-gray-500">Public IP: ${server.public_ip}</p>
-                        ${server.protocol === 'vless' && server.vless ? `
-                            <p class="text-xs text-gray-500">VLESS: ${server.vless.domain}:${server.vless.port} ${server.vless.path} (${server.vless.mode})${server.vless.security === 'reality' && server.vless.reality_dest ? ` · REALITY dest ${server.vless.reality_dest}` : ''}</p>
+                            ${server.protocol === 'vless' && server.vless ? `
+                            <p class="text-xs text-gray-500">
+                                VLESS: ${server.vless.domain}:${server.vless.port} ${server.vless.path} (${server.vless.mode})
+                                ${server.vless.security === 'reality' && server.vless.reality_dest ? ` · REALITY dest ${server.vless.reality_dest}` : ''}
+                                ${server.vless.use_stream
+                                    ? `<span class="ml-1 px-1 py-0.5 rounded bg-green-100 text-green-700 font-medium">порт 443 / stream</span>`
+                                    : `<span class="ml-1 px-1 py-0.5 rounded bg-yellow-100 text-yellow-700 font-medium">прямой порт ${server.vless.inbound_port}</span>`}
+                            </p>
                             <p class="text-xs text-gray-500">Subscription: <span class="font-mono">${this.getVlessSubscriptionUrl(server)}</span>
                                 <button onclick="amneziaApp.copyToClipboard('${btoa(this.getVlessSubscriptionUrl(server))}')" class="ml-2 text-blue-600 hover:text-blue-800 text-xs">Copy</button>
                             </p>

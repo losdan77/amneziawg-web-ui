@@ -23,8 +23,11 @@ RUN mkdir -p /app/web-ui /var/log/supervisor /var/log/webui /var/log/amnezia /va
 
 COPY web-ui /app/web-ui/
 
-RUN mkdir -p /run/nginx
-COPY config/nginx/ /etc/nginx/http.d/
+RUN mkdir -p /run/nginx /etc/nginx/stream.d
+# Copy the main nginx.conf (with stream module include) and HTTP server configs.
+COPY config/nginx/nginx.conf /etc/nginx/nginx.conf
+COPY config/nginx/default.conf /etc/nginx/http.d/default.conf
+COPY config/nginx/ssl.conf.template /etc/nginx/http.d/ssl.conf.template
 COPY config/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY config/cli.ini /etc/letsencrypt/cli.ini
 
