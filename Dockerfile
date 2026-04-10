@@ -9,6 +9,7 @@ RUN apk update && apk add \
     python3 \
     py3-pip \
     nginx \
+    nginx-mod-stream \
     supervisor \
     curl \
     apache2-utils \
