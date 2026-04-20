@@ -1074,6 +1074,15 @@ class AmneziaManager:
                         "path": path,
                         "mode": mode,
                         "host": host,
+                        # Random padding per packet defeats traffic-size fingerprinting by DPI.
+                        # Range "100-1000" adds 100–1000 random bytes to each request/response.
+                        "xPaddingBytes": "100-1000",
+                        # Limit individual POST chunk size to stay within typical browser upload range.
+                        # Default Xray value is very large and looks unnatural for browser traffic.
+                        "scMaxEachPostBytes": 1000000,
+                        # Minimum interval between consecutive upstream POSTs (ms).
+                        # Avoids burst patterns that differ from real browser behaviour.
+                        "scMinPostsIntervalMs": 30,
                     },
                 }
             else:
@@ -1084,6 +1093,9 @@ class AmneziaManager:
                         "path": path,
                         "mode": mode,
                         "host": host,
+                        "xPaddingBytes": "100-1000",
+                        "scMaxEachPostBytes": 1000000,
+                        "scMinPostsIntervalMs": 30,
                     },
                 }
 
@@ -1101,8 +1113,20 @@ class AmneziaManager:
 
         config = {
             "log": {"loglevel": "warning"},
+            "dns": {
+                # Use trusted foreign DNS for resolving reality_dest and outbound domains.
+                # Prevents leaking DNS queries through potentially censored resolvers.
+                "servers": ["1.1.1.1", "8.8.8.8"],
+                "queryStrategy": "UseIP"
+            },
             "inbounds": inbounds,
-            "outbounds": [{"protocol": "freedom", "settings": {}}],
+            "outbounds": [
+                {
+                    "protocol": "freedom",
+                    "settings": {"domainStrategy": "UseIP"},
+                    "tag": "direct"
+                }
+            ],
         }
 
         try:
