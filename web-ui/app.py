@@ -57,23 +57,87 @@ NGINX_STREAM_CONFIG_FILE = '/etc/nginx/stream_reality.conf'
 PUBLIC_IP_SERVICE = 'http://ifconfig.me'
 ENABLE_OBFUSCATION = True
 
-# Curated list of Russian / globally accessible domains suitable as REALITY mask targets.
-# Requirements: TLS 1.3, stable, reachable from EU VPS, likely on Russian ISP white-lists.
+# Curated list of domains suitable as REALITY mask targets.
+#
+# SELECTION CRITERIA:
+#   1. Reachable from a foreign VPS (not geo-blocking non-RU IPs) — critical for REALITY handshake
+#   2. Not blocked inside Russia — ideally whitelisted by ISPs
+#   3. TLS 1.3 + H2, stable, high-traffic (looks natural)
+#
+# Russian domains may geo-block foreign IPs — always verify from your VPS before use:
+#
+#   for d in max.ru web.max.ru vk.com yandex.ru gosuslugi.ru sberbank.ru; do
+#     timeout 5 bash -c "echo Q | openssl s_client -connect $d:443 -servername $d 2>&1" \
+#       | grep -q CONNECTED && echo "OK  $d" || echo "FAIL $d"
+#   done
 REALITY_SNI_PRESETS = [
-    {"host": "www.gosuslugi.ru:443",  "desc": "Госуслуги — правительство РФ, 100% в белых списках"},
-    {"host": "esia.gosuslugi.ru:443", "desc": "ЕСИА / Госуслуги — авторизация"},
-    {"host": "mos.ru:443",            "desc": "Mos.ru — портал Москвы"},
-    {"host": "www.sberbank.ru:443",   "desc": "Сбербанк"},
-    {"host": "www.tbank.ru:443",      "desc": "Т-Банк (Тинькофф)"},
-    {"host": "vk.com:443",            "desc": "ВКонтакте"},
-    {"host": "ok.ru:443",             "desc": "Одноклассники"},
-    {"host": "mail.ru:443",           "desc": "Mail.ru"},
-    {"host": "yandex.ru:443",         "desc": "Яндекс"},
-    {"host": "ria.ru:443",            "desc": "РИА Новости — государственное СМИ"},
-    {"host": "1tv.ru:443",            "desc": "Первый канал"},
-    {"host": "web.max.ru:443",        "desc": "Max (VK стриминг) — высокий трафик"},
-    {"host": "www.microsoft.com:443", "desc": "Microsoft — нейтральный, для ISP без белых списков"},
-    {"host": "www.apple.com:443",     "desc": "Apple"},
+    # ── Иностранные: глобально доступны + в белых списках RU ISP (РЕКОМЕНДУЮТСЯ) ──────────
+    {"host": "www.microsoft.com:443",      "desc": "Microsoft — Windows Update, в белых списках всех ISP"},
+    {"host": "www.apple.com:443",          "desc": "Apple — Software Update, широко разрешён"},
+    {"host": "addons.mozilla.org:443",     "desc": "Mozilla CDN (Cloudflare) — обновления Firefox"},
+    {"host": "dl.google.com:443",          "desc": "Google Downloads — обновления Chrome/Android"},
+    {"host": "github.com:443",             "desc": "GitHub — не заблокирован в РФ, доступен глобально"},
+    {"host": "cdn.jsdelivr.net:443",       "desc": "jsDelivr CDN — популярный CDN, TLS 1.3"},
+    {"host": "releases.ubuntu.com:443",    "desc": "Ubuntu CDN — обновления ОС, не блокируется"},
+    {"host": "www.cloudflare.com:443",     "desc": "Cloudflare — инфраструктурный домен"},
+    # ── Мессенджер Макс (VK Max) — проверить доступность с VPS ──────────────────────────────
+    {"host": "max.ru:443",                 "desc": "Max — главный домен мессенджера"},
+    {"host": "web.max.ru:443",             "desc": "Max — веб-версия мессенджера (высокий трафик)"},
+    {"host": "static.max.ru:443",          "desc": "Max — статика / CDN"},
+    {"host": "api.max.ru:443",             "desc": "Max — API"},
+    {"host": "userapi.com:443",            "desc": "VK/Max — CDN медиафайлов и аватаров"},
+    {"host": "vk-cdn.net:443",             "desc": "VK/Max — CDN видео и аудио"},
+    {"host": "vkuseraudio.net:443",        "desc": "VK/Max — стриминг аудио"},
+    {"host": "vkuservideo.net:443",        "desc": "VK/Max — стриминг видео"},
+    # ── ВКонтакте — проверить доступность с VPS ─────────────────────────────────────────────
+    {"host": "vk.com:443",                 "desc": "ВКонтакте — соцсеть"},
+    {"host": "id.vk.com:443",              "desc": "VK ID — авторизация"},
+    {"host": "m.vk.com:443",               "desc": "ВКонтакте — мобильная версия"},
+    # ── Яндекс — проверить доступность с VPS ────────────────────────────────────────────────
+    {"host": "yandex.ru:443",              "desc": "Яндекс — главная страница"},
+    {"host": "ya.ru:443",                  "desc": "Яндекс — короткий домен"},
+    {"host": "yastatic.net:443",           "desc": "Яндекс — CDN статики"},
+    {"host": "yandex.net:443",             "desc": "Яндекс — инфраструктурный домен"},
+    {"host": "mail.yandex.ru:443",         "desc": "Яндекс.Почта"},
+    # ── Mail.ru Group / VK Tech — проверить доступность с VPS ───────────────────────────────
+    {"host": "mail.ru:443",                "desc": "Mail.ru — почта"},
+    {"host": "ok.ru:443",                  "desc": "Одноклассники"},
+    {"host": "my.mail.ru:443",             "desc": "Mail.ru — социальная сеть"},
+    # ── Банки и финансы — проверить доступность с VPS ───────────────────────────────────────
+    {"host": "www.tbank.ru:443",           "desc": "Т-Банк (Тинькофф)"},
+    {"host": "www.sberbank.ru:443",        "desc": "Сбербанк"},
+    {"host": "online.sberbank.ru:443",     "desc": "Сбербанк Онлайн"},
+    {"host": "www.vtb.ru:443",             "desc": "ВТБ"},
+    {"host": "alfabank.ru:443",            "desc": "Альфа-Банк"},
+    {"host": "www.raiffeisen.ru:443",      "desc": "Райффайзен Банк"},
+    # ── Госсервисы — проверить доступность с VPS ────────────────────────────────────────────
+    {"host": "www.gosuslugi.ru:443",       "desc": "Госуслуги — портал госсервисов РФ"},
+    {"host": "esia.gosuslugi.ru:443",      "desc": "ЕСИА — авторизация Госуслуг"},
+    {"host": "mos.ru:443",                 "desc": "Mos.ru — портал Москвы"},
+    {"host": "www.nalog.gov.ru:443",       "desc": "ФНС — налоговая служба"},
+    {"host": "pfr.gov.ru:443",             "desc": "СФР (ПФР) — пенсионный фонд"},
+    # ── СМИ и медиа — проверить доступность с VPS ───────────────────────────────────────────
+    {"host": "ria.ru:443",                 "desc": "РИА Новости — государственное СМИ"},
+    {"host": "1tv.ru:443",                 "desc": "Первый канал"},
+    {"host": "rbc.ru:443",                 "desc": "РБК — деловые новости"},
+    {"host": "kommersant.ru:443",          "desc": "Коммерсантъ"},
+    {"host": "tass.ru:443",                "desc": "ТАСС — государственное СМИ"},
+    {"host": "www.kp.ru:443",              "desc": "Комсомольская правда"},
+    {"host": "lenta.ru:443",               "desc": "Лента.ру — новости"},
+    {"host": "iz.ru:443",                  "desc": "Известия"},
+    {"host": "gazeta.ru:443",              "desc": "Газета.ру"},
+    # ── Стриминг и развлечения — проверить доступность с VPS ────────────────────────────────
+    {"host": "www.ivi.ru:443",             "desc": "IVI — стриминг видео"},
+    {"host": "www.kinopoisk.ru:443",       "desc": "Кинопоиск (Яндекс)"},
+    {"host": "okko.tv:443",                "desc": "Okko — стриминг (Сбер)"},
+    {"host": "more.tv:443",                "desc": "more.tv — стриминг НТВ"},
+    {"host": "premier.one:443",            "desc": "PREMIER — стриминг"},
+    # ── Маркетплейсы и e-commerce — проверить доступность с VPS ─────────────────────────────
+    {"host": "www.wildberries.ru:443",     "desc": "Wildberries — маркетплейс"},
+    {"host": "www.ozon.ru:443",            "desc": "Ozon — маркетплейс"},
+    {"host": "www.avito.ru:443",           "desc": "Авито — объявления"},
+    {"host": "www.dns-shop.ru:443",        "desc": "DNS — магазин электроники"},
+    {"host": "www.citilink.ru:443",        "desc": "Ситилинк — электроника"},
 ]
 
 print(f"Base directory: {BASE_DIR}")
