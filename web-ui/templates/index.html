@@ -76,15 +76,33 @@
                 <div id="vlessFields" class="border rounded-lg p-4 bg-gray-50 hidden">
                     <h3 class="text-lg font-medium mb-3">VLESS + REALITY + XHTTP</h3>
 
+                    <!-- Whitelist limitation warning -->
+                    <div class="mb-4 p-3 rounded-lg bg-amber-50 border border-amber-300">
+                        <p class="text-amber-900 text-xs font-semibold mb-1">⚠ Об обходе белых списков (Орёл, МТС, Мегафон)</p>
+                        <p class="text-amber-800 text-xs">
+                            ТСПУ в режиме белых списков <strong>замораживает</strong> все TCP-сессии к зарубежным IP после 15–20 KB —
+                            не RST, а именно freeze, соединение виснет. VLESS+Reality на <em>зарубежном VPS</em> в этом режиме не работает
+                            вне зависимости от протокола.
+                        </p>
+                        <p class="text-amber-800 text-xs mt-1">
+                            <strong>Решение — цепочка (chain):</strong> клиент → российский VPS с «белым» IP (Yandex.Cloud / EDGE CDN) →
+                            зарубежный VPS → интернет. Российский узел настраивается как relay через <code>vnext</code> в Xray outbound.
+                            Трафик внутри страны ТСПУ не замораживает.
+                        </p>
+                        <p class="text-amber-800 text-xs mt-1">
+                            Проверить, «белый» ли IP у хостинга: запустите на порту 443 веб-сервер и откройте сайт с мобильного МТС/Мегафон без VPN.
+                        </p>
+                    </div>
+
                     <!-- Port 443 stream routing toggle -->
                     <div class="mb-4 p-3 rounded-lg bg-blue-50 border border-blue-200">
                         <label class="inline-flex items-center text-sm font-medium text-blue-800">
                             <input type="checkbox" id="vlessUseStream" checked class="mr-2 h-4 w-4">
-                            Использовать порт 443 (обход белых списков)
+                            Использовать порт 443 (обход SNI-based белых списков)
                         </label>
                         <p class="text-blue-700 text-xs mt-1">
                             <strong>Рекомендуется.</strong> nginx stream проксирует внешний :443 к Xray по SNI. Нужен SSL (SSL_DOMAIN).
-                            Без галочки — Xray слушает напрямую на порту 8443+ (обходит только DPI, не белые списки).
+                            Обходит ISP, которые фильтруют по SNI-имени, но не по IP. Без галочки — Xray слушает на 8443+.
                         </p>
                     </div>
 
@@ -99,10 +117,12 @@
                         <div>
                             <label class="block text-sm font-medium text-gray-700">XHTTP mode</label>
                             <select id="vlessXhttpMode" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
-                                <option value="auto" selected>auto (рекомендуется — HAPP/v2rayN)</option>
+                                <option value="packet-up" selected>packet-up (рекомендуется — лучший обход DPI)</option>
+                                <option value="auto">auto (совместимость: HAPP/v2rayN/Hiddify)</option>
                                 <option value="stream-up">stream-up</option>
                                 <option value="stream-down">stream-down</option>
                             </select>
+                            <p class="text-gray-500 text-xs mt-1">packet-up: каждый чанк — отдельный HTTP POST (как загрузка файла в браузере). Труднее фингерпринтить DPI.</p>
                         </div>
                     </div>
 
@@ -534,5 +554,120 @@
     </script>
 
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     Bridge / Chain relay generator modal
+     Opens when user clicks "Цепочка (обход WL)" on a VLESS server card.
+     ═══════════════════════════════════════════════════════════════════ -->
+<div id="bridgeModal" class="fixed inset-0 bg-black bg-opacity-50 z-50 hidden flex items-center justify-center p-4">
+  <div class="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-screen overflow-y-auto">
+    <div class="p-6">
+      <div class="flex justify-between items-start mb-4">
+        <div>
+          <h2 class="text-xl font-bold text-gray-900">Цепочка через российский VPS</h2>
+          <p class="text-sm text-gray-500 mt-1">Генерация relay-конфига для обхода белых списков</p>
+        </div>
+        <button onclick="app.closeBridgeModal()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none">&times;</button>
+      </div>
+
+      <!-- Scheme explanation -->
+      <div class="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 text-xs text-blue-900">
+        <p class="font-semibold mb-1">Схема подключения:</p>
+        <p class="font-mono text-center py-1 bg-blue-100 rounded">
+          Клиент → Российский VPS (белый IP) → Зарубежный VPS (этот сервер) → Интернет
+        </p>
+        <p class="mt-2">Инструмент сгенерирует <strong>xray config.json</strong> для российского VPS и готовую <strong>vless:// ссылку</strong> для клиентов.
+          Российский VPS должен иметь «белый» IP — проверьте открыв его на порту 443 с МТС/Мегафон без VPN.</p>
+      </div>
+
+      <!-- Bridge params form -->
+      <div id="bridgeForm">
+        <input type="hidden" id="bridgeServerId" value="">
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+          <div>
+            <label class="block text-sm font-medium text-gray-700">IP российского VPS *</label>
+            <input type="text" id="bridgeIp" placeholder="185.X.X.X"
+                   class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+            <p class="text-xs text-gray-500 mt-1">Только IP-адрес (домен не нужен). Должен быть «белым».</p>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700">Порт (по умолч. 443)</label>
+            <input type="number" id="bridgePort" value="443" min="1" max="65535"
+                   class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+          <div>
+            <label class="block text-sm font-medium text-gray-700">Reality маска для bridge</label>
+            <input type="text" id="bridgeRealityDest" value="vkvideo.ru:443"
+                   class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+            <p class="text-xs text-gray-500 mt-1">Под какой сайт маскируется вход на bridge. vkvideo.ru — рекомендовано.</p>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700">TLS fingerprint</label>
+            <select id="bridgeFingerprint" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+              <option value="chrome" selected>chrome</option>
+              <option value="firefox">firefox</option>
+              <option value="safari">safari</option>
+              <option value="ios">ios</option>
+              <option value="android">android</option>
+              <option value="random">random</option>
+            </select>
+          </div>
+        </div>
+
+        <p id="bridgeError" class="text-red-600 text-sm mb-3 hidden"></p>
+
+        <button onclick="app.generateBridge()" id="bridgeGenBtn"
+                class="w-full bg-indigo-600 text-white py-2 px-4 rounded-md hover:bg-indigo-700 font-medium">
+          Сгенерировать конфиг
+        </button>
+      </div>
+
+      <!-- Result section (hidden until generated) -->
+      <div id="bridgeResult" class="hidden mt-4">
+        <hr class="mb-4">
+
+        <!-- Client link -->
+        <div class="mb-4">
+          <label class="block text-sm font-semibold text-gray-700 mb-1">Ссылка для клиентов (vless://)</label>
+          <p class="text-xs text-gray-500 mb-1">Раздайте эту ссылку пользователям вместо оригинальной — она ведёт через российский relay.</p>
+          <div class="flex gap-2">
+            <input type="text" id="bridgeClientLink" readonly
+                   class="block w-full border border-green-300 bg-green-50 rounded-md px-3 py-2 text-xs font-mono">
+            <button onclick="app.copyBridgeLink()" class="bg-green-600 text-white px-3 py-2 rounded-md hover:bg-green-700 text-sm whitespace-nowrap">
+              Копировать
+            </button>
+          </div>
+        </div>
+
+        <!-- Deploy instructions -->
+        <div class="mb-4 bg-gray-50 rounded-lg p-3 text-xs">
+          <p class="font-semibold text-gray-700 mb-2">Установка на российском VPS (Docker):</p>
+          <pre id="bridgeDeployCmd" class="font-mono text-gray-600 whitespace-pre-wrap overflow-x-auto"></pre>
+        </div>
+
+        <!-- Config JSON -->
+        <div>
+          <div class="flex justify-between items-center mb-1">
+            <label class="block text-sm font-semibold text-gray-700">xray config.json для российского VPS</label>
+            <div class="flex gap-2">
+              <button onclick="app.copyBridgeConfig()" class="text-xs bg-gray-200 px-2 py-1 rounded hover:bg-gray-300">
+                Копировать JSON
+              </button>
+              <button onclick="app.downloadBridgeConfig()" class="text-xs bg-blue-500 text-white px-2 py-1 rounded hover:bg-blue-600">
+                Скачать файл
+              </button>
+            </div>
+          </div>
+          <textarea id="bridgeConfigJson" readonly rows="16"
+                    class="w-full border border-gray-300 rounded-md px-3 py-2 text-xs font-mono bg-gray-50 resize-none"></textarea>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 </body>
 </html>

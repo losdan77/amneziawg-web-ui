@@ -988,7 +988,13 @@ class AmneziaApp {
                     <button onclick="amneziaApp.addClient('${server.id}')" class="bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600">
                         Add Client
                     </button>
-                    ${server.protocol === 'vless' ? '' : `
+                    ${server.protocol === 'vless' ? `
+                    <button onclick="amneziaApp.openBridgeModal('${server.id}')"
+                            class="bg-purple-600 text-white px-3 py-1 rounded hover:bg-purple-700 text-sm"
+                            title="Генерация relay-конфига через российский VPS для обхода белых списков">
+                        🔗 Цепочка (обход WL)
+                    </button>
+                    ` : `
                     <button onclick="amneziaApp.changeServerTier('${server.id}', '${server.bandwidth_tier || 'free'}')" class="bg-orange-500 text-white px-3 py-1 rounded hover:bg-orange-600">
                         Change Tier
                     </button>
@@ -2072,3 +2078,128 @@ class AmneziaApp {
 // Initialize the application
 const amneziaApp = new AmneziaApp();
 const app = amneziaApp; // Alias for convenience
+
+// ─── Bridge / Chain relay modal ───────────────────────────────────────────────
+
+app._bridgeConfigData = null; // holds last generated bridge result
+
+app.openBridgeModal = function(serverId) {
+    document.getElementById('bridgeServerId').value = serverId;
+    document.getElementById('bridgeError').classList.add('hidden');
+    document.getElementById('bridgeResult').classList.add('hidden');
+    document.getElementById('bridgeForm').style.display = '';
+    document.getElementById('bridgeGenBtn').disabled = false;
+    document.getElementById('bridgeGenBtn').textContent = 'Сгенерировать конфиг';
+    document.getElementById('bridgeModal').classList.remove('hidden');
+};
+
+app.closeBridgeModal = function() {
+    document.getElementById('bridgeModal').classList.add('hidden');
+    app._bridgeConfigData = null;
+};
+
+app.generateBridge = async function() {
+    const serverId = document.getElementById('bridgeServerId').value;
+    const bridgeIp = (document.getElementById('bridgeIp').value || '').trim();
+    const bridgePort = parseInt(document.getElementById('bridgePort').value || '443');
+    const bridgeRealityDest = (document.getElementById('bridgeRealityDest').value || 'vkvideo.ru:443').trim();
+    const bridgeFp = document.getElementById('bridgeFingerprint').value || 'chrome';
+
+    const errEl = document.getElementById('bridgeError');
+    errEl.classList.add('hidden');
+
+    if (!bridgeIp) {
+        errEl.textContent = 'Введите IP российского VPS.';
+        errEl.classList.remove('hidden');
+        return;
+    }
+
+    const btn = document.getElementById('bridgeGenBtn');
+    btn.disabled = true;
+    btn.textContent = 'Генерация…';
+
+    try {
+        const resp = await fetch(`/api/servers/${serverId}/bridge`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                bridge_ip: bridgeIp,
+                bridge_port: bridgePort,
+                bridge_reality_dest: bridgeRealityDest,
+                bridge_fingerprint: bridgeFp,
+            })
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            errEl.textContent = data.error || 'Ошибка генерации.';
+            errEl.classList.remove('hidden');
+            btn.disabled = false;
+            btn.textContent = 'Сгенерировать конфиг';
+            return;
+        }
+
+        app._bridgeConfigData = data;
+
+        // Fill client link
+        document.getElementById('bridgeClientLink').value = data.client_link || '';
+
+        // Fill deploy instructions
+        const deployCmd =
+            `# 1. Установите Docker на российский VPS:\n` +
+            `#    curl -fsSL https://get.docker.com | sh\n\n` +
+            `# 2. Создайте директорию и сохраните config.json (кнопка "Скачать файл" ниже):\n` +
+            `mkdir -p /etc/xray\n` +
+            `# скопируйте файл bridge-config.json в /etc/xray/config.json\n\n` +
+            `# 3. Запустите Xray:\n` +
+            `docker run -d --name xray --restart unless-stopped \\\n` +
+            `  -p ${data.bridge_port}:${data.bridge_port}/tcp \\\n` +
+            `  -v /etc/xray:/etc/amnezia/xray \\\n` +
+            `  teddysun/xray:26.3.27\n\n` +
+            `# 4. Проверьте «белый» IP: откройте http://${data.bridge_ip} с телефона МТС/Мегафон\n` +
+            `#    без VPN — должен открыться (или вернуть ответ сервера).\n\n` +
+            `# 5. Раздайте клиентам ссылку vless:// (скопируйте выше).`;
+        document.getElementById('bridgeDeployCmd').textContent = deployCmd;
+
+        // Fill JSON
+        document.getElementById('bridgeConfigJson').value =
+            JSON.stringify(data.bridge_config, null, 2);
+
+        document.getElementById('bridgeResult').classList.remove('hidden');
+        btn.textContent = 'Перегенерировать';
+        btn.disabled = false;
+    } catch (e) {
+        errEl.textContent = 'Сетевая ошибка: ' + e.message;
+        errEl.classList.remove('hidden');
+        btn.disabled = false;
+        btn.textContent = 'Сгенерировать конфиг';
+    }
+};
+
+app.copyBridgeLink = function() {
+    const val = document.getElementById('bridgeClientLink').value;
+    if (val) navigator.clipboard.writeText(val).catch(() => {});
+};
+
+app.copyBridgeConfig = function() {
+    const val = document.getElementById('bridgeConfigJson').value;
+    if (val) navigator.clipboard.writeText(val).catch(() => {});
+};
+
+app.downloadBridgeConfig = function() {
+    const val = document.getElementById('bridgeConfigJson').value;
+    if (!val) return;
+    const blob = new Blob([val], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'bridge-config.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+};
+
+// Close bridge modal on backdrop click
+document.getElementById('bridgeModal').addEventListener('click', function(e) {
+    if (e.target === this) app.closeBridgeModal();
+});

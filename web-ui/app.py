@@ -71,7 +71,15 @@ ENABLE_OBFUSCATION = True
 #       | grep -q CONNECTED && echo "OK  $d" || echo "FAIL $d"
 #   done
 REALITY_SNI_PRESETS = [
-    # ── Иностранные: глобально доступны + в белых списках RU ISP (РЕКОМЕНДУЮТСЯ) ──────────
+    # ── ★ ЛУЧШИЕ для белых списков РФ (из рабочих WL-конфигов 2025-2026) ─────────────────────
+    # Эти домены встречаются в реально работающих whitelist-конфигах для МТС/Мегафон/Билайн.
+    # ВАЖНО: домен должен быть доступен с вашего VPS (проверьте: openssl s_client -connect vkvideo.ru:443)
+    {"host": "vkvideo.ru:443",             "desc": "★ VK Video — в белых списках МТС/Мегафон, рекомендован для WL"},
+    {"host": "rutube.ru:443",              "desc": "★ Rutube — государственный видеохостинг, широко разрешён в WL"},
+    {"host": "cloud.mail.ru:443",          "desc": "★ Mail.ru Cloud — фигурирует в рабочих WL-конфигах"},
+    {"host": "ir.ozone.ru:443",            "desc": "★ Ozon CDN — встречается в whitelist-конфигах"},
+    {"host": "www.vk.com:443",             "desc": "★ ВКонтакте — используется в рабочих WL-конфигах"},
+    # ── Иностранные: глобально доступны + в белых списках RU ISP ─────────────────────────────
     {"host": "www.microsoft.com:443",      "desc": "Microsoft — Windows Update, в белых списках всех ISP"},
     {"host": "www.apple.com:443",          "desc": "Apple — Software Update, широко разрешён"},
     {"host": "addons.mozilla.org:443",     "desc": "Mozilla CDN (Cloudflare) — обновления Firefox"},
@@ -744,8 +752,10 @@ class AmneziaManager:
         return value
 
     def _normalize_xhttp_mode(self, mode):
-        value = str(mode or "").strip().lower() or "stream-up"
-        allowed = {"stream-up", "stream-down", "auto"}
+        # packet-up: each upstream chunk is a separate HTTP POST — looks like browser file uploads,
+        # harder to fingerprint than a persistent stream.  Recommended for whitelist-bypass setups.
+        value = str(mode or "").strip().lower() or "packet-up"
+        allowed = {"stream-up", "stream-down", "packet-up", "auto"}
         if value not in allowed:
             raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
         return value
@@ -848,6 +858,21 @@ class AmneziaManager:
 
     def _generate_reality_short_id(self):
         return secrets.token_hex(4)
+
+    def _generate_random_path(self):
+        """Random URL path that looks like a legit API endpoint."""
+        segments = [
+            "api", "v1", "v2", "data", "update", "sync", "upload", "push",
+            "stream", "feed", "event", "metrics", "health", "status",
+        ]
+        words = [
+            "user", "device", "session", "token", "report", "log", "stats",
+            "telemetry", "beacon", "ping", "batch", "bulk", "queue", "notify",
+        ]
+        part1 = random.choice(segments)
+        part2 = random.choice(words)
+        suffix = secrets.token_hex(3)
+        return f"/{part1}/{part2}/{suffix}"
 
     def _generate_subscription_id(self):
         return base64.urlsafe_b64encode(os.urandom(24)).decode("utf-8").rstrip("=")
@@ -1069,6 +1094,10 @@ class AmneziaManager:
                         "serverNames": server_names,
                         "privateKey": priv,
                         "shortIds": short_ids,
+                        # Allow up to 70 s clock drift between client and server.
+                        # Without this, a client with a slightly off clock gets silently rejected by
+                        # Reality's timestamp check — looks like the VPN "doesn't connect".
+                        "maxTimeDiff": 70000,
                     },
                     "xhttpSettings": {
                         "path": path,
@@ -1211,6 +1240,195 @@ class AmneziaManager:
         self._write_vless_nginx_locations()
         self._write_vless_stream_config()
         return server_config
+
+    def create_bridge_config(self, server_id, bridge_data):
+        """
+        Generate an Xray relay (bridge/chain) config for a Russian VPS.
+
+        Architecture:
+            Client → Bridge VPS (Russian, whitelisted IP)
+                        └─ vnext ─→ Exit VPS (this server, foreign)
+                                         └─→ Internet
+
+        The bridge VPS accepts VLESS+Reality+XHTTP from clients and
+        forwards all traffic to the exit node (this server) via vnext.
+        TSPU allows traffic to the Russian VPS because its IP is whitelisted.
+        """
+        server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
+        if not server or server.get('protocol') != 'vless':
+            raise ValueError("VLESS server not found")
+        vless = server.get('vless') or {}
+        if not self._vless_is_reality(vless):
+            raise ValueError("Bridge is only supported for REALITY servers")
+
+        # ── Bridge VPS parameters ────────────────────────────────────────────
+        bridge_ip = str(bridge_data.get('bridge_ip') or '').strip()
+        if not bridge_ip:
+            raise ValueError("bridge_ip is required")
+        try:
+            ipaddress.ip_address(bridge_ip)
+        except ValueError as exc:
+            raise ValueError("bridge_ip must be a valid IP address") from exc
+
+        bridge_port = int(bridge_data.get('bridge_port') or 443)
+        if not 1 <= bridge_port <= 65535:
+            raise ValueError("bridge_port must be between 1 and 65535")
+
+        raw_dest = str(bridge_data.get('bridge_reality_dest') or 'vkvideo.ru:443').strip()
+        bridge_reality_dest, bridge_dest_host = self._normalize_reality_dest(raw_dest)
+        bridge_server_names = self._reality_server_names_for_host(bridge_dest_host)
+
+        bridge_path = str(bridge_data.get('bridge_path') or '').strip() or self._generate_random_path()
+        if not bridge_path.startswith('/'):
+            bridge_path = '/' + bridge_path
+
+        _valid_fps = {"chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random"}
+        bridge_fp = str(bridge_data.get('bridge_fingerprint') or 'chrome').strip().lower()
+        if bridge_fp not in _valid_fps:
+            bridge_fp = 'chrome'
+
+        # ── Generate fresh cryptographic material for the bridge inbound ────
+        bridge_priv, bridge_pub = self._generate_reality_keypair()
+        bridge_short_id = self._generate_reality_short_id()
+        bridge_uuid = str(uuid.uuid4())
+
+        # ── Create a dedicated exit-node client for the bridge ───────────────
+        # Using a separate UUID prevents bridge traffic from being mixed with
+        # regular users and makes it easier to revoke bridge access later.
+        bridge_client_name = f"bridge-{bridge_ip.replace('.', '-')}"
+        existing_bridge_client = next(
+            (c for c in server.get('clients', [])
+             if c.get('name') == bridge_client_name and not self._is_client_expired(c)),
+            None
+        )
+        if existing_bridge_client:
+            exit_uuid = existing_bridge_client['uuid']
+        else:
+            new_client, _, _ = self.add_vless_client(server_id, bridge_client_name, "forever")
+            exit_uuid = new_client['uuid']
+
+        # ── Exit node connection parameters ──────────────────────────────────
+        exit_domain = vless.get('domain') or server.get('public_ip') or ''
+        exit_port = int(vless.get('client_port') or vless.get('port') or 443)
+        exit_path = vless.get('path') or '/'
+        exit_mode = vless.get('mode') or 'packet-up'
+        exit_sni = (vless.get('reality_server_names') or ['www.microsoft.com'])[0]
+        exit_pbk = vless.get('reality_public_key') or ''
+        exit_sid = vless.get('reality_short_id') or ''
+        exit_fp = vless.get('reality_fingerprint') or 'chrome'
+
+        # ── Compose bridge Xray config ────────────────────────────────────────
+        bridge_config = {
+            "log": {"loglevel": "warning"},
+            "dns": {
+                "servers": ["1.1.1.1", "8.8.8.8"],
+                "queryStrategy": "UseIP"
+            },
+            "inbounds": [{
+                "tag": "bridge-inbound",
+                "listen": "0.0.0.0",
+                "port": bridge_port,
+                "protocol": "vless",
+                "settings": {
+                    "clients": [{"id": bridge_uuid, "email": "bridge"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "show": False,
+                        "target": bridge_reality_dest,
+                        "xver": 0,
+                        "serverNames": bridge_server_names,
+                        "privateKey": bridge_priv,
+                        "shortIds": [bridge_short_id],
+                        "maxTimeDiff": 70000,
+                    },
+                    "xhttpSettings": {
+                        "path": bridge_path,
+                        "mode": "packet-up",
+                        "host": bridge_dest_host,
+                        "xPaddingBytes": "100-1000",
+                        "scMaxEachPostBytes": 1000000,
+                        "scMinPostsIntervalMs": 30,
+                    }
+                }
+            }],
+            "outbounds": [
+                {
+                    "tag": "chain-to-exit",
+                    "protocol": "vless",
+                    "settings": {
+                        "vnext": [{
+                            "address": exit_domain,
+                            "port": exit_port,
+                            "users": [{
+                                "id": exit_uuid,
+                                "flow": "",
+                                "encryption": "none"
+                            }]
+                        }]
+                    },
+                    "streamSettings": {
+                        "network": "xhttp",
+                        "security": "reality",
+                        "realitySettings": {
+                            "fingerprint": exit_fp,
+                            "serverName": exit_sni,
+                            "publicKey": exit_pbk,
+                            "shortId": exit_sid,
+                        },
+                        "xhttpSettings": {
+                            "mode": exit_mode,
+                            "path": exit_path,
+                            "host": exit_sni,
+                            "xPaddingBytes": "100-1000",
+                        }
+                    }
+                },
+                {"protocol": "freedom", "tag": "direct"}
+            ],
+            "routing": {
+                "domainStrategy": "IPIfNonMatch",
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["bridge-inbound"],
+                    "outboundTag": "chain-to-exit"
+                }]
+            }
+        }
+
+        # ── Client vless:// link pointing to the bridge ───────────────────────
+        label = self._sanitize_label(f"{server.get('name', 'VPN')}-via-Bridge")
+        client_link = (
+            f"vless://{bridge_uuid}@{bridge_ip}:{bridge_port}"
+            f"?encryption=none"
+            f"&security=reality"
+            f"&type=xhttp"
+            f"&path={quote(bridge_path, safe='')}"
+            f"&mode=packet-up"
+            f"&host={quote(bridge_dest_host, safe='')}"
+            f"&sni={quote(bridge_server_names[0], safe='')}"
+            f"&fp={quote(bridge_fp, safe='')}"
+            f"&pbk={quote(bridge_pub, safe='')}"
+            f"&sid={quote(bridge_short_id, safe='')}"
+            f"&spx={quote('/', safe='')}"
+            f"&flow="
+            f"#{quote(label, safe='')}"
+        )
+
+        return {
+            "bridge_config": bridge_config,
+            "client_link": client_link,
+            "bridge_uuid": bridge_uuid,
+            "bridge_pub": bridge_pub,
+            "bridge_short_id": bridge_short_id,
+            "exit_uuid": exit_uuid,
+            "bridge_ip": bridge_ip,
+            "bridge_port": bridge_port,
+            "bridge_reality_dest": bridge_reality_dest,
+        }
 
     def generate_vless_client_link(self, server, client_config):
         vless = server.get("vless") or {}
@@ -3082,6 +3300,29 @@ def get_client_config_both(server_id, client_id):
 def vless_sni_presets():
     """Return curated REALITY mask-domain presets for the UI."""
     return jsonify(REALITY_SNI_PRESETS)
+
+
+@app.route('/api/servers/<server_id>/bridge', methods=['POST'])
+def generate_bridge_config(server_id):
+    """
+    Generate an Xray relay config for a Russian 'bridge' VPS.
+
+    POST body (JSON):
+      bridge_ip          – IP of the Russian VPS (required)
+      bridge_port        – listen port on the bridge, default 443
+      bridge_reality_dest– Reality mask domain, e.g. vkvideo.ru:443
+      bridge_path        – XHTTP path, auto-generated if omitted
+      bridge_fingerprint – uTLS fingerprint (chrome/firefox/…)
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        result = amnezia_manager.create_bridge_config(server_id, data)
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        print(f"Bridge config generation error: {e}")
+        return jsonify({"error": "Internal error generating bridge config"}), 500
 
 
 @app.route('/api/sub/vless/<subscription_id>')
