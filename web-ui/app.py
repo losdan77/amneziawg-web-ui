@@ -1070,6 +1070,34 @@ class AmneziaManager:
                     continue
                 clients.append({"id": client["uuid"], "email": self._sanitize_label(client.get("name"), "client")})
 
+            # Common XHTTP anti-DPI parameters shared by REALITY and legacy inbounds.
+            # Kept in one place so both paths benefit from the same masking tuning.
+            common_xhttp = {
+                "path": path,
+                "mode": mode,
+                "host": host,
+                # Random padding per packet defeats traffic-size fingerprinting by DPI.
+                "xPaddingBytes": "100-1000",
+                # Limit individual POST chunk size to stay within typical browser upload range.
+                "scMaxEachPostBytes": 1000000,
+                # Minimum interval between consecutive upstream POSTs (ms).
+                "scMinPostsIntervalMs": 30,
+                # Cap buffered packet-up posts per session; prevents a single client from
+                # allocating unbounded memory and keeps the burst pattern close to a browser.
+                "scMaxBufferedPosts": 30,
+                # Keep default SSE-style Content-Type header so traffic mimics EventSource streams.
+                "noSSEHeader": False,
+            }
+            # Socket-level options applied to the Xray inbound socket. BBR gives more stable
+            # throughput under loss (common on congested RU ISP links) and shifts RTT patterns
+            # away from the default cubic signature. Kernels without BBR fall back silently.
+            common_sockopt = {
+                "tcpcongestion": "bbr",
+                "tcpKeepAliveInterval": 30,
+                "tcpKeepAliveIdle": 300,
+                "tcpFastOpen": True,
+            }
+
             if self._vless_is_reality(vless):
                 reality_dest = vless.get("reality_dest") or "www.microsoft.com:443"
                 server_names = vless.get("reality_server_names") or self._reality_server_names_for_host(
@@ -1099,33 +1127,15 @@ class AmneziaManager:
                         # Reality's timestamp check — looks like the VPN "doesn't connect".
                         "maxTimeDiff": 70000,
                     },
-                    "xhttpSettings": {
-                        "path": path,
-                        "mode": mode,
-                        "host": host,
-                        # Random padding per packet defeats traffic-size fingerprinting by DPI.
-                        # Range "100-1000" adds 100–1000 random bytes to each request/response.
-                        "xPaddingBytes": "100-1000",
-                        # Limit individual POST chunk size to stay within typical browser upload range.
-                        # Default Xray value is very large and looks unnatural for browser traffic.
-                        "scMaxEachPostBytes": 1000000,
-                        # Minimum interval between consecutive upstream POSTs (ms).
-                        # Avoids burst patterns that differ from real browser behaviour.
-                        "scMinPostsIntervalMs": 30,
-                    },
+                    "xhttpSettings": dict(common_xhttp),
+                    "sockopt": dict(common_sockopt),
                 }
             else:
                 stream_settings = {
                     "network": "xhttp",
                     "security": "none",
-                    "xhttpSettings": {
-                        "path": path,
-                        "mode": mode,
-                        "host": host,
-                        "xPaddingBytes": "100-1000",
-                        "scMaxEachPostBytes": 1000000,
-                        "scMinPostsIntervalMs": 30,
-                    },
+                    "xhttpSettings": dict(common_xhttp),
+                    "sockopt": dict(common_sockopt),
                 }
 
             inbounds.append({
@@ -1143,17 +1153,31 @@ class AmneziaManager:
         config = {
             "log": {"loglevel": "warning"},
             "dns": {
-                # Use trusted foreign DNS for resolving reality_dest and outbound domains.
-                # Prevents leaking DNS queries through potentially censored resolvers.
-                "servers": ["1.1.1.1", "8.8.8.8"],
-                "queryStrategy": "UseIP"
+                # DoH-first resolver list encrypts the resolver's own lookups so that
+                # upstream providers / observers cannot see which domains (including
+                # reality_dest targets) Xray is resolving. Plain UDP 1.1.1.1 stays
+                # as a fallback for cold-start bootstrap before TLS is ready.
+                "servers": [
+                    {"address": "https://1.1.1.1/dns-query"},
+                    {"address": "https://dns.google/dns-query"},
+                    "1.1.1.1",
+                ],
+                "queryStrategy": "UseIP",
             },
             "inbounds": inbounds,
             "outbounds": [
                 {
                     "protocol": "freedom",
                     "settings": {"domainStrategy": "UseIP"},
-                    "tag": "direct"
+                    "tag": "direct",
+                    # BBR on the outbound socket stabilises throughput for exit-to-internet
+                    # traffic; TFO reduces RTT for repeat connections to popular origins.
+                    "streamSettings": {
+                        "sockopt": {
+                            "tcpcongestion": "bbr",
+                            "tcpFastOpen": True,
+                        }
+                    },
                 }
             ],
         }
@@ -1317,11 +1341,25 @@ class AmneziaManager:
         exit_sid = vless.get('reality_short_id') or ''
         exit_fp = vless.get('reality_fingerprint') or 'chrome'
 
+        # Socket options reused on both bridge inbound and the chain-to-exit outbound.
+        # BBR improves throughput on congested RU links; TFO shortens repeat RTTs.
+        bridge_sockopt = {
+            "tcpcongestion": "bbr",
+            "tcpKeepAliveInterval": 30,
+            "tcpKeepAliveIdle": 300,
+            "tcpFastOpen": True,
+        }
+
         # ── Compose bridge Xray config ────────────────────────────────────────
         bridge_config = {
             "log": {"loglevel": "warning"},
             "dns": {
-                "servers": ["1.1.1.1", "8.8.8.8"],
+                # DoH first so the bridge VPS doesn't leak exit-domain lookups to its ISP.
+                "servers": [
+                    {"address": "https://1.1.1.1/dns-query"},
+                    {"address": "https://dns.google/dns-query"},
+                    "1.1.1.1",
+                ],
                 "queryStrategy": "UseIP"
             },
             "inbounds": [{
@@ -1352,7 +1390,10 @@ class AmneziaManager:
                         "xPaddingBytes": "100-1000",
                         "scMaxEachPostBytes": 1000000,
                         "scMinPostsIntervalMs": 30,
-                    }
+                        "scMaxBufferedPosts": 30,
+                        "noSSEHeader": False,
+                    },
+                    "sockopt": dict(bridge_sockopt),
                 }
             }],
             "outbounds": [
@@ -1378,13 +1419,23 @@ class AmneziaManager:
                             "serverName": exit_sni,
                             "publicKey": exit_pbk,
                             "shortId": exit_sid,
+                            # Tolerate clock drift on the RU bridge (often on virtualised VPS
+                            # with poor NTP sync) — matches the exit inbound setting.
+                            "maxTimeDiff": 70000,
                         },
                         "xhttpSettings": {
                             "mode": exit_mode,
                             "path": exit_path,
                             "host": exit_sni,
+                            # Mirror the exit inbound's XHTTP tuning so the chain's
+                            # upstream leg has the same browser-like pattern as clients.
                             "xPaddingBytes": "100-1000",
-                        }
+                            "scMaxEachPostBytes": 1000000,
+                            "scMinPostsIntervalMs": 30,
+                            "scMaxBufferedPosts": 30,
+                            "noSSEHeader": False,
+                        },
+                        "sockopt": dict(bridge_sockopt),
                     }
                 },
                 {"protocol": "freedom", "tag": "direct"}
@@ -1563,8 +1614,22 @@ class AmneziaManager:
         # S2 must not be S1+56
         s2_candidates = [s for s in range(15, min(150, mtu - 92) + 1) if s != S1 + 56]
         S2 = random.choice(s2_candidates)
-        Jmin = random.randint(4, mtu - 2)
-        Jmax = random.randint(Jmin + 1, mtu)
+        # Jmin/Jmax bound the per-packet junk length. The legal range is
+        # [4, MTU], but values near the extremes are either too small to
+        # perturb DPI classifiers or large enough to cause fragmentation on
+        # weak links. A realistic browser-like jitter envelope is ~[8..200]
+        # bytes, which is what the validator still allows the operator to
+        # override for imported configs.
+        jmin_lower, jmin_upper = 8, 80
+        jmax_delta_lo, jmax_delta_hi = 50, 150
+        # Clamp against the hard MTU ceiling so we never produce invalid params.
+        jmin_upper = min(jmin_upper, max(jmin_lower + 1, mtu - 2))
+        Jmin = random.randint(jmin_lower, jmin_upper)
+        jmax_lower = min(Jmin + jmax_delta_lo, mtu)
+        jmax_upper = min(Jmin + jmax_delta_hi, mtu)
+        if jmax_upper <= jmax_lower:
+            jmax_upper = min(jmax_lower + 1, mtu)
+        Jmax = random.randint(jmax_lower, jmax_upper)
         return {
             "Jc": random.randint(4, 12),
             "Jmin": Jmin,
@@ -2160,6 +2225,12 @@ H4 = {obfuscation_params['H4']}
         normalized_duration = self._normalize_duration_code(duration_code)
         expires_at = self._calculate_expires_at(normalized_duration, created_at)
 
+        # Per-client randomised keepalive breaks the timing fingerprint that
+        # fixed 25-second WireGuard beacons produce across every client on a
+        # server. Range 15..30 stays within values real clients commonly use
+        # so the traffic still looks like legitimate WireGuard.
+        persistent_keepalive = random.randint(15, 30)
+
         client_config = {
             "id": client_id,
             "name": client_name,
@@ -2174,6 +2245,7 @@ H4 = {obfuscation_params['H4']}
             "bandwidth_tier": tier,
             "obfuscation_enabled": server["obfuscation_enabled"],
             "obfuscation_params": server["obfuscation_params"],
+            "persistent_keepalive": persistent_keepalive,
             "duration_code": normalized_duration,
             "duration_label": self._duration_label(normalized_duration),
             "expires_at": expires_at,
@@ -2362,13 +2434,15 @@ H3 = {params['H3']}
 H4 = {params['H4']}
 """
 
+        # Per-client keepalive if stored (new clients); fall back to 25 for legacy entries.
+        keepalive = client_config.get('persistent_keepalive') or 25
         config += f"""
 [Peer]
 PublicKey = {server['server_public_key']}
 PresharedKey = {client_config['preshared_key']}
 Endpoint = {server['public_ip']}:{server['port']}
 AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
+PersistentKeepalive = {keepalive}
 """
         return config
 
