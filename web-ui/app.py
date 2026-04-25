@@ -793,15 +793,19 @@ class AmneziaManager:
     # Foreign mask SNIs appended to every Reality server's accepted SNI list.
     # Russian whitelist SNIs (vkvideo.ru, max.ru, rutube.ru, …) are fine for
     # direct client → exit traffic from a non-Russian network, but RU outbound
-    # DPI on the *bridge* VPS provider cuts TLS to a foreign IP whenever the
-    # ClientHello SNI is a Russian whitelist domain (verified empirically:
-    # SNI=rutube.ru → foreign IP dropped at ~5 s; SNI=www.google.com survives
-    # 60 s+). The bridge → exit chain leg therefore must use a foreign SNI,
-    # which means the exit's Reality and the upstream nginx stream map have
-    # to accept it. We append the masks here so every newly created exit is
-    # bridge-ready out of the box; legacy exits get migrated lazily by
-    # `create_bridge_config`.
-    REALITY_FOREIGN_CHAIN_MASKS = ("www.microsoft.com", "microsoft.com")
+    # DPI on bridge VPS providers cuts TLS to a foreign IP whenever the
+    # ClientHello SNI is a Russian whitelist domain. The bridge → exit chain
+    # leg therefore must use a foreign SNI, which means the exit's Reality
+    # and the upstream nginx stream map have to accept it. We append the
+    # masks here so every newly created exit is bridge-ready out of the box;
+    # legacy exits get migrated lazily by `create_bridge_config`.
+    #
+    # Choice of mask matters: well-known Reality default masks (microsoft.com,
+    # apple.com, etc.) are heuristically detected and cut by some RU VPS
+    # providers' DPI within ~5 s. www.google.com is verified to survive ≥30 s
+    # because it sees so much real Russian-user traffic that DPI can't
+    # reliably distinguish VPN from legitimate use.
+    REALITY_FOREIGN_CHAIN_MASKS = ("www.google.com", "google.com")
 
     def _reality_server_names_for_host(self, hostname):
         h = str(hostname or "").strip().lower()
