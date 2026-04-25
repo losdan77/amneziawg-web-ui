@@ -790,15 +790,29 @@ class AmneziaManager:
             raise ValueError("reality dest port must be between 1 and 65535")
         return f"{host_part}:{port}", host_part
 
+    # Foreign mask SNIs appended to every Reality server's accepted SNI list.
+    # Russian whitelist SNIs (vkvideo.ru, max.ru, rutube.ru, …) are fine for
+    # direct client → exit traffic from a non-Russian network, but RU outbound
+    # DPI on the *bridge* VPS provider cuts TLS to a foreign IP whenever the
+    # ClientHello SNI is a Russian whitelist domain (verified empirically:
+    # SNI=rutube.ru → foreign IP dropped at ~5 s; SNI=www.google.com survives
+    # 60 s+). The bridge → exit chain leg therefore must use a foreign SNI,
+    # which means the exit's Reality and the upstream nginx stream map have
+    # to accept it. We append the masks here so every newly created exit is
+    # bridge-ready out of the box; legacy exits get migrated lazily by
+    # `create_bridge_config`.
+    REALITY_FOREIGN_CHAIN_MASKS = ("www.microsoft.com", "microsoft.com")
+
     def _reality_server_names_for_host(self, hostname):
         h = str(hostname or "").strip().lower()
         if not h:
-            return ["www.microsoft.com", "microsoft.com"]
+            return list(self.REALITY_FOREIGN_CHAIN_MASKS)
         names = [h]
         if h.startswith("www.") and len(h) > 4:
             names.append(h[4:])
         else:
             names.append("www." + h)
+        names.extend(self.REALITY_FOREIGN_CHAIN_MASKS)
         out = []
         seen = set()
         for n in names:
@@ -1343,7 +1357,23 @@ class AmneziaManager:
         exit_path = vless.get('path') or '/'
         exit_mode = vless.get('mode') or 'packet-up'
         exit_host = vless.get('host') or exit_domain
-        exit_sni = (vless.get('reality_server_names') or ['www.microsoft.com'])[0]
+        # Chain-leg SNI must be a foreign mask (see REALITY_FOREIGN_CHAIN_MASKS
+        # comment). Pick the first foreign mask present in the exit's accepted
+        # SNI list; for legacy exits created before the foreign-mask rollout,
+        # migrate the exit's serverNames in place so its Reality inbound and
+        # the upstream nginx stream map start accepting the foreign SNI too.
+        exit_server_names = list(vless.get('reality_server_names') or [])
+        foreign_masks = list(self.REALITY_FOREIGN_CHAIN_MASKS)
+        exit_sni = next((n for n in exit_server_names if n in foreign_masks), None)
+        if exit_sni is None:
+            for fm in foreign_masks:
+                if fm not in exit_server_names:
+                    exit_server_names.append(fm)
+            vless['reality_server_names'] = exit_server_names
+            self.save_config()
+            self._write_xray_config()
+            self._write_vless_stream_config()
+            exit_sni = foreign_masks[0]
         exit_pbk = vless.get('reality_public_key') or ''
         exit_sid = vless.get('reality_short_id') or ''
         exit_fp = vless.get('reality_fingerprint') or 'chrome'
