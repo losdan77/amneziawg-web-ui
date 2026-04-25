@@ -1332,10 +1332,17 @@ class AmneziaManager:
             exit_uuid = new_client['uuid']
 
         # ── Exit node connection parameters ──────────────────────────────────
+        # `exit_host` is the HTTP Host header the exit's xhttp inbound expects
+        # (set to the server's domain at creation in `_validate_domain(host or domain)`).
+        # `exit_sni` is the Reality TLS ServerName (the masked whitelist domain).
+        # These are different in normal setups — using SNI as the Host header makes
+        # the exit's xhttp respond 404 and the chain silently dies after the bridge
+        # logs an `accepted ... -> chain-to-exit` line.
         exit_domain = vless.get('domain') or server.get('public_ip') or ''
         exit_port = int(vless.get('client_port') or vless.get('port') or 443)
         exit_path = vless.get('path') or '/'
         exit_mode = vless.get('mode') or 'packet-up'
+        exit_host = vless.get('host') or exit_domain
         exit_sni = (vless.get('reality_server_names') or ['www.microsoft.com'])[0]
         exit_pbk = vless.get('reality_public_key') or ''
         exit_sid = vless.get('reality_short_id') or ''
@@ -1352,7 +1359,10 @@ class AmneziaManager:
 
         # ── Compose bridge Xray config ────────────────────────────────────────
         bridge_config = {
-            "log": {"loglevel": "warning"},
+            # `info` (one step above default `warning`) prints chain-to-exit
+            # dial errors and rejection reasons — without it a host/key
+            # mismatch is invisible past the first `accepted` line.
+            "log": {"loglevel": "info"},
             "dns": {
                 # DoH first so the bridge VPS doesn't leak exit-domain lookups to its ISP.
                 "servers": [
@@ -1426,7 +1436,10 @@ class AmneziaManager:
                         "xhttpSettings": {
                             "mode": exit_mode,
                             "path": exit_path,
-                            "host": exit_sni,
+                            # XHTTP Host header must match what the exit inbound
+                            # was created with (the server's `host` field, not the
+                            # Reality SNI mask).
+                            "host": exit_host,
                             # Mirror the exit inbound's XHTTP tuning so the chain's
                             # upstream leg has the same browser-like pattern as clients.
                             "xPaddingBytes": "100-1000",

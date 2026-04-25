@@ -2143,21 +2143,46 @@ app.generateBridge = async function() {
         // Fill client link
         document.getElementById('bridgeClientLink').value = data.client_link || '';
 
-        // Fill deploy instructions
+        // Fill deploy instructions.
+        //
+        // Volume mapping note: the teddysun/xray image's CMD is
+        //   ["/usr/bin/xray", "-c", "/etc/xray/config.json"]
+        // i.e. it reads its config from /etc/xray/config.json *inside* the
+        // container. We therefore mount the host's /etc/xray to the same path.
+        // (The /etc/amnezia/xray path used by this project's main image is
+        // specific to amneziawg-web-ui's own Xray invocation and does NOT apply
+        // to the standalone teddysun image — using it makes the container fall
+        // back to its baked-in default config, which won't have our bridge
+        // inbound and produces a confusing VMess deprecation warning.)
         const deployCmd =
             `# 1. Установите Docker на российский VPS:\n` +
             `#    curl -fsSL https://get.docker.com | sh\n\n` +
-            `# 2. Создайте директорию и сохраните config.json (кнопка "Скачать файл" ниже):\n` +
+            `# 2. (Рекомендуется) включите BBR — в новом конфиге xray сокет\n` +
+            `#    задаёт tcpcongestion=bbr; без BBR ядро тихо откатится на cubic.\n` +
+            `cat >> /etc/sysctl.conf <<'EOF'\n` +
+            `net.core.default_qdisc=fq\n` +
+            `net.ipv4.tcp_congestion_control=bbr\n` +
+            `net.ipv4.tcp_fastopen=3\n` +
+            `EOF\n` +
+            `sysctl -p\n\n` +
+            `# 3. Создайте директорию и сохраните config.json (кнопка "Скачать файл" ниже):\n` +
             `mkdir -p /etc/xray\n` +
             `# скопируйте файл bridge-config.json в /etc/xray/config.json\n\n` +
-            `# 3. Запустите Xray:\n` +
+            `# 4. Запустите Xray:\n` +
             `docker run -d --name xray --restart unless-stopped \\\n` +
             `  -p ${data.bridge_port}:${data.bridge_port}/tcp \\\n` +
-            `  -v /etc/xray:/etc/amnezia/xray \\\n` +
+            `  -v /etc/xray:/etc/xray \\\n` +
             `  teddysun/xray:26.3.27\n\n` +
-            `# 4. Проверьте «белый» IP: откройте http://${data.bridge_ip} с телефона МТС/Мегафон\n` +
+            `# 5. Убедитесь, что контейнер подхватил именно ваш конфиг:\n` +
+            `docker exec xray sh -c 'head -30 /etc/xray/config.json'\n` +
+            `#    должен показать ваш JSON с "tag": "bridge-inbound".\n` +
+            `docker logs xray --tail 20\n` +
+            `#    в логе НЕ должно быть предупреждения про VMess —\n` +
+            `#    оно означает, что Xray стартовал с дефолтным конфигом\n` +
+            `#    (обычно из-за неправильного -v volume-маппинга).\n\n` +
+            `# 6. Проверьте «белый» IP: откройте http://${data.bridge_ip} с телефона МТС/Мегафон\n` +
             `#    без VPN — должен открыться (или вернуть ответ сервера).\n\n` +
-            `# 5. Раздайте клиентам ссылку vless:// (скопируйте выше).`;
+            `# 7. Раздайте клиентам ссылку vless:// (скопируйте выше).`;
         document.getElementById('bridgeDeployCmd').textContent = deployCmd;
 
         // Fill JSON
