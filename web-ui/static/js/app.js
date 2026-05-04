@@ -58,6 +58,22 @@ class AmneziaApp {
             });
         }
 
+        // Auto-fill the flag field from the country code as the operator types.
+        const ccInput = this.getElement('vlessCountryCode');
+        const flagInput = this.getElement('vlessFlagEmoji');
+        if (ccInput && flagInput) {
+            ccInput.addEventListener('input', () => {
+                const cc = (ccInput.value || '').trim().toUpperCase();
+                ccInput.value = cc;
+                if (cc.length === 2 && /^[A-Z]{2}$/.test(cc)) {
+                    // Regional indicator emoji: 0x1F1E6 == 🇦
+                    const flag = String.fromCodePoint(0x1F1E6 + cc.charCodeAt(0) - 65)
+                               + String.fromCodePoint(0x1F1E6 + cc.charCodeAt(1) - 65);
+                    flagInput.value = flag;
+                }
+            });
+        }
+
         // Test create button
         const testCreateBtn = this.getElement('testCreateBtn');
         if (testCreateBtn) {
@@ -745,6 +761,10 @@ class AmneziaApp {
                 reality_dest: (this.getElement('vlessRealityDest')?.value || '').trim(),
                 fingerprint: (this.getElement('vlessFingerprint')?.value || 'chrome').trim(),
                 use_stream: this.getElement('vlessUseStream')?.checked ?? true,
+                // MemeVPN multi-server subscription metadata.
+                country_code: (this.getElement('vlessCountryCode')?.value || '').trim().toUpperCase(),
+                flag_emoji: (this.getElement('vlessFlagEmoji')?.value || '').trim(),
+                display_location: (this.getElement('vlessDisplayLocation')?.value || '').trim(),
             };
         } else {
             formData = {
@@ -952,6 +972,11 @@ class AmneziaApp {
                         </p>
                         <p class="text-sm text-gray-500">Public IP: ${server.public_ip}</p>
                             ${server.protocol === 'vless' && server.vless ? `
+                            ${(server.country_code || server.flag_emoji || server.display_location) ? `
+                            <p class="text-xs text-gray-700 font-medium">
+                                ${server.flag_emoji || ''} ${server.display_location || ''}
+                                ${server.country_code ? `<span class="text-gray-400">(${server.country_code})</span>` : ''}
+                            </p>` : ''}
                             <p class="text-xs text-gray-500">
                                 VLESS: ${server.vless.domain}:${server.vless.port} ${server.vless.path} (${server.vless.mode})
                                 ${server.vless.security === 'reality' && server.vless.reality_dest ? ` · REALITY dest ${server.vless.reality_dest}` : ''}
@@ -2053,23 +2078,35 @@ class AmneziaApp {
     setupTabSwitching() {
         const serversTab = document.getElementById('serversTab');
         const bandwidthTab = document.getElementById('bandwidthTab');
+        const usersTab = document.getElementById('usersTab');
         const serversSection = document.getElementById('serversSection');
         const bandwidthSection = document.getElementById('bandwidthSection');
+        const usersSection = document.getElementById('usersSection');
 
-        if (serversTab && bandwidthTab && serversSection && bandwidthSection) {
-            serversTab.addEventListener('click', () => {
-                serversTab.className = 'tab-button py-2 px-1 border-b-2 border-blue-500 font-medium text-blue-600 text-sm';
-                bandwidthTab.className = 'tab-button py-2 px-1 border-b-2 border-transparent font-medium text-gray-500 hover:text-gray-700 text-sm';
-                serversSection.classList.remove('hidden');
-                bandwidthSection.classList.add('hidden');
-            });
+        const activeCls = 'tab-button py-2 px-1 border-b-2 border-blue-500 font-medium text-blue-600 text-sm';
+        const idleCls = 'tab-button py-2 px-1 border-b-2 border-transparent font-medium text-gray-500 hover:text-gray-700 text-sm';
+        const showOnly = (which) => {
+            if (serversTab) serversTab.className = which === 'servers' ? activeCls : idleCls;
+            if (bandwidthTab) bandwidthTab.className = which === 'bandwidth' ? activeCls : idleCls;
+            if (usersTab) usersTab.className = which === 'users' ? activeCls : idleCls;
+            if (serversSection) serversSection.classList.toggle('hidden', which !== 'servers');
+            if (bandwidthSection) bandwidthSection.classList.toggle('hidden', which !== 'bandwidth');
+            if (usersSection) usersSection.classList.toggle('hidden', which !== 'users');
+        };
 
+        if (serversTab && serversSection) {
+            serversTab.addEventListener('click', () => showOnly('servers'));
+        }
+        if (bandwidthTab && bandwidthSection) {
             bandwidthTab.addEventListener('click', () => {
-                bandwidthTab.className = 'tab-button py-2 px-1 border-b-2 border-blue-500 font-medium text-blue-600 text-sm';
-                serversTab.className = 'tab-button py-2 px-1 border-b-2 border-transparent font-medium text-gray-500 hover:text-gray-700 text-sm';
-                bandwidthSection.classList.remove('hidden');
-                serversSection.classList.add('hidden');
+                showOnly('bandwidth');
                 this.loadBandwidthTiers();
+            });
+        }
+        if (usersTab && usersSection) {
+            usersTab.addEventListener('click', () => {
+                showOnly('users');
+                this.loadUsers();
             });
         }
     }
@@ -2228,3 +2265,170 @@ app.downloadBridgeConfig = function() {
 document.getElementById('bridgeModal').addEventListener('click', function(e) {
     if (e.target === this) app.closeBridgeModal();
 });
+
+// ─── MemeVPN Users (multi-server subscription) ────────────────────────────────
+
+app.loadUsers = function() {
+    const list = document.getElementById('usersList');
+    if (!list) return;
+    list.innerHTML = '<div class="text-gray-500 text-sm">Loading…</div>';
+    fetch('/api/users')
+        .then(r => r.json())
+        .then(data => {
+            const users = (data && data.users) || [];
+            if (users.length === 0) {
+                list.innerHTML = '<div class="text-gray-500 text-sm">Нет пользователей. Создайте первого выше.</div>';
+                return;
+            }
+            list.innerHTML = users.map(u => app._renderUserCard(u)).join('');
+        })
+        .catch(err => {
+            list.innerHTML = `<div class="text-red-600 text-sm">Failed to load users: ${err}</div>`;
+        });
+};
+
+app._renderUserCard = function(u) {
+    if (!u) return '';
+    const subUrl = `${window.location.origin}${u.subscription_url_path}`;
+    const expiry = u.expires_at ? new Date(u.expires_at * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC' : 'forever';
+    const clientRows = (u.clients || []).map(c => {
+        const flag = c.flag_emoji || '🌍';
+        const loc = c.display_location || c.server_name || c.server_id;
+        const exp = c.expires_at ? new Date(c.expires_at * 1000).toISOString().replace('T', ' ').slice(0, 10) : 'forever';
+        const badge = c.is_expired
+            ? '<span class="px-1 py-0.5 text-xs rounded bg-red-100 text-red-700">expired (grace)</span>'
+            : '<span class="px-1 py-0.5 text-xs rounded bg-green-100 text-green-700">active</span>';
+        return `<li class="flex justify-between gap-2 text-xs">
+                    <span>${flag} <span class="font-medium">${loc}</span> <span class="text-gray-400">${c.server_id}</span></span>
+                    <span class="text-gray-500">until ${exp}</span>
+                    <span>${badge}</span>
+                </li>`;
+    }).join('');
+
+    return `
+    <div class="border rounded-lg p-3 bg-white">
+        <div class="flex justify-between items-start gap-2">
+            <div class="min-w-0 flex-1">
+                <div class="flex items-center gap-2 flex-wrap">
+                    <span class="font-semibold">${u.name || u.user_id}</span>
+                    <span class="text-xs text-gray-500">id: <code>${u.user_id}</code></span>
+                    <span class="text-xs text-gray-500">expires: ${expiry}</span>
+                    <span class="text-xs px-1 py-0.5 rounded bg-blue-100 text-blue-800">${u.client_count} server(s)</span>
+                </div>
+                <div class="mt-2">
+                    <label class="text-xs text-gray-500">Subscription URL (раздать клиенту):</label>
+                    <div class="flex gap-2 items-center">
+                        <input type="text" value="${subUrl}" readonly
+                               class="flex-1 border border-emerald-300 bg-emerald-50 rounded-md px-2 py-1 text-xs font-mono">
+                        <button onclick="amneziaApp.copyToClipboard('${btoa(subUrl)}')"
+                                class="bg-emerald-600 text-white px-2 py-1 rounded-md text-xs hover:bg-emerald-700">Copy</button>
+                    </div>
+                </div>
+                ${clientRows ? `<ul class="mt-2 space-y-0.5">${clientRows}</ul>` : '<div class="text-xs text-gray-500 mt-2">Нет активных клиентов.</div>'}
+            </div>
+            <div class="flex flex-col gap-1">
+                <button onclick="amneziaApp.extendUser('${u.user_id}')"
+                        class="bg-blue-500 text-white px-3 py-1 rounded text-xs hover:bg-blue-600">Extend</button>
+                <button onclick="amneziaApp.deleteUser('${u.user_id}')"
+                        class="bg-red-500 text-white px-3 py-1 rounded text-xs hover:bg-red-600">Delete</button>
+            </div>
+        </div>
+    </div>`;
+};
+
+app.provisionUser = function() {
+    const userId = (document.getElementById('newUserId').value || '').trim();
+    const name = (document.getElementById('newUserName').value || '').trim();
+    const duration = document.getElementById('newUserDuration').value;
+    const status = document.getElementById('provisionStatus');
+    if (!userId) {
+        status.className = 'text-sm mt-2 text-red-600';
+        status.textContent = 'User ID is required';
+        status.classList.remove('hidden');
+        return;
+    }
+    status.className = 'text-sm mt-2 text-gray-600';
+    status.textContent = 'Provisioning…';
+    status.classList.remove('hidden');
+
+    fetch(`/api/users/${encodeURIComponent(userId)}/provision`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({duration: duration, name: name || undefined}),
+    })
+    .then(r => r.json().then(j => ({ok: r.ok, body: j})))
+    .then(({ok, body}) => {
+        if (!ok) throw new Error(body.error || 'Failed');
+        const subUrl = `${window.location.origin}${body.subscription_url_path}`;
+        status.className = 'text-sm mt-2 text-green-700';
+        status.innerHTML = `OK — provisioned on ${body.provisioned.length} server(s). Subscription: <a href="${subUrl}" target="_blank" class="underline font-mono">${subUrl}</a>`;
+        document.getElementById('newUserId').value = '';
+        document.getElementById('newUserName').value = '';
+        amneziaApp.loadUsers();
+    })
+    .catch(e => {
+        status.className = 'text-sm mt-2 text-red-600';
+        status.textContent = 'Error: ' + e.message;
+    });
+};
+
+app.extendUser = function(userId) {
+    const duration = prompt('Extend by which duration? (1m, 3m, 6m, 12m, forever)', '1m');
+    if (!duration) return;
+    fetch(`/api/users/${encodeURIComponent(userId)}/extend`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({duration: duration}),
+    })
+    .then(r => r.json().then(j => ({ok: r.ok, body: j})))
+    .then(({ok, body}) => {
+        if (!ok) throw new Error(body.error || 'Failed');
+        alert(`Extended ${body.extended.length} client(s)`);
+        amneziaApp.loadUsers();
+    })
+    .catch(e => alert('Error: ' + e.message));
+};
+
+app.deleteUser = function(userId) {
+    if (!confirm(`Delete user "${userId}" and all their clients on every server? This is permanent.`)) return;
+    fetch(`/api/users/${encodeURIComponent(userId)}`, {method: 'DELETE'})
+    .then(r => r.json().then(j => ({ok: r.ok, body: j})))
+    .then(({ok, body}) => {
+        if (!ok) throw new Error(body.error || 'Failed');
+        amneziaApp.loadUsers();
+    })
+    .catch(e => alert('Error: ' + e.message));
+};
+
+app.broadcastServer = function() {
+    const serverId = (document.getElementById('broadcastServerId').value || '').trim();
+    const duration = document.getElementById('broadcastDuration').value;
+    const status = document.getElementById('broadcastStatus');
+    if (!serverId) {
+        status.className = 'text-sm mt-2 text-red-600';
+        status.textContent = 'Server ID is required';
+        status.classList.remove('hidden');
+        return;
+    }
+    if (!confirm(`Provision server ${serverId} onto every active user with duration ${duration}?`)) return;
+    status.className = 'text-sm mt-2 text-gray-600';
+    status.textContent = 'Broadcasting…';
+    status.classList.remove('hidden');
+
+    fetch('/api/users/broadcast', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({server_id: serverId, duration: duration, only_active: true}),
+    })
+    .then(r => r.json().then(j => ({ok: r.ok, body: j})))
+    .then(({ok, body}) => {
+        if (!ok) throw new Error(body.error || 'Failed');
+        status.className = 'text-sm mt-2 text-green-700';
+        status.textContent = `OK — added to ${body.count} user(s)`;
+        amneziaApp.loadUsers();
+    })
+    .catch(e => {
+        status.className = 'text-sm mt-2 text-red-600';
+        status.textContent = 'Error: ' + e.message;
+    });
+};
