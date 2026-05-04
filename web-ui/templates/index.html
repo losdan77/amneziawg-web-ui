@@ -22,6 +22,9 @@
                 <button id="bandwidthTab" class="tab-button py-2 px-1 border-b-2 border-transparent font-medium text-gray-500 hover:text-gray-700 text-sm">
                     Bandwidth Settings
                 </button>
+                <button id="usersTab" class="tab-button py-2 px-1 border-b-2 border-transparent font-medium text-gray-500 hover:text-gray-700 text-sm">
+                    Users (MemeVPN)
+                </button>
             </nav>
         </div>
 
@@ -75,6 +78,35 @@
 
                 <div id="vlessFields" class="border rounded-lg p-4 bg-gray-50 hidden">
                     <h3 class="text-lg font-medium mb-3">VLESS + REALITY + XHTTP</h3>
+
+                    <!-- Location / branding (multi-server subscription) -->
+                    <div class="mb-4 p-3 rounded-lg bg-emerald-50 border border-emerald-200">
+                        <p class="text-emerald-900 text-xs font-semibold mb-2">🌍 Локация (для подписки MemeVPN)</p>
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            <div>
+                                <label class="block text-xs font-medium text-gray-700">Country code (ISO)</label>
+                                <input type="text" id="vlessCountryCode" maxlength="2" placeholder="DE"
+                                       class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm uppercase">
+                                <p class="text-gray-500 text-xs mt-1">2 буквы: DE, NL, US, FI, …</p>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-gray-700">Flag (auto)</label>
+                                <input type="text" id="vlessFlagEmoji" placeholder="🇩🇪"
+                                       class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                                <p class="text-gray-500 text-xs mt-1">Подставится по country code; можно перебить.</p>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-gray-700">Display name</label>
+                                <input type="text" id="vlessDisplayLocation" placeholder="Germany #1"
+                                       class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                                <p class="text-gray-500 text-xs mt-1">То, что увидит клиент в HAPP справа от флага.</p>
+                            </div>
+                        </div>
+                        <p class="text-emerald-800 text-xs mt-2">
+                            В подписке у клиента это будет выглядеть как
+                            <span class="font-mono bg-white px-1 rounded">MemeVPN | 🇩🇪 Germany #1</span>.
+                        </p>
+                    </div>
 
                     <!-- Whitelist limitation warning -->
                     <div class="mb-4 p-3 rounded-lg bg-amber-50 border border-amber-300">
@@ -526,6 +558,91 @@
             </div>
         </div>
         <!-- End Bandwidth Settings Section -->
+
+        <!-- Users (MemeVPN) Section -->
+        <div id="usersSection" class="hidden">
+            <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+                <h2 class="text-xl font-semibold mb-2">Multi-server VLESS subscriptions (MemeVPN)</h2>
+                <p class="text-gray-600 text-sm mb-4">
+                    Один пользователь — одна ссылка-подписка на все VLESS-сервера. При добавлении нового
+                    сервера можно одной кнопкой раскатать его всем активным пользователям, и в HAPP он
+                    появится после следующего автообновления подписки.
+                </p>
+
+                <div class="border rounded-lg p-4 bg-emerald-50 border-emerald-200 mb-4">
+                    <h3 class="text-md font-semibold mb-2">➕ Создать / продлить пользователя</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700">User ID *</label>
+                            <input type="text" id="newUserId" placeholder="tg_42 или ivanov"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                            <p class="text-gray-500 text-xs mt-1">A-Z 0-9 . _ : @ -</p>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700">Display name</label>
+                            <input type="text" id="newUserName" placeholder="Иван"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700">Duration *</label>
+                            <select id="newUserDuration" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                                <option value="1m">1 month</option>
+                                <option value="3m">3 months</option>
+                                <option value="6m">6 months</option>
+                                <option value="12m">1 year</option>
+                                <option value="forever">Forever</option>
+                            </select>
+                        </div>
+                        <div class="flex items-end">
+                            <button onclick="amneziaApp.provisionUser()"
+                                    class="w-full bg-emerald-600 text-white px-4 py-2 rounded-md hover:bg-emerald-700 text-sm">
+                                Provision
+                            </button>
+                        </div>
+                    </div>
+                    <p id="provisionStatus" class="text-sm mt-2 hidden"></p>
+                </div>
+
+                <div class="border rounded-lg p-4 bg-purple-50 border-purple-200 mb-4">
+                    <h3 class="text-md font-semibold mb-2">📡 Раскатать новый сервер всем активным пользователям</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700">Server ID *</label>
+                            <input type="text" id="broadcastServerId" placeholder="abc123"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                            <p class="text-gray-500 text-xs mt-1">Скопируйте из карточки сервера во вкладке Servers.</p>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700">Duration for new clients</label>
+                            <select id="broadcastDuration" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                                <option value="1m">1 month</option>
+                                <option value="3m">3 months</option>
+                                <option value="6m">6 months</option>
+                                <option value="12m">1 year</option>
+                                <option value="forever">Forever</option>
+                            </select>
+                        </div>
+                        <div class="flex items-end">
+                            <button onclick="amneziaApp.broadcastServer()"
+                                    class="w-full bg-purple-600 text-white px-4 py-2 rounded-md hover:bg-purple-700 text-sm">
+                                Broadcast
+                            </button>
+                        </div>
+                    </div>
+                    <p id="broadcastStatus" class="text-sm mt-2 hidden"></p>
+                </div>
+
+                <div class="flex justify-between items-center mb-2">
+                    <h3 class="text-md font-semibold">👥 Зарегистрированные пользователи</h3>
+                    <button onclick="amneziaApp.loadUsers()"
+                            class="text-blue-600 hover:text-blue-800 text-sm">🔄 Refresh</button>
+                </div>
+                <div id="usersList" class="space-y-3">
+                    <div class="text-gray-500 text-sm">Loading…</div>
+                </div>
+            </div>
+        </div>
+        <!-- End Users Section -->
 
     </div>
 
