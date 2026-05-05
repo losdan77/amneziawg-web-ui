@@ -641,6 +641,82 @@
                     <div class="text-gray-500 text-sm">Loading…</div>
                 </div>
             </div>
+
+            <!-- Satellites (federation) -->
+            <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+                <h2 class="text-xl font-semibold mb-2">🛰️ Спутники (federation)</h2>
+                <p class="text-gray-600 text-sm mb-4">
+                    Зарегистрируйте VPS-спутники, на которых поднят <strong>тот же образ</strong> с заданным
+                    <code>SATELLITE_API_KEY</code>. После регистрации хаб подтянет их VLESS-сервера и
+                    при <em>Provision</em> любого пользователя автоматически создаст ему клиентов и на этих
+                    спутниках. Все ссылки попадут в одну подписку MemeVPN.
+                </p>
+
+                <div class="border rounded-lg p-4 bg-blue-50 border-blue-200 mb-4">
+                    <h3 class="text-md font-semibold mb-2">➕ Зарегистрировать спутник</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700">Label</label>
+                            <input type="text" id="satLabel" placeholder="Netherlands relay"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700">Base URL *</label>
+                            <input type="text" id="satBaseUrl" placeholder="https://nl.memevpn.ru"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700">API key *</label>
+                            <input type="password" id="satApiKey" placeholder="SATELLITE_API_KEY value"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                        </div>
+                        <div class="flex items-end">
+                            <button onclick="amneziaApp.registerSatellite()"
+                                    class="w-full bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 text-sm">
+                                Register
+                            </button>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700">nginx user (optional)</label>
+                            <input type="text" id="satNginxUser" placeholder="admin"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                            <p class="text-gray-500 text-xs mt-1">Если у спутника на nginx стоит basic-auth — введите его учётку, иначе оставьте пустым.</p>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700">nginx password (optional)</label>
+                            <input type="password" id="satNginxPassword" placeholder="…"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                        </div>
+                    </div>
+                    <p id="satRegisterStatus" class="text-sm mt-2 hidden"></p>
+                </div>
+
+                <div class="flex justify-between items-center mb-2">
+                    <h3 class="text-md font-semibold">Зарегистрированные спутники</h3>
+                    <button onclick="amneziaApp.loadSatellites()" class="text-blue-600 hover:text-blue-800 text-sm">🔄 Refresh</button>
+                </div>
+                <div id="satellitesList" class="space-y-3">
+                    <div class="text-gray-500 text-sm">Loading…</div>
+                </div>
+            </div>
+
+            <!-- Promo lines -->
+            <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+                <h2 class="text-xl font-semibold mb-2">📣 Promo lines</h2>
+                <p class="text-gray-600 text-sm mb-4">
+                    Декоративные <code>vless://...#&lt;label&gt;</code> строки, которые подмешиваются в каждую
+                    подписку. Это то, что в HAPP выглядит как «Подписка просрочена / Продлите в боте» у
+                    популярных VPN — серверов на самом деле там нет, лейбл просто отображается в списке.
+                </p>
+                <textarea id="promoLines" rows="6" placeholder="vless://0000…@127.0.0.1:1#%F0%9F%91%89%20Renew%20at%20%40memevpn_bot"
+                          class="block w-full border border-gray-300 rounded-md px-3 py-2 text-xs font-mono"></textarea>
+                <p class="text-gray-500 text-xs mt-1">По одной строке. Допускаются только <code>vless://</code> или <code>vmess://</code>. Лейбл (#…) — то, что увидит пользователь.</p>
+                <button onclick="amneziaApp.savePromoLines()"
+                        class="mt-2 bg-emerald-600 text-white px-4 py-2 rounded-md hover:bg-emerald-700 text-sm">Save promo lines</button>
+                <p id="promoStatus" class="text-sm mt-2 hidden"></p>
+            </div>
         </div>
         <!-- End Users Section -->
 

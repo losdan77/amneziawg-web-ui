@@ -50,6 +50,15 @@ MEMEVPN_BRAND = os.getenv('MEMEVPN_BRAND', 'MemeVPN')
 # When you add a new VLESS server, existing users will see it after this interval.
 MEMEVPN_SUB_UPDATE_HOURS = int(os.getenv('MEMEVPN_SUB_UPDATE_HOURS', '24'))
 
+# ── Federation / satellite mode ─────────────────────────────────────────────
+# When SATELLITE_API_KEY is set, this instance exposes an authenticated
+# /api/satellite/* API that a remote "hub" instance can call to provision
+# clients on this VPS's local Xray. Clients only ever connect *directly* to
+# this VPS — the hub just orchestrates. Leave empty to disable satellite mode.
+SATELLITE_API_KEY = os.getenv('SATELLITE_API_KEY', '').strip()
+# How long the hub's outbound HTTP calls to satellites wait before giving up.
+SATELLITE_HTTP_TIMEOUT = int(os.getenv('SATELLITE_HTTP_TIMEOUT', '10'))
+
 # Parse DNS servers from comma-separated string
 DNS_SERVERS = [dns.strip() for dns in DEFAULT_DNS.split(',') if dns.strip()]
 
@@ -382,6 +391,15 @@ class AmneziaManager:
             updated = True
         if "user_tokens" not in self.config:
             self.config["user_tokens"] = {}
+            updated = True
+        # Federation: registered satellite instances and operator-curated
+        # decorative entries that get appended to every user's subscription
+        # (e.g. "Renew at @bot" placeholder lines like popular VPN providers do).
+        if "satellites" not in self.config:
+            self.config["satellites"] = {}
+            updated = True
+        if "promo_lines" not in self.config:
+            self.config["promo_lines"] = []
             updated = True
 
         # Rebuild reverse-lookup map from ``users`` in case it's drifted.
@@ -1896,27 +1914,102 @@ class AmneziaManager:
     def get_active_vless_servers(self):
         return [s for s in self.config.get("servers", []) if s.get("protocol") == "vless"]
 
-    def provision_user(self, user_id, duration_code="1m", server_ids=None, name=None):
-        """Ensure the user has a client on each requested VLESS server.
+    def _fanout_provision_to_satellites(self, uid, duration_code, user_record, provisioned):
+        """Create or top-up clients on every registered satellite for this user.
 
-        - ``server_ids=None`` provisions on all VLESS servers.
-        - Idempotent: if a client already exists for the user on a server, its
-          duration is extended (same semantics as ``add_vless_client``).
-        - Returns ``(user_record, provisioned_clients, subscription_url_path)``.
+        Mutates ``user_record["remote_clients"]`` so the next subscription fetch
+        returns the new links. Failures per satellite are non-fatal — they're
+        recorded in ``user_record["remote_errors"]`` for the operator UI.
+        """
+        sats = self.config.get("satellites", {})
+        if not sats:
+            return
+        remote_clients = user_record.setdefault("remote_clients", [])
+        remote_errors = []
+
+        # Build an O(1) lookup of existing remotes so re-provision extends instead
+        # of creating duplicate clients on the satellite.
+        existing_idx = {(r.get("satellite_id"), r.get("remote_server_id")): r for r in remote_clients}
+
+        for sat_id, sat in sats.items():
+            for srv in sat.get("servers", []):
+                key = (sat_id, srv["id"])
+                client_name = f"user-{uid}"
+                try:
+                    if key in existing_idx:
+                        # Already provisioned — extend on the satellite to align expiry.
+                        existing = existing_idx[key]
+                        ext = self._satellite_request(
+                            sat["base_url"], sat["api_key"], "POST",
+                            f"/api/satellite/servers/{srv['id']}/clients/{existing['remote_client_id']}/extend",
+                            {"duration_code": duration_code},
+                            basic_auth=self._satellite_basic_auth(sat),
+                        )
+                        existing["expires_at"] = ext.get("expires_at")
+                        existing["country_code"] = srv.get("country_code", "")
+                        existing["flag_emoji"] = srv.get("flag_emoji", "")
+                        existing["display_location"] = srv.get("display_location", "")
+                    else:
+                        created = self._satellite_request(
+                            sat["base_url"], sat["api_key"], "POST",
+                            "/api/satellite/clients",
+                            {
+                                "server_id": srv["id"],
+                                "client_name": client_name,
+                                "duration_code": duration_code,
+                            },
+                            basic_auth=self._satellite_basic_auth(sat),
+                        )
+                        remote_clients.append({
+                            "satellite_id": sat_id,
+                            "satellite_label": sat.get("label"),
+                            "remote_server_id": srv["id"],
+                            "remote_client_id": created["client_id"],
+                            "uuid": created.get("uuid"),
+                            "country_code": srv.get("country_code", ""),
+                            "flag_emoji": srv.get("flag_emoji", ""),
+                            "display_location": srv.get("display_location", ""),
+                            "link": created.get("link"),
+                            "expires_at": created.get("expires_at"),
+                        })
+                        provisioned.append({
+                            "server_id": srv["id"],
+                            "server_name": srv.get("name"),
+                            "satellite_id": sat_id,
+                            "country_code": srv.get("country_code", ""),
+                            "client_id": created["client_id"],
+                            "uuid": created.get("uuid"),
+                            "expires_at": created.get("expires_at"),
+                            "renewed": False,
+                            "link": created.get("link"),
+                        })
+                except ValueError as e:
+                    remote_errors.append({"satellite_id": sat_id, "server_id": srv["id"], "error": str(e)})
+                    print(f"provision: satellite {sat_id} server {srv['id']} failed: {e}")
+
+        user_record["remote_errors"] = remote_errors
+        with self.config_lock:
+            self.save_config()
+
+    def provision_user(self, user_id, duration_code="1m", server_ids=None, name=None):
+        """Ensure the user has a client on every local VLESS server *and* on
+        every satellite-side VLESS server. Returns the user record, a list of
+        provisioned/extended client descriptors, and the subscription URL path.
         """
         uid = self._normalize_user_id(user_id)
         user_record = self._get_or_create_user(uid, name=name)
 
         all_vless = self.get_active_vless_servers()
-        if not all_vless:
-            raise ValueError("No VLESS servers exist; create at least one first")
+        sats = self.config.get("satellites", {})
+        if not all_vless and not sats:
+            raise ValueError("No VLESS servers exist locally and no satellites are registered")
 
         if server_ids:
             wanted = set(server_ids)
             target_servers = [s for s in all_vless if s.get("id") in wanted]
             missing = wanted - {s.get("id") for s in target_servers}
             if missing:
-                raise ValueError(f"Unknown server_id(s): {sorted(missing)}")
+                raise ValueError(f"Unknown local server_id(s): {sorted(missing)}")
         else:
             target_servers = all_vless
 
@@ -1937,10 +2030,15 @@ class AmneziaManager:
                     "link": link,
                 })
 
+        # Federation fan-out (only when ``server_ids`` filter is absent — operator
+        # asked for "everything" — keeping per-satellite filtering for a later iteration).
+        if not server_ids:
+            self._fanout_provision_to_satellites(uid, duration_code, user_record, provisioned)
+
         return user_record, provisioned, f"/api/sub/user/{user_record['token']}"
 
     def extend_user(self, user_id, duration_code):
-        """Extend every existing client of the user by ``duration_code``."""
+        """Extend every existing client of the user (local + remote)."""
         uid = self._normalize_user_id(user_id)
         normalized_duration = self._normalize_duration_code(duration_code)
         extended = []
@@ -1953,16 +2051,61 @@ class AmneziaManager:
                 "client_id": client["id"],
                 "expires_at": new_client.get("expires_at"),
             })
+
+        # Extend remote clients on each satellite.
+        record = self.config.get("users", {}).get(uid)
+        if record:
+            sats = self.config.get("satellites", {})
+            for remote in record.get("remote_clients", []):
+                sat = sats.get(remote.get("satellite_id"))
+                if not sat:
+                    continue
+                try:
+                    ext = self._satellite_request(
+                        sat["base_url"], sat["api_key"], "POST",
+                        f"/api/satellite/servers/{remote['remote_server_id']}/clients/{remote['remote_client_id']}/extend",
+                        {"duration_code": normalized_duration},
+                        basic_auth=self._satellite_basic_auth(sat),
+                    )
+                    remote["expires_at"] = ext.get("expires_at")
+                    extended.append({
+                        "server_id": remote["remote_server_id"],
+                        "client_id": remote["remote_client_id"],
+                        "satellite_id": remote["satellite_id"],
+                        "expires_at": remote["expires_at"],
+                    })
+                except ValueError as e:
+                    print(f"extend: satellite {remote['satellite_id']} failed: {e}")
+            with self.config_lock:
+                self.save_config()
         return extended
 
     def delete_user(self, user_id, *, purge_clients=True):
-        """Delete the user record and (optionally) every client they own."""
+        """Delete the user record and every client they own (local + remote)."""
         uid = self._normalize_user_id(user_id)
         removed_clients = []
         if purge_clients:
             for server, client in self._get_user_clients(uid):
                 if self.delete_client(server["id"], client["id"], reason="user_deleted"):
                     removed_clients.append(client["id"])
+
+            # Remove the user's clients on satellites too.
+            record = self.config.get("users", {}).get(uid)
+            if record:
+                sats = self.config.get("satellites", {})
+                for remote in record.get("remote_clients", []):
+                    sat = sats.get(remote.get("satellite_id"))
+                    if not sat:
+                        continue
+                    try:
+                        self._satellite_request(
+                            sat["base_url"], sat["api_key"], "DELETE",
+                            f"/api/satellite/servers/{remote['remote_server_id']}/clients/{remote['remote_client_id']}",
+                            basic_auth=self._satellite_basic_auth(sat),
+                        )
+                        removed_clients.append(remote["remote_client_id"])
+                    except ValueError as e:
+                        print(f"delete: satellite {remote['satellite_id']} failed: {e}")
 
         with self.config_lock:
             users = self.config.setdefault("users", {})
@@ -1993,6 +2136,23 @@ class AmneziaManager:
                 "expires_at": client.get("expires_at"),
                 "duration_label": client.get("duration_label"),
                 "is_expired": self._is_client_expired(client),
+                "scope": "local",
+            })
+        # Remote clients (federation) are first-class in the summary too.
+        for remote in record.get("remote_clients", []):
+            clients_view.append({
+                "server_id": remote.get("remote_server_id"),
+                "server_name": remote.get("display_location") or remote.get("satellite_label"),
+                "country_code": remote.get("country_code", ""),
+                "flag_emoji": remote.get("flag_emoji", ""),
+                "display_location": remote.get("display_location", ""),
+                "client_id": remote.get("remote_client_id"),
+                "expires_at": remote.get("expires_at"),
+                "duration_label": None,
+                "is_expired": (remote.get("expires_at") is not None
+                               and time.time() >= float(remote["expires_at"])),
+                "scope": "satellite",
+                "satellite_id": remote.get("satellite_id"),
             })
         max_expiry = max((c["expires_at"] for c in clients_view if c.get("expires_at")), default=None)
         return {
@@ -2004,10 +2164,251 @@ class AmneziaManager:
             "clients": clients_view,
             "client_count": len(clients_view),
             "expires_at": max_expiry,
+            "remote_errors": record.get("remote_errors", []),
         }
 
     def list_users(self):
         return [self.get_user_summary(uid) for uid in self.config.get("users", {}).keys()]
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Federation — hub-side: registry, RPC helper, fan-out for user actions.
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _validate_satellite_url(self, base_url):
+        text = str(base_url or "").strip().rstrip("/")
+        if not text:
+            raise ValueError("base_url is required")
+        if not (text.startswith("http://") or text.startswith("https://")):
+            raise ValueError("base_url must start with http:// or https://")
+        if len(text) > 256:
+            raise ValueError("base_url is too long")
+        return text
+
+    def _satellite_request(self, base_url, api_key, method, path, json_body=None,
+                           timeout=None, basic_auth=None):
+        """Authenticated outbound call to a satellite. ``basic_auth`` lets the
+        caller pass nginx basic-auth credentials (the satellite is usually
+        behind nginx in this project)."""
+        url = base_url.rstrip("/") + path
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        try:
+            r = requests.request(
+                method, url,
+                headers=headers,
+                json=json_body,
+                timeout=timeout or SATELLITE_HTTP_TIMEOUT,
+                auth=basic_auth,
+            )
+        except requests.RequestException as e:
+            raise ValueError(f"satellite unreachable: {e}") from e
+        if r.status_code >= 400:
+            try:
+                detail = r.json().get("error") or r.text
+            except Exception:
+                detail = r.text
+            raise ValueError(f"satellite returned {r.status_code}: {detail}")
+        try:
+            return r.json()
+        except Exception:
+            return {}
+
+    def _satellite_basic_auth(self, record):
+        u = (record or {}).get("nginx_user") or ""
+        p = (record or {}).get("nginx_password") or ""
+        if u and p:
+            return (u, p)
+        return None
+
+    def register_satellite(self, base_url, api_key, label=None,
+                           nginx_user=None, nginx_password=None):
+        url = self._validate_satellite_url(base_url)
+        key = str(api_key or "").strip()
+        if not key:
+            raise ValueError("api_key is required")
+
+        sat_id = "sat-" + str(uuid.uuid4())[:8]
+        record = {
+            "id": sat_id,
+            "label": (str(label).strip() if label else url),
+            "base_url": url,
+            "api_key": key,
+            "nginx_user": (str(nginx_user).strip() if nginx_user else ""),
+            "nginx_password": (str(nginx_password).strip() if nginx_password else ""),
+            "created_at": time.time(),
+            "servers": [],
+            "last_sync_at": None,
+            "last_error": None,
+        }
+
+        # Validate by pinging the remote first.
+        try:
+            self._satellite_request(
+                url, key, "GET", "/api/satellite/ping",
+                basic_auth=self._satellite_basic_auth(record),
+            )
+        except ValueError as e:
+            raise ValueError(f"satellite ping failed: {e}")
+
+        # Pull initial server list.
+        try:
+            data = self._satellite_request(
+                url, key, "GET", "/api/satellite/servers",
+                basic_auth=self._satellite_basic_auth(record),
+            )
+            record["servers"] = data.get("servers", [])
+            record["last_sync_at"] = time.time()
+        except ValueError as e:
+            record["last_error"] = str(e)
+
+        with self.config_lock:
+            self.config.setdefault("satellites", {})[sat_id] = record
+            self.save_config()
+        return self._satellite_public_view(record)
+
+    def delete_satellite(self, sat_id):
+        with self.config_lock:
+            sats = self.config.setdefault("satellites", {})
+            record = sats.pop(sat_id, None)
+            if record is None:
+                return False
+            # Best-effort cleanup of any remote clients we've provisioned there.
+            for uid, user in self.config.get("users", {}).items():
+                kept = []
+                for remote in user.get("remote_clients", []):
+                    if remote.get("satellite_id") != sat_id:
+                        kept.append(remote)
+                        continue
+                    try:
+                        self._satellite_request(
+                            record["base_url"], record["api_key"], "DELETE",
+                            f"/api/satellite/servers/{remote['remote_server_id']}/clients/{remote['remote_client_id']}",
+                            basic_auth=self._satellite_basic_auth(record),
+                        )
+                    except ValueError as e:
+                        print(f"delete_satellite: orphaned remote client on {sat_id}: {e}")
+                user["remote_clients"] = kept
+            self.save_config()
+            return True
+
+    def sync_satellite(self, sat_id):
+        record = self.config.get("satellites", {}).get(sat_id)
+        if not record:
+            raise ValueError("satellite not found")
+        try:
+            data = self._satellite_request(
+                record["base_url"], record["api_key"], "GET", "/api/satellite/servers",
+                basic_auth=self._satellite_basic_auth(record),
+            )
+        except ValueError as e:
+            with self.config_lock:
+                record["last_error"] = str(e)
+                self.save_config()
+            raise
+        with self.config_lock:
+            record["servers"] = data.get("servers", [])
+            record["last_sync_at"] = time.time()
+            record["last_error"] = None
+            self.save_config()
+        return {"satellite_id": sat_id, "server_count": len(record["servers"])}
+
+    def list_satellites(self):
+        return [self._satellite_public_view(s) for s in self.config.get("satellites", {}).values()]
+
+    def _satellite_public_view(self, record):
+        """Hide the api_key/basic-auth password from API responses."""
+        return {
+            "id": record["id"],
+            "label": record.get("label"),
+            "base_url": record.get("base_url"),
+            "created_at": record.get("created_at"),
+            "last_sync_at": record.get("last_sync_at"),
+            "last_error": record.get("last_error"),
+            "server_count": len(record.get("servers", [])),
+            "servers": record.get("servers", []),
+        }
+
+    def set_promo_lines(self, lines):
+        cleaned = []
+        for line in lines or []:
+            text = str(line or "").strip()
+            if not text:
+                continue
+            # Only allow vless:// (or vmess://) lines so we don't smuggle anything weird.
+            if not (text.startswith("vless://") or text.startswith("vmess://")):
+                continue
+            if len(text) > 4096:
+                continue
+            cleaned.append(text)
+        with self.config_lock:
+            self.config["promo_lines"] = cleaned
+            self.save_config()
+        return cleaned
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Satellite-mode helpers (used by the satellite-side API). The satellite
+    # instance only stores native VLESS servers and the clients the hub
+    # provisions on it; it has no concept of users or tokens.
+    # ─────────────────────────────────────────────────────────────────────
+
+    def satellite_servers_view(self):
+        """Public-safe list of VLESS servers exposed to the hub.
+
+        Reality private keys, internal port mappings, and other secrets are
+        deliberately omitted — the hub only needs identity + display fields.
+        """
+        out = []
+        for s in self.get_active_vless_servers():
+            v = s.get("vless") or {}
+            out.append({
+                "id": s["id"],
+                "name": s.get("name"),
+                "country_code": s.get("country_code", ""),
+                "flag_emoji": s.get("flag_emoji", ""),
+                "display_location": s.get("display_location", ""),
+                "description": s.get("description", ""),
+                "public_ip": s.get("public_ip"),
+                "domain": v.get("domain"),
+                "client_port": v.get("client_port") or v.get("port"),
+                "use_stream": v.get("use_stream"),
+            })
+        return out
+
+    def satellite_create_client(self, server_id, client_name, duration_code="1m"):
+        """Provision a VLESS client on this satellite. Wraps add_vless_client."""
+        result = self.add_vless_client(server_id, client_name, duration_code)
+        if result is None:
+            raise ValueError("server not found")
+        client, link, renewed = result
+        return {
+            "client_id": client["id"],
+            "server_id": server_id,
+            "uuid": client["uuid"],
+            "expires_at": client.get("expires_at"),
+            "duration_code": client.get("duration_code"),
+            "duration_label": client.get("duration_label"),
+            "link": link,
+            "renewed": renewed,
+        }
+
+    def satellite_extend_client(self, server_id, client_id, duration_code):
+        client, err = self.extend_client(server_id, client_id, duration_code)
+        if err:
+            raise ValueError(err)
+        return {
+            "client_id": client_id,
+            "expires_at": client.get("expires_at"),
+            "duration_code": client.get("duration_code"),
+        }
+
+    def satellite_delete_client(self, server_id, client_id):
+        ok = self.delete_client(server_id, client_id, reason="hub_request")
+        if not ok:
+            raise ValueError("client not found")
+        return {"client_id": client_id}
 
     def broadcast_server_to_users(self, server_id, duration_code="1m", only_active=True):
         """Provision every existing user onto a newly added VLESS server.
@@ -4006,6 +4407,141 @@ def _b64(value):
     return base64.urlsafe_b64encode(str(value).encode("utf-8")).decode("ascii").rstrip("=")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Satellite-side API. Enabled on a VPS by setting SATELLITE_API_KEY. Other
+# instances act as the "hub" and call these endpoints to provision clients
+# directly on this satellite's local Xray.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _require_satellite_auth():
+    """Return None on success, or a ``(json, status)`` tuple on failure."""
+    if not SATELLITE_API_KEY:
+        return jsonify({"error": "satellite mode disabled"}), 403
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return jsonify({"error": "Bearer token required"}), 401
+    if auth.removeprefix("Bearer ").strip() != SATELLITE_API_KEY:
+        return jsonify({"error": "invalid api key"}), 403
+    return None
+
+
+@app.route('/api/satellite/ping', methods=['GET'])
+def satellite_ping():
+    err = _require_satellite_auth()
+    if err is not None:
+        return err
+    return jsonify({
+        "ok": True,
+        "brand": MEMEVPN_BRAND,
+        "public_ip": amnezia_manager.public_ip,
+        "vless_servers": len(amnezia_manager.get_active_vless_servers()),
+    })
+
+
+@app.route('/api/satellite/servers', methods=['GET'])
+def satellite_servers():
+    err = _require_satellite_auth()
+    if err is not None:
+        return err
+    return jsonify({"servers": amnezia_manager.satellite_servers_view()})
+
+
+@app.route('/api/satellite/clients', methods=['POST'])
+def satellite_create_client_route():
+    err = _require_satellite_auth()
+    if err is not None:
+        return err
+    data = request.json or {}
+    try:
+        result = amnezia_manager.satellite_create_client(
+            data.get("server_id"),
+            data.get("client_name") or "hub-client",
+            data.get("duration_code") or "1m",
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+@app.route('/api/satellite/servers/<server_id>/clients/<client_id>/extend', methods=['POST'])
+def satellite_extend_client_route(server_id, client_id):
+    err = _require_satellite_auth()
+    if err is not None:
+        return err
+    data = request.json or {}
+    try:
+        result = amnezia_manager.satellite_extend_client(
+            server_id, client_id, data.get("duration_code") or "1m"
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+@app.route('/api/satellite/servers/<server_id>/clients/<client_id>', methods=['DELETE'])
+def satellite_delete_client_route(server_id, client_id):
+    err = _require_satellite_auth()
+    if err is not None:
+        return err
+    try:
+        result = amnezia_manager.satellite_delete_client(server_id, client_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    return jsonify(result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hub-side: register / list / sync / delete satellites.
+# Promo lines: short curated list of arbitrary vless:// strings appended to
+# every user's subscription (e.g. "Renew at @bot" billboard entries).
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/api/satellites', methods=['GET'])
+def list_satellites_route():
+    return jsonify({"satellites": amnezia_manager.list_satellites()})
+
+
+@app.route('/api/satellites', methods=['POST'])
+def register_satellite_route():
+    data = request.json or {}
+    try:
+        sat = amnezia_manager.register_satellite(
+            base_url=data.get("base_url"),
+            api_key=data.get("api_key"),
+            label=data.get("label"),
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(sat)
+
+
+@app.route('/api/satellites/<sat_id>', methods=['DELETE'])
+def delete_satellite_route(sat_id):
+    if amnezia_manager.delete_satellite(sat_id):
+        return jsonify({"status": "deleted", "satellite_id": sat_id})
+    return jsonify({"error": "Satellite not found"}), 404
+
+
+@app.route('/api/satellites/<sat_id>/sync', methods=['POST'])
+def sync_satellite_route(sat_id):
+    try:
+        result = amnezia_manager.sync_satellite(sat_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+@app.route('/api/promo-lines', methods=['GET', 'PUT'])
+def promo_lines_route():
+    if request.method == 'PUT':
+        data = request.json or {}
+        lines = data.get("lines") or []
+        if not isinstance(lines, list):
+            return jsonify({"error": "lines must be a list of strings"}), 400
+        amnezia_manager.set_promo_lines([str(s) for s in lines])
+    return jsonify({"lines": amnezia_manager.config.get("promo_lines", [])})
+
+
 @app.route('/api/sub/user/<token>')
 def user_subscription(token):
     """Single subscription URL aggregating one user's VLESS clients across all servers.
@@ -4022,11 +4558,6 @@ def user_subscription(token):
     lines = []
     latest_expiry = None
     for server, client in amnezia_manager._get_user_clients(user_id):
-        if amnezia_manager._is_client_expired(client):
-            # Client is in the grace period — server still accepts the UUID, so we
-            # keep the link in the subscription. Once we cross grace, _get_user_clients
-            # filters it out.
-            pass
         try:
             lines.append(amnezia_manager.generate_vless_client_link(
                 server, client, label_style="memevpn"
@@ -4037,6 +4568,30 @@ def user_subscription(token):
         ce = client.get("expires_at")
         if ce is not None and (latest_expiry is None or ce > latest_expiry):
             latest_expiry = ce
+
+    # Federation: append cached vless:// links produced when this user was
+    # provisioned on each registered satellite. The link points directly at the
+    # satellite VPS — HAPP connects there without going through the hub.
+    for remote in record.get("remote_clients", []):
+        link = remote.get("link")
+        if not link:
+            continue
+        # Skip remotes whose grace window already elapsed (the hub will purge
+        # them on the next provision/extend call; until then, just hide them).
+        re_exp = remote.get("expires_at")
+        if re_exp is not None:
+            grace = max(0.0, CLIENT_DELETE_GRACE_DAYS) * 24 * 60 * 60
+            if time.time() >= float(re_exp) + grace:
+                continue
+        lines.append(link)
+        if re_exp is not None and (latest_expiry is None or re_exp > latest_expiry):
+            latest_expiry = re_exp
+
+    # Promo / billboard entries — last so they sit at the bottom in HAPP.
+    for promo in amnezia_manager.config.get("promo_lines", []):
+        promo = str(promo).strip()
+        if promo:
+            lines.append(promo)
 
     body_text = "\n".join(lines) + ("\n" if lines else "")
     encoded = base64.b64encode(body_text.encode("utf-8")).decode("ascii")
