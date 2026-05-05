@@ -2107,6 +2107,8 @@ class AmneziaApp {
             usersTab.addEventListener('click', () => {
                 showOnly('users');
                 this.loadUsers();
+                if (typeof amneziaApp.loadSatellites === 'function') amneziaApp.loadSatellites();
+                if (typeof amneziaApp.loadPromoLines === 'function') amneziaApp.loadPromoLines();
             });
         }
     }
@@ -2298,12 +2300,18 @@ app._renderUserCard = function(u) {
         const badge = c.is_expired
             ? '<span class="px-1 py-0.5 text-xs rounded bg-red-100 text-red-700">expired (grace)</span>'
             : '<span class="px-1 py-0.5 text-xs rounded bg-green-100 text-green-700">active</span>';
+        const scope = c.scope === 'satellite'
+            ? `<span class="px-1 py-0.5 text-xs rounded bg-purple-100 text-purple-800">satellite</span>`
+            : `<span class="px-1 py-0.5 text-xs rounded bg-gray-200 text-gray-700">local</span>`;
         return `<li class="flex justify-between gap-2 text-xs">
-                    <span>${flag} <span class="font-medium">${loc}</span> <span class="text-gray-400">${c.server_id}</span></span>
+                    <span>${flag} <span class="font-medium">${loc}</span> <span class="text-gray-400">${c.server_id}</span> ${scope}</span>
                     <span class="text-gray-500">until ${exp}</span>
                     <span>${badge}</span>
                 </li>`;
     }).join('');
+    const errors = (u.remote_errors || []).map(e =>
+        `<li class="text-xs text-red-600">⚠ satellite ${e.satellite_id} server ${e.server_id}: ${e.error}</li>`
+    ).join('');
 
     return `
     <div class="border rounded-lg p-3 bg-white">
@@ -2325,6 +2333,7 @@ app._renderUserCard = function(u) {
                     </div>
                 </div>
                 ${clientRows ? `<ul class="mt-2 space-y-0.5">${clientRows}</ul>` : '<div class="text-xs text-gray-500 mt-2">Нет активных клиентов.</div>'}
+                ${errors ? `<ul class="mt-1 space-y-0.5">${errors}</ul>` : ''}
             </div>
             <div class="flex flex-col gap-1">
                 <button onclick="amneziaApp.extendUser('${u.user_id}')"
@@ -2398,6 +2407,156 @@ app.deleteUser = function(userId) {
         amneziaApp.loadUsers();
     })
     .catch(e => alert('Error: ' + e.message));
+};
+
+// ─── Satellites (federation) ──────────────────────────────────────────────────
+
+app.loadSatellites = function() {
+    const list = document.getElementById('satellitesList');
+    if (!list) return;
+    list.innerHTML = '<div class="text-gray-500 text-sm">Loading…</div>';
+    fetch('/api/satellites')
+        .then(r => r.json())
+        .then(data => {
+            const sats = (data && data.satellites) || [];
+            if (sats.length === 0) {
+                list.innerHTML = '<div class="text-gray-500 text-sm">Спутники не зарегистрированы.</div>';
+                return;
+            }
+            list.innerHTML = sats.map(s => {
+                const lastSync = s.last_sync_at ? new Date(s.last_sync_at * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC' : 'never';
+                const err = s.last_error ? `<p class="text-xs text-red-600 mt-1">⚠ Last error: ${s.last_error}</p>` : '';
+                const servers = (s.servers || []).map(sv =>
+                    `<li class="text-xs"><span>${sv.flag_emoji || '🌍'} ${sv.display_location || sv.name || sv.id} <span class="text-gray-400">(${sv.country_code || '—'})</span> · ${sv.domain || sv.public_ip}</span></li>`
+                ).join('') || '<li class="text-xs text-gray-500">Нет VLESS-серверов на спутнике.</li>';
+                return `
+                <div class="border rounded-lg p-3 bg-white">
+                    <div class="flex justify-between items-start gap-2">
+                        <div class="min-w-0 flex-1">
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <span class="font-semibold">${s.label || s.id}</span>
+                                <span class="text-xs px-1 py-0.5 rounded bg-blue-100 text-blue-800">${s.server_count} server(s)</span>
+                                <span class="text-xs text-gray-500">last sync: ${lastSync}</span>
+                            </div>
+                            <p class="text-xs text-gray-600 font-mono">${s.base_url}</p>
+                            ${err}
+                            <ul class="mt-2 list-disc list-inside">${servers}</ul>
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <button onclick="amneziaApp.syncSatellite('${s.id}')" class="bg-blue-500 text-white px-3 py-1 rounded text-xs hover:bg-blue-600">Sync</button>
+                            <button onclick="amneziaApp.deleteSatellite('${s.id}')" class="bg-red-500 text-white px-3 py-1 rounded text-xs hover:bg-red-600">Delete</button>
+                        </div>
+                    </div>
+                </div>`;
+            }).join('');
+        })
+        .catch(err => {
+            list.innerHTML = `<div class="text-red-600 text-sm">Failed to load: ${err}</div>`;
+        });
+};
+
+app.registerSatellite = function() {
+    const label = (document.getElementById('satLabel').value || '').trim();
+    const baseUrl = (document.getElementById('satBaseUrl').value || '').trim();
+    const apiKey = (document.getElementById('satApiKey').value || '').trim();
+    const nginxUser = (document.getElementById('satNginxUser').value || '').trim();
+    const nginxPwd = (document.getElementById('satNginxPassword').value || '').trim();
+    const status = document.getElementById('satRegisterStatus');
+    if (!baseUrl || !apiKey) {
+        status.className = 'text-sm mt-2 text-red-600';
+        status.textContent = 'Base URL and API key are required';
+        status.classList.remove('hidden');
+        return;
+    }
+    status.className = 'text-sm mt-2 text-gray-600';
+    status.textContent = 'Pinging satellite…';
+    status.classList.remove('hidden');
+
+    fetch('/api/satellites', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            label: label || baseUrl,
+            base_url: baseUrl,
+            api_key: apiKey,
+            nginx_user: nginxUser || undefined,
+            nginx_password: nginxPwd || undefined,
+        }),
+    })
+    .then(r => r.json().then(j => ({ok: r.ok, body: j})))
+    .then(({ok, body}) => {
+        if (!ok) throw new Error(body.error || 'Failed');
+        status.className = 'text-sm mt-2 text-green-700';
+        status.textContent = `Registered: ${body.label} (${body.server_count} VLESS server(s))`;
+        document.getElementById('satLabel').value = '';
+        document.getElementById('satBaseUrl').value = '';
+        document.getElementById('satApiKey').value = '';
+        document.getElementById('satNginxUser').value = '';
+        document.getElementById('satNginxPassword').value = '';
+        amneziaApp.loadSatellites();
+    })
+    .catch(e => {
+        status.className = 'text-sm mt-2 text-red-600';
+        status.textContent = 'Error: ' + e.message;
+    });
+};
+
+app.syncSatellite = function(satId) {
+    fetch(`/api/satellites/${encodeURIComponent(satId)}/sync`, {method: 'POST'})
+    .then(r => r.json().then(j => ({ok: r.ok, body: j})))
+    .then(({ok, body}) => {
+        if (!ok) throw new Error(body.error || 'Failed');
+        amneziaApp.loadSatellites();
+    })
+    .catch(e => alert('Sync failed: ' + e.message));
+};
+
+app.deleteSatellite = function(satId) {
+    if (!confirm(`Удалить спутник ${satId}? Это удалит у него всех клиентов, провижененных через хаб.`)) return;
+    fetch(`/api/satellites/${encodeURIComponent(satId)}`, {method: 'DELETE'})
+    .then(r => r.json().then(j => ({ok: r.ok, body: j})))
+    .then(({ok, body}) => {
+        if (!ok) throw new Error(body.error || 'Failed');
+        amneziaApp.loadSatellites();
+        amneziaApp.loadUsers();
+    })
+    .catch(e => alert('Delete failed: ' + e.message));
+};
+
+// ─── Promo lines ──────────────────────────────────────────────────────────────
+
+app.loadPromoLines = function() {
+    fetch('/api/promo-lines')
+        .then(r => r.json())
+        .then(data => {
+            const ta = document.getElementById('promoLines');
+            if (ta) ta.value = (data.lines || []).join('\n');
+        })
+        .catch(() => {});
+};
+
+app.savePromoLines = function() {
+    const ta = document.getElementById('promoLines');
+    const status = document.getElementById('promoStatus');
+    const lines = (ta.value || '').split('\n').map(s => s.trim()).filter(Boolean);
+    fetch('/api/promo-lines', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({lines}),
+    })
+    .then(r => r.json().then(j => ({ok: r.ok, body: j})))
+    .then(({ok, body}) => {
+        if (!ok) throw new Error(body.error || 'Failed');
+        status.className = 'text-sm mt-2 text-green-700';
+        status.textContent = `Saved ${body.lines.length} line(s)`;
+        status.classList.remove('hidden');
+        if (ta) ta.value = body.lines.join('\n');
+    })
+    .catch(e => {
+        status.className = 'text-sm mt-2 text-red-600';
+        status.textContent = 'Error: ' + e.message;
+        status.classList.remove('hidden');
+    });
 };
 
 app.broadcastServer = function() {
