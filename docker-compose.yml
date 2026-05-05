@@ -40,6 +40,16 @@ services:
       # Internal-only ports for stream-routed REALITY inbounds (port-443 whitelist bypass mode).
       # nginx stream proxies from external :443 to xray:9443+ by SNI — no host-port publishing needed.
       - XRAY_STREAM_BASE_PORT=9443
+      # MemeVPN multi-server subscription branding & cadence.
+      - MEMEVPN_BRAND=${MEMEVPN_BRAND:-MemeVPN}
+      - MEMEVPN_SUB_UPDATE_HOURS=${MEMEVPN_SUB_UPDATE_HOURS:-24}
+      # How long an expired client stays alive before the pruner deletes it
+      # (gives users a window to renew without losing their config).
+      - CLIENT_DELETE_GRACE_DAYS=${CLIENT_DELETE_GRACE_DAYS:-3}
+      # Federation: leave empty on the hub VPS; set to a long random value on
+      # satellite VPSes to enable the /api/satellite/* endpoints. Generate one with:
+      #   openssl rand -hex 32
+      - SATELLITE_API_KEY=${SATELLITE_API_KEY:-}
 
   xray:
     image: teddysun/xray:26.3.27
