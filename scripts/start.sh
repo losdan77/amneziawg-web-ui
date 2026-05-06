@@ -49,6 +49,12 @@ if [ -n "$SSL_EMAIL" ] && [ "$SSL_DOMAIN" ]; then
     mv /etc/nginx/http.d/ssl.conf.template /etc/nginx/http.d/ssl.conf
     nginx
     echo "Configuring certbot to use $SSL_EMAIL and $SSL_DOMAIN"
+    # When /etc/letsencrypt is bind-mounted from the host, the cli.ini we
+    # copied at build time gets shadowed. Always (re)materialise it from the
+    # template so every container start has a valid config with the current
+    # SSL_EMAIL / SSL_DOMAIN values.
+    mkdir -p /etc/letsencrypt
+    cp /app/config/cli.ini.template $LE_CONFIG_FILE
     sed -i "s/email_placeholder/$SSL_EMAIL/" $LE_CONFIG_FILE
     sed -i "s/domain_placeholder/$SSL_DOMAIN/" $LE_CONFIG_FILE
 

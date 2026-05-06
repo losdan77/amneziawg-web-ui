@@ -30,7 +30,10 @@ COPY config/nginx/nginx.conf /etc/nginx/nginx.conf
 COPY config/nginx/default.conf /etc/nginx/http.d/default.conf
 COPY config/nginx/ssl.conf.template /etc/nginx/http.d/ssl.conf.template
 COPY config/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-COPY config/cli.ini /etc/letsencrypt/cli.ini
+# cli.ini is a template — start.sh copies it into /etc/letsencrypt/cli.ini at
+# runtime and seds in SSL_EMAIL / SSL_DOMAIN. Stored under /app so a host
+# bind mount over /etc/letsencrypt doesn't shadow it.
+COPY config/cli.ini /app/config/cli.ini.template
 
 COPY scripts/ /app/scripts/
 RUN chmod +x /app/scripts/*.sh
