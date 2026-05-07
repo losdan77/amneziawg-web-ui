@@ -677,19 +677,22 @@
                             </button>
                         </div>
                     </div>
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
-                        <div>
-                            <label class="block text-xs font-medium text-gray-700">nginx user (optional)</label>
-                            <input type="text" id="satNginxUser" placeholder="admin"
-                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
-                            <p class="text-gray-500 text-xs mt-1">Если у спутника на nginx стоит basic-auth — введите его учётку, иначе оставьте пустым.</p>
+                    <details class="mt-2">
+                        <summary class="text-xs text-gray-500 cursor-pointer">Расширенные опции (basic-auth, обычно не нужны)</summary>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+                            <div>
+                                <label class="block text-xs font-medium text-gray-700">nginx user</label>
+                                <input type="text" id="satNginxUser" placeholder=""
+                                       class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                                <p class="text-gray-500 text-xs mt-1">Только если nginx у спутника закрыт <em>дополнительной</em> basic-auth поверх /api/satellite/. По умолчанию (наш конфиг) — оставьте пустым.</p>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-gray-700">nginx password</label>
+                                <input type="password" id="satNginxPassword" placeholder=""
+                                       class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                            </div>
                         </div>
-                        <div>
-                            <label class="block text-xs font-medium text-gray-700">nginx password (optional)</label>
-                            <input type="password" id="satNginxPassword" placeholder="…"
-                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
-                        </div>
-                    </div>
+                    </details>
                     <p id="satRegisterStatus" class="text-sm mt-2 hidden"></p>
                 </div>
 
