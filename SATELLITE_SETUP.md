@@ -134,16 +134,19 @@ inbound (не через хаб). Хаб ходит на спутник толь
    - **Label**: `Netherlands relay`
    - **Base URL**: `https://nl.memevpn.ru`
    - **API key**: тот самый `SATELLITE_API_KEY` со спутника (`8ef9c2…`)
-   - **nginx user / password**: учётные данные basic-auth, которые стоят на
-     спутнике перед `/api/...` (по умолчанию `admin / <NGINX_PASSWORD>`).
-     Без них хаб упрётся в 401.
+   - **nginx user / password**: **оставьте пустыми**. С нашим nginx-конфигом
+     `/api/satellite/*` НЕ закрыт basic-auth — аутентификация идёт только через
+     Bearer-токен `SATELLITE_API_KEY`, проверяет сам Flask. Поля нужны лишь
+     если вы вручную закрыли federation-эндпоинты дополнительной basic-auth.
 4. Жмём **Register**. Хаб дёрнет `/api/satellite/ping` и `/api/satellite/servers`,
    подтянет список VLESS-серверов спутника. Если всё ок — карточка спутника
    появится ниже с зелёной строкой «Registered: Netherlands relay (1 VLESS server)».
 
 > Если ошибка `satellite unreachable` — проверьте DNS / SSL / firewall на VPS-2.
-> Если `401` — проверьте basic-auth поля. Если `403 invalid api key` — ключ
-> разный на хабе и спутнике.
+> Если `401 Authorization Required` от nginx — на спутнике ещё не подтянут
+> новый nginx-конфиг (нужно `git pull && docker compose up -d --build web-ui`).
+> Если `403 invalid api key` — ключ разный на хабе и спутнике.
+> Если `403 satellite mode disabled` — на спутнике не задан `SATELLITE_API_KEY` в `.env`.
 
 5. Аналогично можно зарегистрировать VPS-3, VPS-4 и т.д.
 
