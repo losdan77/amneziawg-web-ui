@@ -2263,9 +2263,21 @@ app.downloadBridgeConfig = function() {
     URL.revokeObjectURL(url);
 };
 
-// Close bridge modal on backdrop click
-document.getElementById('bridgeModal').addEventListener('click', function(e) {
-    if (e.target === this) app.closeBridgeModal();
+// Close bridge modal on backdrop click.
+//
+// IMPORTANT: this script tag is loaded *before* the #bridgeModal div in
+// index.html, so at the moment this top-level code runs the modal doesn't
+// exist yet — without the DOMContentLoaded guard, getElementById returns
+// null, .addEventListener throws, and every subsequent `app.X = function`
+// statement below this line silently never executes (manifesting as
+// "amneziaApp.registerSatellite is not a function" once you click Register).
+document.addEventListener('DOMContentLoaded', function () {
+    const modal = document.getElementById('bridgeModal');
+    if (modal) {
+        modal.addEventListener('click', function (e) {
+            if (e.target === this) app.closeBridgeModal();
+        });
+    }
 });
 
 // ─── MemeVPN Users (multi-server subscription) ────────────────────────────────
