@@ -11,6 +11,8 @@ import requests
 import calendar
 import ipaddress
 import socket
+import ssl
+from concurrent.futures import ThreadPoolExecutor
 import re
 from urllib.parse import quote
 from flask import Flask, render_template, request, jsonify, send_file, send_from_directory
@@ -885,6 +887,34 @@ class AmneziaManager:
         flag = server.get("flag_emoji") or self._country_code_to_flag(cc)
         display = (server.get("display_location") or server.get("name") or "Server").strip()
         return cc, flag, display
+
+    def _format_memevpn_label_from_remote(self, remote):
+        """Build a MemeVPN-style label for a satellite-cached client.
+
+        ``remote`` is one of the entries in ``user_record["remote_clients"]``
+        (the cached payload of a satellite's add_vless_client response, plus
+        country/flag/display fields the hub copied at provision time).
+        """
+        return self._format_memevpn_subscription_label({
+            "name": remote.get("display_location") or remote.get("satellite_label") or "Server",
+            "country_code": remote.get("country_code", ""),
+            "flag_emoji": remote.get("flag_emoji", ""),
+            "display_location": remote.get("display_location", ""),
+        })
+
+    def _replace_vless_link_label(self, link, new_label):
+        """Replace the URI fragment (text after the last #) on a vless:// link.
+
+        Satellites generate links with their own legacy ``Server-Client`` labels
+        — the hub re-writes those to MemeVPN brand format before emitting them
+        in the multi-server subscription so HAPP shows a coherent list.
+        """
+        if not link:
+            return link
+        base, sep, _old = link.rpartition("#")
+        if not sep:
+            base = link
+        return f"{base}#{quote(new_label, safe='')}"
 
     def _format_memevpn_subscription_label(self, server):
         """Pretty per-link label shown in HAPP's server list.
@@ -2330,6 +2360,59 @@ class AmneziaManager:
             "server_count": len(record.get("servers", [])),
             "servers": record.get("servers", []),
         }
+
+    def test_sni_reachability(self, host_port_list, timeout=4, max_workers=10):
+        """For each ``"host:port"`` in the list, attempt a TCP connect + TLS
+        handshake from this VPS, then return whether it succeeded, the
+        negotiated TLS version, and the round-trip latency.
+
+        Why it matters: REALITY masks under a real public website's TLS
+        handshake. If the destination is unreachable from your server (gov-
+        blocked, geo-blocked, firewall, …) clients will silently fail to
+        bootstrap. A "✅ TLS 1.3, 128 ms" result means it's safe to use.
+        Useful both on the hub and when it's mounted on a satellite — the
+        operator can probe whatever VPS they're configuring.
+        """
+        def _probe(host_port):
+            host_port = (host_port or "").strip()
+            if not host_port:
+                return {"host": host_port, "ok": False, "error": "empty host"}
+            host, _, port_str = host_port.partition(":")
+            try:
+                port = int(port_str) if port_str else 443
+            except ValueError:
+                return {"host": host_port, "ok": False, "error": "invalid port"}
+            host = host.strip().lower()
+            if not host:
+                return {"host": host_port, "ok": False, "error": "empty host"}
+
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            try:
+                start = time.time()
+                with socket.create_connection((host, port), timeout=timeout) as sock:
+                    with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                        latency_ms = int((time.time() - start) * 1000)
+                        cipher = ssock.cipher()
+                        return {
+                            "host": host_port,
+                            "ok": True,
+                            "tls_version": ssock.version(),
+                            "cipher": cipher[0] if cipher else None,
+                            "latency_ms": latency_ms,
+                        }
+            except socket.timeout:
+                return {"host": host_port, "ok": False, "error": f"timeout after {timeout}s"}
+            except (socket.gaierror, OSError) as e:
+                return {"host": host_port, "ok": False, "error": str(e)[:120]}
+            except Exception as e:
+                return {"host": host_port, "ok": False, "error": f"{type(e).__name__}: {str(e)[:120]}"}
+
+        # Cap concurrency to avoid hammering DNS / outbound when many presets pass through.
+        workers = max(1, min(max_workers, len(host_port_list) or 1))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(_probe, host_port_list))
 
     def set_promo_lines(self, lines):
         cleaned = []
@@ -4254,6 +4337,43 @@ def vless_sni_presets():
     return jsonify(REALITY_SNI_PRESETS)
 
 
+@app.route('/api/vless/test-sni', methods=['POST'])
+def vless_test_sni():
+    """Probe one or many SNI host:port targets from this VPS.
+
+    Body: ``{"hosts": ["vkvideo.ru:443", "www.microsoft.com:443"]}``  or
+          ``{"host": "vkvideo.ru:443"}``. Returns one result per host with
+    `ok / tls_version / latency_ms / error`. Use to validate that a Reality
+    `dest` you're about to pick is actually reachable from the server VPS
+    before saving — otherwise REALITY can't fall back to the masked
+    handshake and the whole inbound silently dies under any probe.
+
+    `?all=1` (or empty body) probes every preset returned by
+    `/api/vless/sni-presets`. Useful for the "test all SNIs from this VPS"
+    button.
+    """
+    data = request.json or {}
+    if request.args.get('all') == '1' or (not data.get('host') and not data.get('hosts')):
+        hosts = [p["host"] for p in REALITY_SNI_PRESETS]
+    elif data.get('hosts'):
+        if not isinstance(data['hosts'], list):
+            return jsonify({"error": "hosts must be a list"}), 400
+        hosts = [str(h) for h in data['hosts']]
+    else:
+        hosts = [str(data['host'])]
+
+    if len(hosts) > 100:
+        return jsonify({"error": "too many hosts (max 100)"}), 400
+
+    results = amnezia_manager.test_sni_reachability(hosts)
+    summary = {
+        "ok": sum(1 for r in results if r.get("ok")),
+        "fail": sum(1 for r in results if not r.get("ok")),
+        "tested_from": amnezia_manager.public_ip,
+    }
+    return jsonify({"results": results, "summary": summary})
+
+
 @app.route('/api/servers/<server_id>/bridge', methods=['POST'])
 def generate_bridge_config(server_id):
     """
@@ -4572,6 +4692,9 @@ def user_subscription(token):
     # Federation: append cached vless:// links produced when this user was
     # provisioned on each registered satellite. The link points directly at the
     # satellite VPS — HAPP connects there without going through the hub.
+    # We re-write the URI fragment (#label) in MemeVPN format so HAPP shows a
+    # coherent list (otherwise satellite links carry their own legacy
+    # "<server>-<client>" label, e.g. "Netherlands-1-user-test").
     for remote in record.get("remote_clients", []):
         link = remote.get("link")
         if not link:
@@ -4583,6 +4706,8 @@ def user_subscription(token):
             grace = max(0.0, CLIENT_DELETE_GRACE_DAYS) * 24 * 60 * 60
             if time.time() >= float(re_exp) + grace:
                 continue
+        new_label = amnezia_manager._format_memevpn_label_from_remote(remote)
+        link = amnezia_manager._replace_vless_link_label(link, new_label)
         lines.append(link)
         if re_exp is not None and (latest_expiry is None or re_exp > latest_expiry):
             latest_expiry = re_exp

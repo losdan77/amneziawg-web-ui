@@ -58,6 +58,13 @@ class AmneziaApp {
             });
         }
 
+        const testAllSniBtn = this.getElement('testAllSniBtn');
+        if (testAllSniBtn) {
+            testAllSniBtn.addEventListener('click', () => {
+                this.testAllSni();
+            });
+        }
+
         // Auto-fill the flag field from the country code as the operator types.
         const ccInput = this.getElement('vlessCountryCode');
         const flagInput = this.getElement('vlessFlagEmoji');
@@ -251,11 +258,19 @@ class AmneziaApp {
             listEl.innerHTML = '';
             if (datalist) datalist.innerHTML = '';
             presets.forEach(p => {
-                // Clickable preset button
+                // Clickable preset button. Add a status badge slot so the
+                // "Test all SNI" button can mark it ✅/❌ later without
+                // re-rendering the whole list.
                 const btn = document.createElement('button');
                 btn.type = 'button';
                 btn.className = 'text-left p-2 rounded hover:bg-indigo-100 border border-indigo-100 cursor-pointer';
-                btn.innerHTML = `<span class="font-mono text-indigo-700">${p.host}</span><br><span class="text-gray-500">${p.desc}</span>`;
+                btn.dataset.host = p.host;
+                btn.innerHTML = `
+                    <div class="flex items-center justify-between gap-2">
+                        <span class="font-mono text-indigo-700">${p.host}</span>
+                        <span class="sni-status text-xs text-gray-400">⚪</span>
+                    </div>
+                    <span class="text-gray-500">${p.desc}</span>`;
                 btn.addEventListener('click', () => {
                     const destInput = this.getElement('vlessRealityDest');
                     if (destInput) destInput.value = p.host;
@@ -263,7 +278,6 @@ class AmneziaApp {
                     if (panel) panel.classList.add('hidden');
                 });
                 listEl.appendChild(btn);
-                // Also add to datalist for native autocomplete
                 if (datalist) {
                     const opt = document.createElement('option');
                     opt.value = p.host;
@@ -274,6 +288,45 @@ class AmneziaApp {
             listEl.dataset.loaded = '1';
         } catch (e) {
             console.error('Failed to load SNI presets', e);
+        }
+    }
+
+    async testAllSni() {
+        const status = this.getElement('sniTestStatus');
+        const list = this.getElement('sniPresetsList');
+        const btn = this.getElement('testAllSniBtn');
+        if (!list) return;
+        if (status) {
+            status.classList.remove('hidden');
+            status.textContent = 'Testing — это займёт ~10 секунд (TLS handshake к каждому домену)…';
+        }
+        if (btn) btn.disabled = true;
+        try {
+            const r = await fetch('/api/vless/test-sni?all=1', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+            const data = await r.json();
+            const results = data.results || [];
+            const byHost = Object.fromEntries(results.map(x => [x.host, x]));
+            list.querySelectorAll('button[data-host]').forEach(b => {
+                const res = byHost[b.dataset.host];
+                const slot = b.querySelector('.sni-status');
+                if (!slot || !res) return;
+                if (res.ok) {
+                    slot.textContent = `✅ ${res.tls_version} ${res.latency_ms}ms`;
+                    slot.className = 'sni-status text-xs text-green-700 font-mono';
+                    b.classList.remove('opacity-50');
+                } else {
+                    slot.textContent = `❌ ${(res.error || '').split(':')[0]}`;
+                    slot.className = 'sni-status text-xs text-red-600 font-mono';
+                    b.classList.add('opacity-50');
+                }
+            });
+            if (status) {
+                status.textContent = `Готово. ✅ ${data.summary.ok} рабочих / ❌ ${data.summary.fail} недоступных. Тестировалось с ${data.summary.tested_from}.`;
+            }
+        } catch (e) {
+            if (status) status.textContent = 'Ошибка: ' + e.message;
+        } finally {
+            if (btn) btn.disabled = false;
         }
     }
 
