@@ -4,6 +4,10 @@ class AmneziaApp {
         this.socket = null;
         this.clientFilterMode = 'all';
         this.expiringSoonDays = 14;
+        // Cached payload of /api/vless/sni-presets so the operator dropdown
+        // can filter in-memory without a network round trip each change.
+        this._allSniPresets = [];
+        this._sniOperatorLabels = {};
         this.init();
     }
 
@@ -249,67 +253,121 @@ class AmneziaApp {
     async loadSniPresets() {
         const listEl = this.getElement('sniPresetsList');
         const datalist = this.getElement('sniPresetList');
+        const opSelect = this.getElement('sniOperatorFilter');
         if (!listEl) return;
-        if (listEl.dataset.loaded === '1') return;
+        if (listEl.dataset.loaded === '1') {
+            // Make sure dropdown matches the (possibly changed) cached state.
+            this._renderSniPresets();
+            return;
+        }
         try {
             const resp = await fetch('/api/vless/sni-presets');
             if (!resp.ok) return;
-            const presets = await resp.json();
-            listEl.innerHTML = '';
+            const data = await resp.json();
+            // Backwards compat: in the pre-operator-tags era this endpoint
+            // returned a flat array. Accept either shape so an old cached
+            // bundle doesn't crash the panel.
+            this._allSniPresets = Array.isArray(data) ? data : (data.presets || []);
+            this._sniOperatorLabels = (data && data.operators) || {};
             if (datalist) datalist.innerHTML = '';
-            presets.forEach(p => {
-                // Clickable preset button. Add a status badge slot so the
-                // "Test all SNI" button can mark it ✅/❌ later without
-                // re-rendering the whole list.
-                const btn = document.createElement('button');
-                btn.type = 'button';
-                btn.className = 'text-left p-2 rounded hover:bg-indigo-100 border border-indigo-100 cursor-pointer';
-                btn.dataset.host = p.host;
-                btn.innerHTML = `
-                    <div class="flex items-center justify-between gap-2">
-                        <span class="font-mono text-indigo-700">${p.host}</span>
-                        <span class="sni-status text-xs text-gray-400">⚪</span>
-                    </div>
-                    <span class="text-gray-500">${p.desc}</span>`;
-                btn.addEventListener('click', () => {
-                    const destInput = this.getElement('vlessRealityDest');
-                    if (destInput) destInput.value = p.host;
-                    const panel = this.getElement('sniPresetsPanel');
-                    if (panel) panel.classList.add('hidden');
-                });
-                listEl.appendChild(btn);
-                if (datalist) {
-                    const opt = document.createElement('option');
-                    opt.value = p.host;
-                    opt.label = p.desc;
-                    datalist.appendChild(opt);
-                }
+            this._allSniPresets.forEach(p => {
+                if (!datalist) return;
+                const opt = document.createElement('option');
+                opt.value = p.host;
+                opt.label = p.desc;
+                datalist.appendChild(opt);
             });
+            // Populate the operator <select> if we have labels and it isn't
+            // already populated.
+            if (opSelect && opSelect.options.length <= 1) {
+                Object.entries(this._sniOperatorLabels).forEach(([key, label]) => {
+                    const opt = document.createElement('option');
+                    opt.value = key;
+                    opt.textContent = label;
+                    opSelect.appendChild(opt);
+                });
+                opSelect.addEventListener('change', () => this._renderSniPresets());
+            }
+            this._renderSniPresets();
             listEl.dataset.loaded = '1';
         } catch (e) {
             console.error('Failed to load SNI presets', e);
         }
     }
 
+    _renderSniPresets() {
+        const listEl = this.getElement('sniPresetsList');
+        if (!listEl) return;
+        const opSelect = this.getElement('sniOperatorFilter');
+        const operator = opSelect ? (opSelect.value || '') : '';
+        // When an operator is selected we surface the count so the operator
+        // sees "12 SNI работают на Билайне" instead of guessing.
+        const presets = operator
+            ? this._allSniPresets.filter(p => Array.isArray(p.operators) && p.operators.includes(operator))
+            : this._allSniPresets;
+        listEl.innerHTML = '';
+        presets.forEach(p => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'text-left p-2 rounded hover:bg-indigo-100 border border-indigo-100 cursor-pointer';
+            btn.dataset.host = p.host;
+            // The badges row makes it easy to see at a glance which
+            // operators each domain covers — saves clicking through descs.
+            const opBadges = (p.operators || [])
+                .map(o => `<span class="inline-block text-[10px] px-1 rounded bg-indigo-200 text-indigo-900">${o}</span>`)
+                .join(' ');
+            btn.innerHTML = `
+                <div class="flex items-center justify-between gap-2">
+                    <span class="font-mono text-indigo-700">${p.host}</span>
+                    <span class="sni-status text-xs text-gray-400">⚪</span>
+                </div>
+                <span class="text-gray-500">${p.desc}</span>
+                <div class="mt-1 flex flex-wrap gap-1">${opBadges}</div>`;
+            btn.addEventListener('click', () => {
+                const destInput = this.getElement('vlessRealityDest');
+                if (destInput) destInput.value = p.host;
+                const panel = this.getElement('sniPresetsPanel');
+                if (panel) panel.classList.add('hidden');
+            });
+            listEl.appendChild(btn);
+        });
+    }
+
     async testAllSni() {
         const status = this.getElement('sniTestStatus');
         const list = this.getElement('sniPresetsList');
         const btn = this.getElement('testAllSniBtn');
+        const opSelect = this.getElement('sniOperatorFilter');
         if (!list) return;
+        const operator = opSelect ? (opSelect.value || '') : '';
         if (status) {
             status.classList.remove('hidden');
-            status.textContent = 'Testing — это займёт ~10 секунд (TLS handshake к каждому домену)…';
+            status.textContent = operator
+                ? `Тестирование SNI из whitelist ${this._sniOperatorLabels[operator] || operator}…`
+                : 'Тестирование всех SNI — займёт ~10–20 секунд (TLS handshake к каждому домену)…';
         }
         if (btn) btn.disabled = true;
         try {
-            const r = await fetch('/api/vless/test-sni?all=1', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+            // The operator filter narrows what's tested — that's the whole
+            // point of separating mobile-WL SNIs from generic-foreign ones.
+            const body = JSON.stringify(operator ? {operator} : {});
+            const r = await fetch('/api/vless/test-sni', {method: 'POST', headers: {'Content-Type': 'application/json'}, body});
             const data = await r.json();
             const results = data.results || [];
             const byHost = Object.fromEntries(results.map(x => [x.host, x]));
             list.querySelectorAll('button[data-host]').forEach(b => {
                 const res = byHost[b.dataset.host];
                 const slot = b.querySelector('.sni-status');
-                if (!slot || !res) return;
+                if (!slot) return;
+                if (!res) {
+                    // The current operator filter excluded this preset from
+                    // testing — clear any previous result so the user isn't
+                    // misled by stale ✅/❌ from an earlier sweep.
+                    slot.textContent = '⚪';
+                    slot.className = 'sni-status text-xs text-gray-400';
+                    b.classList.remove('opacity-50');
+                    return;
+                }
                 if (res.ok) {
                     slot.textContent = `✅ ${res.tls_version} ${res.latency_ms}ms`;
                     slot.className = 'sni-status text-xs text-green-700 font-mono';
@@ -321,7 +379,8 @@ class AmneziaApp {
                 }
             });
             if (status) {
-                status.textContent = `Готово. ✅ ${data.summary.ok} рабочих / ❌ ${data.summary.fail} недоступных. Тестировалось с ${data.summary.tested_from}.`;
+                const opLabel = data.summary.operator_label ? ` для ${data.summary.operator_label}` : '';
+                status.textContent = `Готово${opLabel}. ✅ ${data.summary.ok} рабочих / ❌ ${data.summary.fail} недоступных. Тестировалось с ${data.summary.tested_from}.`;
             }
         } catch (e) {
             if (status) status.textContent = 'Ошибка: ' + e.message;
