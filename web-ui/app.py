@@ -86,89 +86,112 @@ ENABLE_OBFUSCATION = True
 #   2. Not blocked inside Russia — ideally whitelisted by ISPs
 #   3. TLS 1.3 + H2, stable, high-traffic (looks natural)
 #
+# Each entry carries an `operators` list — the RU mobile/home ISPs whose
+# whitelist this domain is known to appear in (community reports + reverse-
+# engineered "free internet" promos as of 2025-2026). The UI surfaces these
+# tags so an operator stuck on Beeline mobile, for example, can filter the
+# preset list down to just SNIs that have actually been observed working
+# from Beeline egress. Tags:
+#   "beeline"  — Билайн mobile
+#   "mts"      — МТС mobile
+#   "megafon"  — Мегафон mobile
+#   "tele2"    — Tele2 mobile
+#   "home"     — fixed-line residential (most permissive)
+#   "global"   — works from outside RU too (foreign CDN)
+#
 # Russian domains may geo-block foreign IPs — always verify from your VPS before use:
 #
 #   for d in max.ru web.max.ru vk.com yandex.ru gosuslugi.ru sberbank.ru; do
 #     timeout 5 bash -c "echo Q | openssl s_client -connect $d:443 -servername $d 2>&1" \
 #       | grep -q CONNECTED && echo "OK  $d" || echo "FAIL $d"
 #   done
+_ALL_RU_MOBILE = ["beeline", "mts", "megafon", "tele2"]
+_ALL_RU = _ALL_RU_MOBILE + ["home"]
 REALITY_SNI_PRESETS = [
-    # ── ★ ЛУЧШИЕ для белых списков РФ (из рабочих WL-конфигов 2025-2026) ─────────────────────
-    # Эти домены встречаются в реально работающих whitelist-конфигах для МТС/Мегафон/Билайн.
-    # ВАЖНО: домен должен быть доступен с вашего VPS (проверьте: openssl s_client -connect vkvideo.ru:443)
-    {"host": "vkvideo.ru:443",             "desc": "★ VK Video — в белых списках МТС/Мегафон, рекомендован для WL"},
-    {"host": "rutube.ru:443",              "desc": "★ Rutube — государственный видеохостинг, широко разрешён в WL"},
-    {"host": "cloud.mail.ru:443",          "desc": "★ Mail.ru Cloud — фигурирует в рабочих WL-конфигах"},
-    {"host": "ir.ozone.ru:443",            "desc": "★ Ozon CDN — встречается в whitelist-конфигах"},
-    {"host": "www.vk.com:443",             "desc": "★ ВКонтакте — используется в рабочих WL-конфигах"},
-    # ── Иностранные: глобально доступны + в белых списках RU ISP ─────────────────────────────
-    {"host": "www.microsoft.com:443",      "desc": "Microsoft — Windows Update, в белых списках всех ISP"},
-    {"host": "www.apple.com:443",          "desc": "Apple — Software Update, широко разрешён"},
-    {"host": "addons.mozilla.org:443",     "desc": "Mozilla CDN (Cloudflare) — обновления Firefox"},
-    {"host": "dl.google.com:443",          "desc": "Google Downloads — обновления Chrome/Android"},
-    {"host": "github.com:443",             "desc": "GitHub — не заблокирован в РФ, доступен глобально"},
-    {"host": "cdn.jsdelivr.net:443",       "desc": "jsDelivr CDN — популярный CDN, TLS 1.3"},
-    {"host": "releases.ubuntu.com:443",    "desc": "Ubuntu CDN — обновления ОС, не блокируется"},
-    {"host": "www.cloudflare.com:443",     "desc": "Cloudflare — инфраструктурный домен"},
-    # ── Мессенджер Макс (VK Max) — проверить доступность с VPS ──────────────────────────────
-    {"host": "max.ru:443",                 "desc": "Max — главный домен мессенджера"},
-    {"host": "web.max.ru:443",             "desc": "Max — веб-версия мессенджера (высокий трафик)"},
-    {"host": "static.max.ru:443",          "desc": "Max — статика / CDN"},
-    {"host": "api.max.ru:443",             "desc": "Max — API"},
-    {"host": "userapi.com:443",            "desc": "VK/Max — CDN медиафайлов и аватаров"},
-    {"host": "vk-cdn.net:443",             "desc": "VK/Max — CDN видео и аудио"},
-    {"host": "vkuseraudio.net:443",        "desc": "VK/Max — стриминг аудио"},
-    {"host": "vkuservideo.net:443",        "desc": "VK/Max — стриминг видео"},
-    # ── ВКонтакте — проверить доступность с VPS ─────────────────────────────────────────────
-    {"host": "vk.com:443",                 "desc": "ВКонтакте — соцсеть"},
-    {"host": "id.vk.com:443",              "desc": "VK ID — авторизация"},
-    {"host": "m.vk.com:443",               "desc": "ВКонтакте — мобильная версия"},
-    # ── Яндекс — проверить доступность с VPS ────────────────────────────────────────────────
-    {"host": "yandex.ru:443",              "desc": "Яндекс — главная страница"},
-    {"host": "ya.ru:443",                  "desc": "Яндекс — короткий домен"},
-    {"host": "yastatic.net:443",           "desc": "Яндекс — CDN статики"},
-    {"host": "yandex.net:443",             "desc": "Яндекс — инфраструктурный домен"},
-    {"host": "mail.yandex.ru:443",         "desc": "Яндекс.Почта"},
-    # ── Mail.ru Group / VK Tech — проверить доступность с VPS ───────────────────────────────
-    {"host": "mail.ru:443",                "desc": "Mail.ru — почта"},
-    {"host": "ok.ru:443",                  "desc": "Одноклассники"},
-    {"host": "my.mail.ru:443",             "desc": "Mail.ru — социальная сеть"},
-    # ── Банки и финансы — проверить доступность с VPS ───────────────────────────────────────
-    {"host": "www.tbank.ru:443",           "desc": "Т-Банк (Тинькофф)"},
-    {"host": "www.sberbank.ru:443",        "desc": "Сбербанк"},
-    {"host": "online.sberbank.ru:443",     "desc": "Сбербанк Онлайн"},
-    {"host": "www.vtb.ru:443",             "desc": "ВТБ"},
-    {"host": "alfabank.ru:443",            "desc": "Альфа-Банк"},
-    {"host": "www.raiffeisen.ru:443",      "desc": "Райффайзен Банк"},
-    # ── Госсервисы — проверить доступность с VPS ────────────────────────────────────────────
-    {"host": "www.gosuslugi.ru:443",       "desc": "Госуслуги — портал госсервисов РФ"},
-    {"host": "esia.gosuslugi.ru:443",      "desc": "ЕСИА — авторизация Госуслуг"},
-    {"host": "mos.ru:443",                 "desc": "Mos.ru — портал Москвы"},
-    {"host": "www.nalog.gov.ru:443",       "desc": "ФНС — налоговая служба"},
-    {"host": "pfr.gov.ru:443",             "desc": "СФР (ПФР) — пенсионный фонд"},
-    # ── СМИ и медиа — проверить доступность с VPS ───────────────────────────────────────────
-    {"host": "ria.ru:443",                 "desc": "РИА Новости — государственное СМИ"},
-    {"host": "1tv.ru:443",                 "desc": "Первый канал"},
-    {"host": "rbc.ru:443",                 "desc": "РБК — деловые новости"},
-    {"host": "kommersant.ru:443",          "desc": "Коммерсантъ"},
-    {"host": "tass.ru:443",                "desc": "ТАСС — государственное СМИ"},
-    {"host": "www.kp.ru:443",              "desc": "Комсомольская правда"},
-    {"host": "lenta.ru:443",               "desc": "Лента.ру — новости"},
-    {"host": "iz.ru:443",                  "desc": "Известия"},
-    {"host": "gazeta.ru:443",              "desc": "Газета.ру"},
-    # ── Стриминг и развлечения — проверить доступность с VPS ────────────────────────────────
-    {"host": "www.ivi.ru:443",             "desc": "IVI — стриминг видео"},
-    {"host": "www.kinopoisk.ru:443",       "desc": "Кинопоиск (Яндекс)"},
-    {"host": "okko.tv:443",                "desc": "Okko — стриминг (Сбер)"},
-    {"host": "more.tv:443",                "desc": "more.tv — стриминг НТВ"},
-    {"host": "premier.one:443",            "desc": "PREMIER — стриминг"},
-    # ── Маркетплейсы и e-commerce — проверить доступность с VPS ─────────────────────────────
-    {"host": "www.wildberries.ru:443",     "desc": "Wildberries — маркетплейс"},
-    {"host": "www.ozon.ru:443",            "desc": "Ozon — маркетплейс"},
-    {"host": "www.avito.ru:443",           "desc": "Авито — объявления"},
-    {"host": "www.dns-shop.ru:443",        "desc": "DNS — магазин электроники"},
-    {"host": "www.citilink.ru:443",        "desc": "Ситилинк — электроника"},
+    # ── ★ Топ по покрытию whitelist'ов всех мобильных операторов РФ ──────────────────────────
+    # Эти домены встречаются в реально работающих "бесплатный соцсети" / WL-конфигах
+    # для МТС / Мегафон / Билайн / Tele2 (2025-2026). Самый надёжный выбор для мобильного DPI.
+    {"host": "vkvideo.ru:443",             "desc": "★ VK Video — все мобильные WL + сервис ВК",         "operators": _ALL_RU},
+    {"host": "www.vk.com:443",             "desc": "★ ВКонтакте — соцсеть в WL всех операторов",       "operators": _ALL_RU},
+    {"host": "vk.com:443",                 "desc": "★ ВКонтакте (apex) — широкий WL",                  "operators": _ALL_RU},
+    {"host": "m.vk.com:443",               "desc": "★ ВК мобильная — целевая для мобильных DPI",       "operators": _ALL_RU_MOBILE + ["home"]},
+    {"host": "ok.ru:443",                  "desc": "★ Одноклассники — соцсеть в WL всех операторов",   "operators": _ALL_RU},
+    {"host": "userapi.com:443",            "desc": "★ VK CDN — медиа, в WL вместе с vk.com",           "operators": _ALL_RU},
+    {"host": "rutube.ru:443",              "desc": "★ Rutube — гос.видеохостинг, очень широкий WL",    "operators": _ALL_RU},
+    {"host": "cloud.mail.ru:443",          "desc": "★ Mail.ru Cloud — стабильно в WL",                 "operators": _ALL_RU},
+    {"host": "yandex.ru:443",              "desc": "★ Яндекс — практически везде в WL",                "operators": _ALL_RU},
+    {"host": "ya.ru:443",                  "desc": "★ Яндекс короткий — везде в WL",                   "operators": _ALL_RU},
+    {"host": "mail.ru:443",                "desc": "★ Mail.ru — почта, в WL",                          "operators": _ALL_RU},
+    # ── Иностранные: глобальный CDN, доступны отовсюду; покрытие WL частичное ─────────────────
+    {"host": "www.microsoft.com:443",      "desc": "Microsoft — Windows Update, у некоторых ISP в WL", "operators": ["home", "global"]},
+    {"host": "www.apple.com:443",          "desc": "Apple — Software Update",                          "operators": ["home", "global"]},
+    {"host": "addons.mozilla.org:443",     "desc": "Mozilla CDN (Cloudflare) — обновления Firefox",    "operators": ["home", "global"]},
+    {"host": "dl.google.com:443",          "desc": "Google Downloads — обновления Chrome/Android",     "operators": ["home", "global"]},
+    {"host": "github.com:443",             "desc": "GitHub — не блокируется в РФ",                     "operators": ["home", "global"]},
+    {"host": "cdn.jsdelivr.net:443",       "desc": "jsDelivr CDN — TLS 1.3, повсеместно",              "operators": ["home", "global"]},
+    {"host": "releases.ubuntu.com:443",    "desc": "Ubuntu CDN — обновления ОС",                       "operators": ["home", "global"]},
+    {"host": "www.cloudflare.com:443",     "desc": "Cloudflare — инфраструктурный домен",              "operators": ["home", "global"]},
+    # ── Мессенджер Макс / экосистема VK ────────────────────────────────────────────────────
+    {"host": "max.ru:443",                 "desc": "Max — главный домен мессенджера",                  "operators": _ALL_RU},
+    {"host": "web.max.ru:443",             "desc": "Max — веб-версия",                                 "operators": _ALL_RU},
+    {"host": "static.max.ru:443",          "desc": "Max — статика / CDN",                              "operators": _ALL_RU},
+    {"host": "api.max.ru:443",             "desc": "Max — API",                                        "operators": _ALL_RU},
+    {"host": "vk-cdn.net:443",             "desc": "VK CDN — видео и аудио",                           "operators": _ALL_RU},
+    {"host": "vkuseraudio.net:443",        "desc": "VK CDN — стриминг аудио",                          "operators": _ALL_RU},
+    {"host": "vkuservideo.net:443",        "desc": "VK CDN — стриминг видео",                          "operators": _ALL_RU},
+    {"host": "id.vk.com:443",              "desc": "VK ID — авторизация",                              "operators": _ALL_RU},
+    # ── Яндекс — обширная экосистема, часто в WL вместе ──────────────────────────────────────
+    {"host": "yastatic.net:443",           "desc": "Яндекс — CDN статики",                             "operators": _ALL_RU},
+    {"host": "yandex.net:443",             "desc": "Яндекс — инфраструктурный домен",                  "operators": _ALL_RU},
+    {"host": "mail.yandex.ru:443",         "desc": "Яндекс.Почта",                                     "operators": _ALL_RU},
+    {"host": "my.mail.ru:443",             "desc": "Mail.ru — социальная сеть",                        "operators": _ALL_RU},
+    # ── Банки — у мобильных операторов обычно есть «бесплатно банки» опция ────────────────────
+    {"host": "www.tbank.ru:443",           "desc": "Т-Банк — банк, часто в мобильном WL",              "operators": _ALL_RU},
+    {"host": "www.sberbank.ru:443",        "desc": "Сбербанк — банк, часто в мобильном WL",            "operators": _ALL_RU},
+    {"host": "online.sberbank.ru:443",     "desc": "Сбербанк Онлайн",                                  "operators": _ALL_RU},
+    {"host": "www.vtb.ru:443",             "desc": "ВТБ — банк",                                       "operators": _ALL_RU},
+    {"host": "alfabank.ru:443",            "desc": "Альфа-Банк",                                       "operators": _ALL_RU},
+    {"host": "www.raiffeisen.ru:443",      "desc": "Райффайзен Банк",                                  "operators": ["home"]},
+    # ── Госсервисы — обязательно в WL у всех ─────────────────────────────────────────────────
+    {"host": "www.gosuslugi.ru:443",       "desc": "★ Госуслуги — обязательно в WL всех операторов",   "operators": _ALL_RU},
+    {"host": "esia.gosuslugi.ru:443",      "desc": "★ ЕСИА — авторизация Госуслуг",                    "operators": _ALL_RU},
+    {"host": "mos.ru:443",                 "desc": "Mos.ru — портал Москвы",                           "operators": _ALL_RU},
+    {"host": "www.nalog.gov.ru:443",       "desc": "ФНС — налоговая",                                  "operators": _ALL_RU},
+    {"host": "pfr.gov.ru:443",             "desc": "СФР (ПФР) — пенсионный фонд",                      "operators": _ALL_RU},
+    # ── Гос.СМИ ─────────────────────────────────────────────────────────────────────────────
+    {"host": "ria.ru:443",                 "desc": "РИА Новости — гос.СМИ",                            "operators": _ALL_RU},
+    {"host": "1tv.ru:443",                 "desc": "Первый канал",                                     "operators": _ALL_RU},
+    {"host": "rbc.ru:443",                 "desc": "РБК — деловые новости",                            "operators": _ALL_RU},
+    {"host": "kommersant.ru:443",          "desc": "Коммерсантъ",                                      "operators": ["home"]},
+    {"host": "tass.ru:443",                "desc": "ТАСС — гос.СМИ",                                   "operators": _ALL_RU},
+    {"host": "www.kp.ru:443",              "desc": "Комсомольская правда",                             "operators": ["home"]},
+    {"host": "lenta.ru:443",               "desc": "Лента.ру",                                         "operators": ["home"]},
+    {"host": "iz.ru:443",                  "desc": "Известия",                                         "operators": ["home"]},
+    {"host": "gazeta.ru:443",              "desc": "Газета.ру",                                        "operators": ["home"]},
+    # ── Стриминг ────────────────────────────────────────────────────────────────────────────
+    {"host": "www.ivi.ru:443",             "desc": "IVI — стриминг",                                   "operators": ["home"]},
+    {"host": "www.kinopoisk.ru:443",       "desc": "Кинопоиск (Яндекс)",                               "operators": _ALL_RU},
+    {"host": "okko.tv:443",                "desc": "Okko — стриминг (Сбер)",                           "operators": ["home"]},
+    {"host": "more.tv:443",                "desc": "more.tv — стриминг НТВ",                           "operators": ["home"]},
+    {"host": "premier.one:443",            "desc": "PREMIER — стриминг",                               "operators": ["home"]},
+    # ── Маркетплейсы — мощные WL-кандидаты ──────────────────────────────────────────────────
+    {"host": "ir.ozone.ru:443",            "desc": "Ozon CDN",                                         "operators": _ALL_RU},
+    {"host": "www.wildberries.ru:443",     "desc": "Wildberries — маркетплейс, в WL",                  "operators": _ALL_RU},
+    {"host": "www.ozon.ru:443",            "desc": "Ozon — маркетплейс, в WL",                         "operators": _ALL_RU},
+    {"host": "www.avito.ru:443",           "desc": "Авито — объявления",                               "operators": _ALL_RU},
+    {"host": "www.dns-shop.ru:443",        "desc": "DNS — магазин электроники",                        "operators": ["home"]},
+    {"host": "www.citilink.ru:443",        "desc": "Ситилинк — электроника",                           "operators": ["home"]},
 ]
+
+# Operator-name → human label for the UI dropdown.
+SNI_OPERATOR_LABELS = {
+    "beeline":  "Билайн (mobile)",
+    "mts":      "МТС (mobile)",
+    "megafon":  "Мегафон (mobile)",
+    "tele2":    "Tele2 (mobile)",
+    "home":     "Дом / городской интернет",
+    "global":   "Из-за пределов РФ",
+}
 
 print(f"Base directory: {BASE_DIR}")
 print(f"Template directory: {TEMPLATE_DIR}")
@@ -835,8 +858,33 @@ class AmneziaManager:
 
     def save_config(self):
         with self.config_lock:
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(self.config, f, indent=2)
+            self._atomic_write_text(CONFIG_FILE, json.dumps(self.config, indent=2))
+
+    @staticmethod
+    def _atomic_write_text(path, content):
+        # Write to a sibling tmp file then rename. The xray sidecar watches
+        # config.json via sha256sum polling — a non-atomic write truncates the
+        # file for a brief window, and if the poll lands there the watchdog
+        # kills the running xray and re-launches it against a half-written
+        # config, which then exits with a parse error and is never resurrected
+        # (the outer hash hasn't moved off the bad state). os.replace is atomic
+        # on the same filesystem, so the reader either sees the old contents or
+        # the complete new contents and never anything in between.
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def execute_command(self, command):
         """Execute shell command and return result"""
@@ -955,9 +1003,12 @@ class AmneziaManager:
         return value
 
     def _normalize_xhttp_mode(self, mode):
-        # packet-up: each upstream chunk is a separate HTTP POST — looks like browser file uploads,
-        # harder to fingerprint than a persistent stream.  Recommended for whitelist-bypass setups.
-        value = str(mode or "").strip().lower() or "packet-up"
+        # "auto": the server accepts whichever transport variant the client
+        # picks, and the client is free to fall back across variants if one
+        # gets DPI-classified. Empirically the most resilient default against
+        # mobile-operator flow-pattern DPI — pinning a single mode gives DPI a
+        # static signature to lock on to.
+        value = str(mode or "").strip().lower() or "auto"
         allowed = {"stream-up", "stream-down", "packet-up", "auto"}
         if value not in allowed:
             raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
@@ -1078,7 +1129,30 @@ class AmneziaManager:
         return self._parse_x25519_cli_output(out, r.returncode)
 
     def _generate_reality_short_id(self):
+        # Kept for backwards compatibility with callers that want a single ID.
+        # New servers should call _generate_reality_short_ids (plural).
         return secrets.token_hex(4)
+
+    def _generate_reality_short_ids(self, count=4):
+        """Generate a small set of REALITY shortIds of varied length.
+
+        Multiple shortIds matter for two reasons:
+          1. The client can pick any one of them at connect time, which means
+             active DPI probes observe different shortIds across sessions —
+             one server is no longer a single static identifier.
+          2. Mixing lengths (2, 4, 6, 8 hex chars) matches how XTLS docs
+             recommend Reality be configured, and how commercial REALITY VPNs
+             (PSNreality etc.) deploy it.
+        Empty shortId is intentionally NOT included — it disables auth.
+        """
+        lengths = [2, 4, 6, 8]
+        ids = set()
+        # Always include at least one of length 4 (the legacy default) so an
+        # operator pasting an old URL with the original sid still authenticates.
+        ids.add(secrets.token_hex(2))
+        for ln in lengths[: max(1, count - 1)]:
+            ids.add(secrets.token_hex(ln))
+        return sorted(ids, key=len)
 
     def _generate_random_path(self):
         """Random URL path that looks like a legit API endpoint."""
@@ -1133,8 +1207,7 @@ class AmneziaManager:
             lines.append("")
 
         try:
-            with open("/etc/nginx/vless_locations.inc", "w") as f:
-                f.write("\n".join(lines))
+            self._atomic_write_text("/etc/nginx/vless_locations.inc", "\n".join(lines))
         except Exception as e:
             print(f"Failed to write vless nginx locations: {e}")
 
@@ -1222,8 +1295,7 @@ class AmneziaManager:
             content = self._build_stream_conf(sni_to_port, port_set)
 
         try:
-            with open(NGINX_STREAM_CONFIG_FILE, "w") as f:
-                f.write(content)
+            self._atomic_write_text(NGINX_STREAM_CONFIG_FILE, content)
             self.execute_command("nginx -s reload 2>/dev/null || true")
         except Exception as e:
             print(f"Failed writing nginx stream config: {e}")
@@ -1293,27 +1365,72 @@ class AmneziaManager:
 
             # Common XHTTP anti-DPI parameters shared by REALITY and legacy inbounds.
             # Kept in one place so both paths benefit from the same masking tuning.
+            #
+            # IMPORTANT — what this defends against:
+            # Russian mobile-operator DPI (Beeline/MTS/Megafon) reportedly does
+            # flow-based payload classification: TLS handshake passes, the
+            # first few packets get inspected, and if their size+timing pattern
+            # doesn't look like a real browser session the operator silently
+            # RST-resets follow-up connections for ~15-30 min. The fix is to
+            # make every parameter that DPI measures a RANDOM RANGE instead of
+            # a fixed number, so the flow signature shifts every session.
             common_xhttp = {
                 "path": path,
                 "mode": mode,
                 "host": host,
-                # Random padding per packet defeats traffic-size fingerprinting by DPI.
-                "xPaddingBytes": "100-1000",
-                # Limit individual POST chunk size to stay within typical browser upload range.
-                "scMaxEachPostBytes": 1000000,
-                # Minimum interval between consecutive upstream POSTs (ms).
-                "scMinPostsIntervalMs": 30,
-                # Cap buffered packet-up posts per session; prevents a single client from
-                # allocating unbounded memory and keeps the burst pattern close to a browser.
-                "scMaxBufferedPosts": 30,
+                # Browser-like headers — DPI sometimes inspects HTTP/2 ALPN +
+                # request headers right after the TLS handshake. The values
+                # don't have to be unique per session (the User-Agent field is
+                # already part of the JA3 fingerprint), but they MUST be
+                # present and look browser-shaped. Pinning to a recent Chrome
+                # stable so the request header set matches what
+                # `fp=chrome` advertises in the TLS fingerprint.
+                "headers": {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/126.0.0.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+                },
+                # Wider random padding range — 100-1000 bytes was easy to
+                # fingerprint as "always-small-padding" by per-flow profilers.
+                # 1000-3000 puts each XHTTP frame closer to real chunked-HTTP
+                # body sizes a browser would send.
+                "xPaddingBytes": "1000-3000",
+                # Each upstream POST chunk: range, not a fixed cap. A constant
+                # 1 000 000 byte chunk every time is a strong DPI signal —
+                # browsers upload variable-size pieces.
+                "scMaxEachPostBytes": "1000000-3000000",
+                # Random delay between consecutive POSTs: 30-100 ms looks like
+                # a browser sending multiple resources, instead of a tight
+                # robot-loop with fixed 30 ms cadence.
+                "scMinPostsIntervalMs": "30-100",
+                # Vary how many posts a client buffers before flushing. A
+                # constant 30 made every session's burst pattern identical.
+                "scMaxBufferedPosts": "30-100",
                 # Keep default SSE-style Content-Type header so traffic mimics EventSource streams.
                 "noSSEHeader": False,
+                # Multiplexing: tells xhttp to treat one TCP connection like
+                # HTTP/2 — many small request/response pairs over one stream.
+                # DPI sees ONE long-lived TCP that carries lots of independent
+                # mini-requests (like a real browser visiting cnn.com). Each
+                # connection lifetime is randomized so the flow doesn't stay
+                # open for hours, which is itself a giveaway.
+                "xmux": {
+                    "maxConcurrency": "16-32",
+                    "maxConnections": 0,
+                    "cMaxReuseTimes": "64-128",
+                    "cMaxLifetimeMs": "1800000-3600000",
+                },
             }
             # Socket-level options applied to the Xray inbound socket. BBR gives more stable
             # throughput under loss (common on congested RU ISP links) and shifts RTT patterns
             # away from the default cubic signature. Kernels without BBR fall back silently.
+            # NOTE: xray-core's JSON key is camelCase "tcpCongestion" — the previous all-lowercase
+            # spelling was silently ignored, so BBR was never actually applied.
             common_sockopt = {
-                "tcpcongestion": "bbr",
+                "tcpCongestion": "bbr",
                 "tcpKeepAliveInterval": 30,
                 "tcpKeepAliveIdle": 300,
                 "tcpFastOpen": True,
@@ -1332,17 +1449,29 @@ class AmneziaManager:
                 priv = vless.get("reality_private_key")
                 if not priv:
                     continue
+                # Server-side TLS fingerprint that Xray impersonates when REALITY
+                # falls back to the masquerade target on any non-authenticated
+                # connection (DPI probe, port scanner, …). Without it Xray uses
+                # Go's stdlib TLS fingerprint, which DPI can flag as "not chrome,
+                # not curl — almost certainly a tunnel". Pinning to "chrome"
+                # makes a fallback handshake indistinguishable from a real
+                # Chrome request to the dest.
+                server_fingerprint = vless.get("reality_fingerprint") or "chrome"
                 stream_settings = {
                     "network": "xhttp",
                     "security": "reality",
                     "realitySettings": {
                         "show": False,
-                        # `target` is the current RealityObject name; `dest` is a compatible alias (XTLS docs).
+                        # Both `dest` and `target` are accepted by xray-core; `dest` is the
+                        # canonical name, `target` is its newer alias. Emit `dest` for
+                        # widest compatibility with older xray builds operators may pin.
+                        "dest": reality_dest,
                         "target": reality_dest,
                         "xver": 0,
                         "serverNames": server_names,
                         "privateKey": priv,
                         "shortIds": short_ids,
+                        "fingerprint": server_fingerprint,
                         # Allow up to 70 s clock drift between client and server.
                         # Without this, a client with a slightly off clock gets silently rejected by
                         # Reality's timestamp check — looks like the VPN "doesn't connect".
@@ -1395,7 +1524,7 @@ class AmneziaManager:
                     # traffic; TFO reduces RTT for repeat connections to popular origins.
                     "streamSettings": {
                         "sockopt": {
-                            "tcpcongestion": "bbr",
+                            "tcpCongestion": "bbr",
                             "tcpFastOpen": True,
                         }
                     },
@@ -1405,8 +1534,7 @@ class AmneziaManager:
 
         try:
             os.makedirs(XRAY_CONFIG_DIR, exist_ok=True)
-            with open(XRAY_CONFIG_FILE, "w") as f:
-                json.dump(config, f, indent=2)
+            self._atomic_write_text(XRAY_CONFIG_FILE, json.dumps(config, indent=2))
         except Exception as e:
             print(f"Failed writing xray config: {e}")
 
@@ -1419,9 +1547,13 @@ class AmneziaManager:
         reality_dest, dest_host = self._normalize_reality_dest(server_data.get("reality_dest"))
         server_names = self._reality_server_names_for_host(dest_host)
         priv, pub = self._generate_reality_keypair()
-        short_id = self._generate_reality_short_id()
-        # Non-empty shortId only: the empty string allows unauthenticated connections.
-        short_ids = [short_id]
+        # Multiple shortIds of varied lengths: client picks one per session, so
+        # active DPI probes see a moving target instead of one static auth tag.
+        # We keep `short_id` (singular) as the "primary" — that's what goes
+        # into the vless:// URL by default and into existing per-client export
+        # codepaths. `short_ids` is the full set xray accepts.
+        short_ids = self._generate_reality_short_ids(count=4)
+        short_id = short_ids[0]
 
         # Location metadata for the multi-server MemeVPN subscription (HAPP labels).
         # All optional — old code paths that don't set these still work.
@@ -1602,7 +1734,7 @@ class AmneziaManager:
         # Socket options reused on both bridge inbound and the chain-to-exit outbound.
         # BBR improves throughput on congested RU links; TFO shortens repeat RTTs.
         bridge_sockopt = {
-            "tcpcongestion": "bbr",
+            "tcpCongestion": "bbr",
             "tcpKeepAliveInterval": 30,
             "tcpKeepAliveIdle": 300,
             "tcpFastOpen": True,
@@ -1637,11 +1769,13 @@ class AmneziaManager:
                     "security": "reality",
                     "realitySettings": {
                         "show": False,
+                        "dest": bridge_reality_dest,
                         "target": bridge_reality_dest,
                         "xver": 0,
                         "serverNames": bridge_server_names,
                         "privateKey": bridge_priv,
                         "shortIds": [bridge_short_id],
+                        "fingerprint": bridge_fp,
                         "maxTimeDiff": 70000,
                     },
                     "xhttpSettings": {
@@ -4333,8 +4467,26 @@ def get_client_config_both(server_id, client_id):
 
 @app.route('/api/vless/sni-presets')
 def vless_sni_presets():
-    """Return curated REALITY mask-domain presets for the UI."""
-    return jsonify(REALITY_SNI_PRESETS)
+    """Return curated REALITY mask-domain presets for the UI.
+
+    Optional ``?operator=beeline`` (or `mts`/`megafon`/`tele2`/`home`/`global`)
+    filters the list down to presets observed working in that operator's
+    whitelist. Without the filter, the full list is returned along with the
+    operator legend so the UI can render the dropdown.
+    """
+    operator = (request.args.get('operator') or '').strip().lower()
+    if operator and operator in SNI_OPERATOR_LABELS:
+        filtered = [p for p in REALITY_SNI_PRESETS if operator in p.get("operators", [])]
+        return jsonify({
+            "operator": operator,
+            "operator_label": SNI_OPERATOR_LABELS[operator],
+            "operators": SNI_OPERATOR_LABELS,
+            "presets": filtered,
+        })
+    return jsonify({
+        "operators": SNI_OPERATOR_LABELS,
+        "presets": REALITY_SNI_PRESETS,
+    })
 
 
 @app.route('/api/vless/test-sni', methods=['POST'])
@@ -4342,25 +4494,39 @@ def vless_test_sni():
     """Probe one or many SNI host:port targets from this VPS.
 
     Body: ``{"hosts": ["vkvideo.ru:443", "www.microsoft.com:443"]}``  or
-          ``{"host": "vkvideo.ru:443"}``. Returns one result per host with
-    `ok / tls_version / latency_ms / error`. Use to validate that a Reality
-    `dest` you're about to pick is actually reachable from the server VPS
-    before saving — otherwise REALITY can't fall back to the masked
-    handshake and the whole inbound silently dies under any probe.
+          ``{"host": "vkvideo.ru:443"}``  or  ``{"operator": "beeline"}``.
+    Returns one result per host with `ok / tls_version / latency_ms / error`.
+    Use to validate that a Reality `dest` you're about to pick is actually
+    reachable from the server VPS before saving — otherwise REALITY can't
+    fall back to the masked handshake and the whole inbound silently dies
+    under any probe.
 
     `?all=1` (or empty body) probes every preset returned by
-    `/api/vless/sni-presets`. Useful for the "test all SNIs from this VPS"
-    button.
+    `/api/vless/sni-presets`. `?operator=beeline` (or via body) probes only
+    presets tagged for that ISP, which is the realistic scenario when the
+    end-user is stuck on a specific mobile operator.
     """
     data = request.json or {}
-    if request.args.get('all') == '1' or (not data.get('host') and not data.get('hosts')):
-        hosts = [p["host"] for p in REALITY_SNI_PRESETS]
-    elif data.get('hosts'):
+
+    # The "operator" filter is the same on body and querystring — pick whichever.
+    operator = (data.get('operator') or request.args.get('operator') or '').strip().lower()
+    operator_label = SNI_OPERATOR_LABELS.get(operator) if operator else None
+
+    def _presets_for(op):
+        if op and op in SNI_OPERATOR_LABELS:
+            return [p["host"] for p in REALITY_SNI_PRESETS if op in p.get("operators", [])]
+        return [p["host"] for p in REALITY_SNI_PRESETS]
+
+    if data.get('hosts'):
         if not isinstance(data['hosts'], list):
             return jsonify({"error": "hosts must be a list"}), 400
         hosts = [str(h) for h in data['hosts']]
-    else:
+    elif data.get('host'):
         hosts = [str(data['host'])]
+    elif operator or request.args.get('all') == '1' or not data:
+        hosts = _presets_for(operator)
+    else:
+        hosts = _presets_for(None)
 
     if len(hosts) > 100:
         return jsonify({"error": "too many hosts (max 100)"}), 400
@@ -4370,6 +4536,8 @@ def vless_test_sni():
         "ok": sum(1 for r in results if r.get("ok")),
         "fail": sum(1 for r in results if not r.get("ok")),
         "tested_from": amnezia_manager.public_ip,
+        "operator": operator or None,
+        "operator_label": operator_label,
     }
     return jsonify({"results": results, "summary": summary})
 

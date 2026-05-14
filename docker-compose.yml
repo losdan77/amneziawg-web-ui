@@ -58,10 +58,28 @@ services:
     image: teddysun/xray:26.3.27
     container_name: amneziawg-xray
     restart: unless-stopped
+    # NET_ADMIN is required so xray can actually apply sockopt options such as
+    # tcpFastOpen / tcpCongestion=bbr on the inbound listening socket. Without
+    # it setsockopt() returns EPERM and the optimisations are silently dropped.
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.tcp_fastopen=3
     volumes:
       - /etc/amnezia:/etc/amnezia
     # Auto-restart xray when config.json changes (simple watchdog).
     # Web UI regenerates /etc/amnezia/xray/config.json after VLESS changes.
+    #
+    # IMPORTANT invariants this script must preserve:
+    #   * If xray crashes for any reason, we MUST relaunch it on the very next
+    #     iteration — otherwise users connect to a dead inbound and traffic
+    #     silently stops flowing (the symptom that motivated this fix).
+    #   * If a stale truncated config is written by the web-ui (mitigated on
+    #     the Python side via atomic replace, but defence in depth), xray will
+    #     exit immediately and we must NOT wedge waiting for a "new" hash.
+    #   * All `$` that belong to the inner shell must be escaped as `$$` so
+    #     Compose interpolation doesn't eat them — including `$$!`, which is
+    #     the PID of the most recently backgrounded process.
     command:
       - /bin/sh
       - -lc
@@ -74,12 +92,13 @@ services:
         while true; do
           cur="$$(sha256sum "$$CFG" 2>/dev/null | awk '{print $$1}' || true)"
           if [ -n "$$cur" ] && [ "$$cur" != "$$last" ]; then
-            echo "[xray] config changed, restarting xray"
+            echo "[xray] config changed, (re)starting xray"
             last="$$cur"
-            # Run xray in background and restart on next change.
             /usr/bin/xray -config "$$CFG" &
-            pid="$!"
-            # Poll until hash changes, then terminate xray.
+            pid="$$!"
+            # Inner loop: stay attached to this xray pid until either the
+            # config changes (then kill+respawn) or xray itself dies (then
+            # reset `last` so the outer loop unconditionally respawns it).
             while true; do
               sleep 2
               nxt="$$(sha256sum "$$CFG" 2>/dev/null | awk '{print $$1}' || true)"
@@ -89,9 +108,12 @@ services:
                 wait "$$pid" 2>/dev/null || true
                 break
               fi
-              # If xray crashed, break and let outer loop restart it.
               if ! kill -0 "$$pid" 2>/dev/null; then
-                echo "[xray] process exited, restarting"
+                # Without this `last=""` the outer loop sees the unchanged
+                # hash, falls into the else branch, and sleeps forever — xray
+                # would never come back after a crash.
+                echo "[xray] process exited unexpectedly, will respawn"
+                last=""
                 break
               fi
             done
