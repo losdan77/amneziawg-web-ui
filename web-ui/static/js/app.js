@@ -1317,18 +1317,96 @@ class AmneziaApp {
         this.openAddClientDialog(serverId);
     }
 
-    getDurationOptions(selectedValue = '1m') {
-        const options = [
-            { value: '1m', label: '1 month' },
-            { value: '3m', label: '3 months' },
-            { value: '6m', label: '6 months' },
-            { value: '12m', label: '1 year' },
-            { value: 'forever', label: 'Forever' }
+    /**
+     * Render the flexible duration picker (number input + unit select +
+     * optional date input). Pass a unique ``prefix`` so multiple pickers can
+     * coexist on the page. ``defaultUnit`` is one of ``h|d|w|m|y|forever|abs``.
+     */
+    renderDurationPicker(prefix, defaultAmount = 1, defaultUnit = 'm') {
+        const amountId = `${prefix}Amount`;
+        const unitId = `${prefix}Unit`;
+        const dateId = `${prefix}Date`;
+        const units = [
+            { value: 'h', label: 'Hours' },
+            { value: 'd', label: 'Days' },
+            { value: 'w', label: 'Weeks' },
+            { value: 'm', label: 'Months' },
+            { value: 'y', label: 'Years' },
+            { value: 'abs', label: 'Until date…' },
+            { value: 'forever', label: 'Forever' },
         ];
-        return options.map(option => {
-            const selected = option.value === selectedValue ? 'selected' : '';
-            return `<option value="${option.value}" ${selected}>${option.label}</option>`;
-        }).join('');
+        const opts = units.map(u =>
+            `<option value="${u.value}" ${u.value === defaultUnit ? 'selected' : ''}>${u.label}</option>`
+        ).join('');
+        const hideAmount = (defaultUnit === 'forever' || defaultUnit === 'abs') ? 'opacity-50 pointer-events-none' : '';
+        const showDate = defaultUnit === 'abs' ? '' : 'hidden';
+        return `
+            <div class="flex gap-2">
+                <input type="number" id="${amountId}" min="1" value="${defaultAmount}"
+                       class="block w-20 border border-gray-300 rounded-md px-3 py-2 ${hideAmount}">
+                <select id="${unitId}"
+                        class="block flex-1 border border-gray-300 rounded-md px-3 py-2"
+                        onchange="amneziaApp.onDurationUnitChange('${amountId}', '${unitId}', '${dateId}')">
+                    ${opts}
+                </select>
+            </div>
+            <input type="date" id="${dateId}"
+                   class="mt-2 block w-full border border-gray-300 rounded-md px-3 py-2 ${showDate}">
+        `;
+    }
+
+    /**
+     * Toggle the amount/date inputs based on the selected unit. Wired from
+     * both this file (renderDurationPicker) and the static markup in
+     * index.html so it's safe to call with a missing ``dateId``.
+     */
+    onDurationUnitChange(amountId, unitId, dateId) {
+        const amount = document.getElementById(amountId);
+        const unitEl = document.getElementById(unitId);
+        if (!unitEl) return;
+        const unit = unitEl.value;
+        // The static markup in index.html uses fixed date input IDs that
+        // mirror the unit id with the ``Unit`` suffix swapped for ``Date``.
+        if (!dateId) {
+            dateId = unitId.replace(/Unit$/, 'Date');
+        }
+        const date = document.getElementById(dateId);
+        if (amount) {
+            const disabled = (unit === 'forever' || unit === 'abs');
+            amount.disabled = disabled;
+            amount.classList.toggle('opacity-50', disabled);
+        }
+        if (date) {
+            date.classList.toggle('hidden', unit !== 'abs');
+        }
+    }
+
+    /**
+     * Read the value of a duration picker as a canonical string the backend
+     * understands (e.g. ``"30d"``, ``"6m"``, ``"forever"``, ``"2026-12-31"``).
+     * Returns ``null`` and shows an error toast if the input is invalid.
+     */
+    readDurationValue(prefix) {
+        const amountEl = document.getElementById(`${prefix}Amount`);
+        const unitEl = document.getElementById(`${prefix}Unit`);
+        const dateEl = document.getElementById(`${prefix}Date`);
+        if (!unitEl) return null;
+        const unit = unitEl.value;
+        if (unit === 'forever') return 'forever';
+        if (unit === 'abs') {
+            const dateVal = dateEl ? dateEl.value : '';
+            if (!dateVal) {
+                this.showTempMessage('Please pick an expiration date', 'error');
+                return null;
+            }
+            return dateVal;
+        }
+        const amount = amountEl ? parseInt(amountEl.value, 10) : NaN;
+        if (!Number.isFinite(amount) || amount <= 0) {
+            this.showTempMessage('Please enter a positive duration', 'error');
+            return null;
+        }
+        return `${amount}${unit}`;
     }
 
     openAddClientDialog(serverId) {
@@ -1344,9 +1422,7 @@ class AmneziaApp {
                         </div>
                         <div>
                             <label class="block text-sm font-medium text-gray-700 mb-1">Access Duration</label>
-                            <select id="newClientDuration" class="w-full border border-gray-300 rounded-md px-3 py-2">
-                                ${this.getDurationOptions('1m')}
-                            </select>
+                            ${this.renderDurationPicker('newClientDuration', 1, 'm')}
                         </div>
                     </div>
                     <div class="mt-6 flex justify-end space-x-3">
@@ -1372,9 +1448,9 @@ class AmneziaApp {
 
     confirmAddClient(serverId) {
         const nameInput = document.getElementById('newClientName');
-        const durationSelect = document.getElementById('newClientDuration');
         const clientName = nameInput ? nameInput.value.trim() : '';
-        const duration = durationSelect ? durationSelect.value : '1m';
+        const duration = this.readDurationValue('newClientDuration');
+        if (duration === null) return;
 
         if (!clientName) {
             this.showTempMessage('Client name is required', 'error');
@@ -1419,9 +1495,8 @@ class AmneziaApp {
                     <p class="text-sm text-gray-600 mb-4">${safeName}</p>
                     <div>
                         <label class="block text-sm font-medium text-gray-700 mb-1">Extend by</label>
-                        <select id="extendClientDuration" class="w-full border border-gray-300 rounded-md px-3 py-2">
-                            ${this.getDurationOptions('1m')}
-                        </select>
+                        ${this.renderDurationPicker('extendClientDuration', 1, 'm')}
+                        <p class="text-xs text-gray-500 mt-2">Pick any positive amount or an exact end date.</p>
                     </div>
                     <div class="mt-6 flex justify-end space-x-3">
                         <button onclick="amneziaApp.closeExtendClientDialog()" class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">
@@ -1445,8 +1520,8 @@ class AmneziaApp {
     }
 
     confirmExtendClient(serverId, clientId) {
-        const durationSelect = document.getElementById('extendClientDuration');
-        const duration = durationSelect ? durationSelect.value : '1m';
+        const duration = this.readDurationValue('extendClientDuration');
+        if (duration === null) return;
 
         fetch(`/api/servers/${serverId}/clients/${clientId}/extend`, {
             method: 'POST',
@@ -2413,11 +2488,17 @@ app._renderUserCard = function(u) {
 app.provisionUser = function() {
     const userId = (document.getElementById('newUserId').value || '').trim();
     const name = (document.getElementById('newUserName').value || '').trim();
-    const duration = document.getElementById('newUserDuration').value;
+    const duration = this.readDurationValue('newUserDuration');
     const status = document.getElementById('provisionStatus');
     if (!userId) {
         status.className = 'text-sm mt-2 text-red-600';
         status.textContent = 'User ID is required';
+        status.classList.remove('hidden');
+        return;
+    }
+    if (duration === null) {
+        status.className = 'text-sm mt-2 text-red-600';
+        status.textContent = 'Please pick a valid duration';
         status.classList.remove('hidden');
         return;
     }
@@ -2447,8 +2528,42 @@ app.provisionUser = function() {
 };
 
 app.extendUser = function(userId) {
-    const duration = prompt('Extend by which duration? (1m, 3m, 6m, 12m, forever)', '1m');
-    if (!duration) return;
+    this.closeExtendUserDialog();
+    const safeUserId = this.escapeHtml(userId);
+    const dialogHTML = `
+        <div id="extendUserDialog" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div class="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+                <h3 class="text-xl font-semibold mb-2">Extend user</h3>
+                <p class="text-sm text-gray-600 mb-4">${safeUserId}</p>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Extend by</label>
+                    ${this.renderDurationPicker('extendUserDuration', 1, 'm')}
+                    <p class="text-xs text-gray-500 mt-2">Pick any positive amount or an exact end date.</p>
+                </div>
+                <div class="mt-6 flex justify-end space-x-3">
+                    <button onclick="amneziaApp.closeExtendUserDialog()"
+                            class="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50">
+                        Cancel
+                    </button>
+                    <button onclick="amneziaApp.confirmExtendUser('${userId.replace(/'/g, "\\'")}')"
+                            class="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600">
+                        Extend
+                    </button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', dialogHTML);
+};
+
+app.closeExtendUserDialog = function() {
+    const dialog = document.getElementById('extendUserDialog');
+    if (dialog) dialog.remove();
+};
+
+app.confirmExtendUser = function(userId) {
+    const duration = this.readDurationValue('extendUserDuration');
+    if (duration === null) return;
     fetch(`/api/users/${encodeURIComponent(userId)}/extend`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -2457,7 +2572,8 @@ app.extendUser = function(userId) {
     .then(r => r.json().then(j => ({ok: r.ok, body: j})))
     .then(({ok, body}) => {
         if (!ok) throw new Error(body.error || 'Failed');
-        alert(`Extended ${body.extended.length} client(s)`);
+        this.closeExtendUserDialog();
+        this.showTempMessage(`Extended ${body.extended.length} client(s)`, 'success');
         amneziaApp.loadUsers();
     })
     .catch(e => alert('Error: ' + e.message));
@@ -2626,11 +2742,17 @@ app.savePromoLines = function() {
 
 app.broadcastServer = function() {
     const serverId = (document.getElementById('broadcastServerId').value || '').trim();
-    const duration = document.getElementById('broadcastDuration').value;
+    const duration = this.readDurationValue('broadcastDuration');
     const status = document.getElementById('broadcastStatus');
     if (!serverId) {
         status.className = 'text-sm mt-2 text-red-600';
         status.textContent = 'Server ID is required';
+        status.classList.remove('hidden');
+        return;
+    }
+    if (duration === null) {
+        status.className = 'text-sm mt-2 text-red-600';
+        status.textContent = 'Please pick a valid duration';
         status.classList.remove('hidden');
         return;
     }

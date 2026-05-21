@@ -592,13 +592,24 @@
                         </div>
                         <div>
                             <label class="block text-xs font-medium text-gray-700">Duration *</label>
-                            <select id="newUserDuration" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
-                                <option value="1m">1 month</option>
-                                <option value="3m">3 months</option>
-                                <option value="6m">6 months</option>
-                                <option value="12m">1 year</option>
-                                <option value="forever">Forever</option>
-                            </select>
+                            <div class="mt-1 flex gap-2">
+                                <input type="number" id="newUserDurationAmount" min="1" value="1"
+                                       class="block w-20 border border-gray-300 rounded-md px-2 py-1 text-sm">
+                                <select id="newUserDurationUnit"
+                                        class="block flex-1 border border-gray-300 rounded-md px-2 py-1 text-sm"
+                                        onchange="amneziaApp.onDurationUnitChange('newUserDurationAmount', 'newUserDurationUnit')">
+                                    <option value="h">Hours</option>
+                                    <option value="d">Days</option>
+                                    <option value="w">Weeks</option>
+                                    <option value="m" selected>Months</option>
+                                    <option value="y">Years</option>
+                                    <option value="abs">Until date…</option>
+                                    <option value="forever">Forever</option>
+                                </select>
+                            </div>
+                            <input type="date" id="newUserDurationDate"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm hidden">
+                            <p class="text-gray-500 text-xs mt-1">Any positive number, or pick an exact date.</p>
                         </div>
                         <div class="flex items-end">
                             <button onclick="amneziaApp.provisionUser()"
@@ -621,13 +632,23 @@
                         </div>
                         <div>
                             <label class="block text-xs font-medium text-gray-700">Duration for new clients</label>
-                            <select id="broadcastDuration" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
-                                <option value="1m">1 month</option>
-                                <option value="3m">3 months</option>
-                                <option value="6m">6 months</option>
-                                <option value="12m">1 year</option>
-                                <option value="forever">Forever</option>
-                            </select>
+                            <div class="mt-1 flex gap-2">
+                                <input type="number" id="broadcastDurationAmount" min="1" value="1"
+                                       class="block w-20 border border-gray-300 rounded-md px-2 py-1 text-sm">
+                                <select id="broadcastDurationUnit"
+                                        class="block flex-1 border border-gray-300 rounded-md px-2 py-1 text-sm"
+                                        onchange="amneziaApp.onDurationUnitChange('broadcastDurationAmount', 'broadcastDurationUnit')">
+                                    <option value="h">Hours</option>
+                                    <option value="d">Days</option>
+                                    <option value="w">Weeks</option>
+                                    <option value="m" selected>Months</option>
+                                    <option value="y">Years</option>
+                                    <option value="abs">Until date…</option>
+                                    <option value="forever">Forever</option>
+                                </select>
+                            </div>
+                            <input type="date" id="broadcastDurationDate"
+                                   class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm hidden">
                         </div>
                         <div class="flex items-end">
                             <button onclick="amneziaApp.broadcastServer()"

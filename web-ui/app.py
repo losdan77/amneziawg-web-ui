@@ -237,45 +237,141 @@ class AmneziaManager:
         self.start_client_expiration_worker()
         self.start_link_health_worker()
 
+    # ── Flexible client expiration ──────────────────────────────────────
+    # The web UI / bot can pass any of the following as the ``duration`` field:
+    #   • ``"forever"`` / ``"permanent"`` / ``"lifetime"`` / ``"unlimited"`` /
+    #     ``"never"`` / ``"навсегда"``  → client never expires.
+    #   • ``"<N>d"`` / ``"<N>day(s)"`` — N calendar days.
+    #   • ``"<N>h"`` / ``"<N>hour(s)"`` — N hours.
+    #   • ``"<N>w"`` / ``"<N>week(s)"`` — N weeks.
+    #   • ``"<N>m"`` / ``"<N>mo"`` / ``"<N>month(s)"`` — N calendar months.
+    #   • ``"<N>y"`` / ``"<N>year(s)"`` — N years.
+    #   • A bare integer (``"30"``) — treated as N days.
+    #   • An ISO date ``YYYY-MM-DD`` or ``YYYY-MM-DD HH:MM[:SS]`` — absolute
+    #     expiry timestamp (UTC if no timezone is given). Stored as ``abs:<ts>``.
+    #   • Legacy fixed codes ``"1m" / "3m" / "6m" / "12m"`` keep working — they
+    #     normalise to the same ``Nm`` form.
+    # The internal canonical code is stored in ``client["duration_code"]`` and
+    # its human-readable form in ``client["duration_label"]``. ``expires_at``
+    # is the absolute UNIX timestamp at which the client stops working.
+
+    _DURATION_UNIT_ALIASES = {
+        "h": "h", "hr": "h", "hrs": "h", "hour": "h", "hours": "h",
+        "d": "d", "day": "d", "days": "d",
+        "w": "w", "wk": "w", "wks": "w", "week": "w", "weeks": "w",
+        "m": "m", "mo": "m", "mon": "m", "month": "m", "months": "m",
+        "y": "y", "yr": "y", "yrs": "y", "year": "y", "years": "y",
+    }
+
+    _DURATION_FOREVER_ALIASES = {
+        "", "0", "forever", "permanent", "lifetime", "unlimited",
+        "never", "navsegda", "навсегда", "вечно", "infinity", "inf",
+    }
+
     def _normalize_duration_code(self, duration_code):
-        """Normalize user-provided duration to internal code."""
+        """Normalize user-provided duration to an internal canonical code.
+
+        Returns one of:
+          • ``"forever"``
+          • ``"<N><unit>"`` where unit ∈ {h, d, w, m, y} and N is a positive int
+          • ``"abs:<timestamp>"`` for an absolute UTC expiry timestamp
+        """
         if duration_code is None:
             return "forever"
 
-        duration_text = str(duration_code).strip().lower()
-        aliases = {
-            "1m": "1m",
-            "month": "1m",
-            "1month": "1m",
-            "3m": "3m",
-            "3months": "3m",
-            "6m": "6m",
-            "6months": "6m",
-            "12m": "12m",
-            "year": "12m",
-            "1y": "12m",
-            "12months": "12m",
-            "forever": "forever",
-            "permanent": "forever",
-            "lifetime": "forever",
-            "unlimited": "forever",
-            "navsegda": "forever",
-            "навсегда": "forever"
-        }
-        normalized = aliases.get(duration_text)
-        if not normalized:
+        # Allow callers to pass already-canonical strings, plain ints (days)
+        # or floats from older code paths.
+        if isinstance(duration_code, bool):
             raise ValueError(f"Unsupported client duration: {duration_code}")
-        return normalized
+        if isinstance(duration_code, (int, float)):
+            n = int(duration_code)
+            if n <= 0:
+                return "forever"
+            return f"{n}d"
+
+        text = str(duration_code).strip().lower().replace(" ", "")
+        if text in self._DURATION_FOREVER_ALIASES:
+            return "forever"
+
+        # Pre-normalised ``abs:`` form coming back from saved config or a
+        # satellite — just validate the timestamp.
+        if text.startswith("abs:"):
+            try:
+                ts = float(text[4:])
+            except ValueError:
+                raise ValueError(f"Unsupported client duration: {duration_code}")
+            return f"abs:{ts}"
+
+        # Absolute ISO date / datetime (UTC if naive).
+        iso_match = re.fullmatch(
+            r"(\d{4}-\d{2}-\d{2})(?:[t ](\d{2}:\d{2}(?::\d{2})?))?", text
+        )
+        if iso_match:
+            date_part, time_part = iso_match.group(1), iso_match.group(2)
+            iso_text = f"{date_part}T{time_part}" if time_part else date_part
+            try:
+                dt = datetime.fromisoformat(iso_text)
+            except ValueError:
+                raise ValueError(f"Unsupported client duration: {duration_code}")
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return f"abs:{dt.timestamp()}"
+
+        # Bare integer → days.
+        if text.isdigit():
+            n = int(text)
+            return "forever" if n <= 0 else f"{n}d"
+
+        # ``<N><unit>`` relative duration.
+        rel_match = re.fullmatch(r"(\d+)([a-zа-я]+)", text)
+        if rel_match:
+            n = int(rel_match.group(1))
+            unit_raw = rel_match.group(2)
+            unit = self._DURATION_UNIT_ALIASES.get(unit_raw)
+            if unit is None:
+                raise ValueError(f"Unsupported client duration: {duration_code}")
+            if n <= 0:
+                return "forever"
+            return f"{n}{unit}"
+
+        # Legacy bare unit aliases like ``"month"`` / ``"year"`` (no number).
+        unit = self._DURATION_UNIT_ALIASES.get(text)
+        if unit is not None:
+            return f"1{unit}"
+
+        raise ValueError(f"Unsupported client duration: {duration_code}")
 
     def _duration_label(self, duration_code):
-        labels = {
-            "1m": "1 month",
-            "3m": "3 months",
-            "6m": "6 months",
-            "12m": "1 year",
-            "forever": "Forever"
-        }
-        return labels.get(duration_code, "Forever")
+        """Return a human-readable label for a canonical duration code."""
+        if duration_code is None or duration_code == "forever":
+            return "Forever"
+
+        text = str(duration_code)
+        if text.startswith("abs:"):
+            try:
+                ts = float(text[4:])
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+                    return f"Until {dt.strftime('%Y-%m-%d')}"
+                return f"Until {dt.strftime('%Y-%m-%d %H:%M UTC')}"
+            except (ValueError, OSError):
+                return "Forever"
+
+        rel_match = re.fullmatch(r"(\d+)([hdwmy])", text)
+        if rel_match:
+            n = int(rel_match.group(1))
+            unit = rel_match.group(2)
+            unit_names = {
+                "h": ("hour", "hours"),
+                "d": ("day", "days"),
+                "w": ("week", "weeks"),
+                "m": ("month", "months"),
+                "y": ("year", "years"),
+            }
+            singular, plural = unit_names[unit]
+            return f"{n} {singular if n == 1 else plural}"
+
+        return text
 
     def _add_calendar_months_utc(self, base_ts, months):
         """Add calendar months in UTC without fixed-day approximations."""
@@ -288,11 +384,44 @@ class AmneziaManager:
         return shifted.timestamp()
 
     def _calculate_expires_at(self, duration_code, base_ts):
+        """Compute the absolute expiry timestamp for ``duration_code``.
+
+        For relative durations the returned timestamp is ``base_ts`` shifted
+        forward by the requested amount; for absolute (``abs:<ts>``) durations
+        the stored timestamp is returned verbatim regardless of ``base_ts``.
+        Returns ``None`` for ``forever``.
+        """
         duration = self._normalize_duration_code(duration_code)
-        months_map = {"1m": 1, "3m": 3, "6m": 6, "12m": 12}
         if duration == "forever":
             return None
-        return self._add_calendar_months_utc(base_ts, months_map[duration])
+
+        if duration.startswith("abs:"):
+            return float(duration[4:])
+
+        rel_match = re.fullmatch(r"(\d+)([hdwmy])", duration)
+        if not rel_match:
+            raise ValueError(f"Unsupported client duration: {duration_code}")
+
+        n = int(rel_match.group(1))
+        unit = rel_match.group(2)
+        if unit == "h":
+            return base_ts + n * 3600
+        if unit == "d":
+            return base_ts + n * 86400
+        if unit == "w":
+            return base_ts + n * 7 * 86400
+        if unit == "m":
+            return self._add_calendar_months_utc(base_ts, n)
+        if unit == "y":
+            return self._add_calendar_months_utc(base_ts, n * 12)
+
+        raise ValueError(f"Unsupported client duration: {duration_code}")
+
+    def _duration_is_absolute(self, duration_code):
+        """Return True if ``duration_code`` represents an absolute timestamp."""
+        if duration_code is None:
+            return False
+        return str(duration_code).startswith("abs:")
 
     def _is_client_expired(self, client_config, now_ts=None):
         expires_at = client_config.get("expires_at")
@@ -3267,7 +3396,17 @@ AllowedIPs = {client_ip}/32
         return True
 
     def extend_client(self, server_id, client_id, duration_code):
-        """Extend client expiration by duration from current expiry or now."""
+        """Extend client expiration by duration from current expiry or now.
+
+        For relative durations (e.g. ``30d``, ``6m``) the new expiry is the
+        request added to ``max(current_expiry, now)`` so that active clients
+        keep their unused time and expired clients restart from today.
+
+        For absolute durations (``abs:<ts>`` / ISO dates) the new expiry is
+        the specified date itself — but never earlier than the current expiry,
+        so an operator cannot accidentally shorten a paying client by picking
+        a past date.
+        """
         normalized_duration = self._normalize_duration_code(duration_code)
         now_ts = time.time()
 
@@ -3288,7 +3427,19 @@ AllowedIPs = {client_ip}/32
             else:
                 base_ts = now_ts
 
-            new_expires_at = self._calculate_expires_at(normalized_duration, base_ts)
+            if self._duration_is_absolute(normalized_duration):
+                requested_expires_at = self._calculate_expires_at(normalized_duration, base_ts)
+                # Never silently downgrade a "forever" client to a fixed date,
+                # and never roll a paying client backwards in time.
+                if requested_expires_at is None:
+                    new_expires_at = None
+                elif current_expires_at is None:
+                    # Already permanent — keep it permanent.
+                    new_expires_at = None
+                else:
+                    new_expires_at = max(float(current_expires_at), requested_expires_at)
+            else:
+                new_expires_at = self._calculate_expires_at(normalized_duration, base_ts)
             self._sync_client_expiration_fields(server_client, global_client, normalized_duration, new_expires_at)
 
             new_extended_count = int(server_client.get("extended_count", 0)) + 1
