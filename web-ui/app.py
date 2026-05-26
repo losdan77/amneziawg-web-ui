@@ -1357,6 +1357,60 @@ class AmneziaManager:
         except Exception as e:
             print(f"Failed writing nginx stream config: {e}")
 
+    def _vless_stream_sni_conflicts(self):
+        """Return stream-routed REALITY SNI names used by more than one server.
+
+        nginx stream can only route a TLS ClientHello to one backend based on
+        SNI. If two VLESS inbounds on the same VPS accept the same REALITY SNI,
+        one of them will receive clients intended for the other and those
+        clients will be rejected by Xray.
+        """
+        by_sni = {}
+        for server in self.config.get("servers", []):
+            if server.get("protocol") != "vless":
+                continue
+            vless = server.get("vless") or {}
+            if not self._vless_is_reality(vless) or not vless.get("use_stream"):
+                continue
+            for sn in (vless.get("reality_server_names") or []):
+                key = str(sn or "").strip().lower()
+                if not key:
+                    continue
+                by_sni.setdefault(key, []).append({
+                    "server_id": server.get("id"),
+                    "server_name": server.get("name"),
+                    "inbound_port": vless.get("inbound_port"),
+                })
+        return {sni: refs for sni, refs in by_sni.items() if len(refs) > 1}
+
+    def vless_server_warnings(self, server, sni_conflicts=None):
+        warnings = []
+        if not server or server.get("protocol") != "vless":
+            return warnings
+        vless = server.get("vless") or {}
+        if self._vless_is_reality(vless) and vless.get("use_stream"):
+            if not os.getenv("SSL_DOMAIN", "").strip():
+                warnings.append(
+                    "Port 443 stream routing needs SSL_DOMAIN configured so nginx HTTP moves to internal :4443."
+                )
+            conflicts = sni_conflicts if sni_conflicts is not None else self._vless_stream_sni_conflicts()
+            own_id = server.get("id")
+            conflict_names = []
+            for sn in (vless.get("reality_server_names") or []):
+                key = str(sn or "").strip().lower()
+                refs = conflicts.get(key) or []
+                if any(ref.get("server_id") == own_id for ref in refs):
+                    others = [ref.get("server_id") for ref in refs if ref.get("server_id") != own_id]
+                    if others:
+                        conflict_names.append(f"{key} also used by {', '.join(others)}")
+            if conflict_names:
+                warnings.append(
+                    "REALITY SNI conflict on port 443: "
+                    + "; ".join(conflict_names)
+                    + ". Use a unique REALITY dest per VLESS server on the same VPS, or keep one VLESS server per VPS."
+                )
+        return warnings
+
     def _build_stream_conf(self, sni_to_port: dict, port_set: set) -> str:
         """Render the nginx stream{} block from the SNI→port mapping."""
         map_lines = []
@@ -2150,6 +2204,128 @@ class AmneziaManager:
         with self.config_lock:
             self.save_config()
 
+    def _remote_client_is_live_for_broadcast(self, remote, now_ts=None):
+        exp = (remote or {}).get("expires_at")
+        if exp is None:
+            return True
+        try:
+            grace = max(0.0, CLIENT_DELETE_GRACE_DAYS) * 24 * 60 * 60
+            return (now_ts or time.time()) < float(exp) + grace
+        except (TypeError, ValueError):
+            return True
+
+    def _user_has_live_clients_for_broadcast(self, uid, record=None):
+        if self._get_user_clients(uid):
+            return True
+        record = record or self.config.get("users", {}).get(uid) or {}
+        now_ts = time.time()
+        return any(
+            self._remote_client_is_live_for_broadcast(remote, now_ts)
+            for remote in record.get("remote_clients", [])
+        )
+
+    def _find_satellite_server_for_broadcast(self, target):
+        """Resolve a satellite broadcast target.
+
+        Accepts either a remote server id if it is unique across satellites, or
+        the explicit ``satellite_id:server_id`` format.
+        """
+        raw = str(target or "").strip()
+        sat_hint = None
+        remote_id = raw
+        if ":" in raw:
+            sat_hint, remote_id = [part.strip() for part in raw.split(":", 1)]
+            if not sat_hint or not remote_id:
+                raise ValueError("Satellite target must be satellite_id:server_id")
+
+        matches = []
+        for sat_id, sat in self.config.get("satellites", {}).items():
+            if sat_hint and sat_id != sat_hint:
+                continue
+            for srv in sat.get("servers", []):
+                if srv.get("id") == remote_id:
+                    matches.append((sat_id, sat, srv))
+
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise ValueError(
+                "Satellite server_id is ambiguous; use satellite_id:server_id"
+            )
+        return matches[0]
+
+    def _provision_single_satellite_server_for_user(
+        self, uid, duration_code, user_record, sat_id, sat, srv
+    ):
+        remote_clients = user_record.setdefault("remote_clients", [])
+        existing = next(
+            (
+                r for r in remote_clients
+                if r.get("satellite_id") == sat_id
+                and r.get("remote_server_id") == srv.get("id")
+            ),
+            None,
+        )
+
+        if existing:
+            ext = self._satellite_request(
+                sat["base_url"], sat["api_key"], "POST",
+                f"/api/satellite/servers/{srv['id']}/clients/{existing['remote_client_id']}/extend",
+                {"duration_code": duration_code},
+                basic_auth=self._satellite_basic_auth(sat),
+            )
+            existing["expires_at"] = ext.get("expires_at")
+            existing["country_code"] = srv.get("country_code", "")
+            existing["flag_emoji"] = srv.get("flag_emoji", "")
+            existing["display_location"] = srv.get("display_location", "")
+            entry = existing
+            renewed = True
+        else:
+            created = self._satellite_request(
+                sat["base_url"], sat["api_key"], "POST",
+                "/api/satellite/clients",
+                {
+                    "server_id": srv["id"],
+                    "client_name": f"user-{uid}",
+                    "duration_code": duration_code,
+                },
+                basic_auth=self._satellite_basic_auth(sat),
+            )
+            entry = {
+                "satellite_id": sat_id,
+                "satellite_label": sat.get("label"),
+                "remote_server_id": srv["id"],
+                "remote_client_id": created["client_id"],
+                "uuid": created.get("uuid"),
+                "country_code": srv.get("country_code", ""),
+                "flag_emoji": srv.get("flag_emoji", ""),
+                "display_location": srv.get("display_location", ""),
+                "link": created.get("link"),
+                "expires_at": created.get("expires_at"),
+            }
+            remote_clients.append(entry)
+            renewed = False
+
+        user_record["remote_errors"] = [
+            e for e in user_record.get("remote_errors", [])
+            if not (
+                e.get("satellite_id") == sat_id
+                and e.get("server_id") == srv.get("id")
+            )
+        ]
+        return {
+            "server_id": srv["id"],
+            "server_name": srv.get("name"),
+            "satellite_id": sat_id,
+            "country_code": srv.get("country_code", ""),
+            "client_id": entry.get("remote_client_id"),
+            "uuid": entry.get("uuid"),
+            "expires_at": entry.get("expires_at"),
+            "renewed": renewed,
+            "link": entry.get("link"),
+            "scope": "satellite",
+        }
+
     def provision_user(self, user_id, duration_code="1m", server_ids=None, name=None):
         """Ensure the user has a client on every local VLESS server *and* on
         every satellite-side VLESS server. Returns the user record, a list of
@@ -2629,25 +2805,63 @@ class AmneziaManager:
         the grace period (effectively gone) and users with no live clients —
         they will get the new server when they renew.
         """
-        server = next((s for s in self.config.get("servers", []) if s.get("id") == server_id), None)
-        if not server or server.get("protocol") != "vless":
-            raise ValueError("VLESS server not found")
+        server_id = str(server_id or "").strip()
+        if not server_id:
+            raise ValueError("server_id is required")
+
+        local_server = None
+        if ":" not in server_id:
+            local_server = next(
+                (
+                    s for s in self.config.get("servers", [])
+                    if s.get("id") == server_id and s.get("protocol") == "vless"
+                ),
+                None,
+            )
+
+        satellite_target = None
+        if local_server is None:
+            satellite_target = self._find_satellite_server_for_broadcast(server_id)
+        if local_server is None and satellite_target is None:
+            raise ValueError(
+                "VLESS server not found. For satellite servers use satellite_id:server_id"
+            )
 
         added = []
         for uid in list(self.config.get("users", {}).keys()):
-            existing_clients = self._get_user_clients(uid)
-            if only_active and not existing_clients:
+            user_record = self.config.get("users", {}).get(uid)
+            if not user_record:
                 continue
-            # Use the same duration the user currently has (max remaining), or fall back
-            # to the requested default. Keeps everyone aligned to one renewal date.
-            # For simplicity start with the requested duration_code.
+            if only_active and not self._user_has_live_clients_for_broadcast(uid, user_record):
+                continue
+            if local_server is not None:
+                try:
+                    _, provisioned, _ = self.provision_user(
+                        uid, duration_code, server_ids=[server_id]
+                    )
+                except Exception as e:
+                    print(f"broadcast: skipping user {uid} due to {e}")
+                    continue
+                for entry in provisioned:
+                    added.append({"user_id": uid, **entry, "scope": "local"})
+                continue
+
+            sat_id, sat, srv = satellite_target
             try:
-                _, provisioned, _ = self.provision_user(uid, duration_code, server_ids=[server_id])
-            except Exception as e:
-                print(f"broadcast: skipping user {uid} due to {e}")
-                continue
-            for entry in provisioned:
+                entry = self._provision_single_satellite_server_for_user(
+                    uid, duration_code, user_record, sat_id, sat, srv
+                )
                 added.append({"user_id": uid, **entry})
+            except Exception as e:
+                user_record.setdefault("remote_errors", []).append({
+                    "satellite_id": sat_id,
+                    "server_id": srv.get("id"),
+                    "error": str(e),
+                })
+                print(f"broadcast: skipping user {uid} due to {e}")
+        if satellite_target is not None:
+            with self.config_lock:
+                self.save_config()
         return added
 
     def generate_wireguard_keys(self):
@@ -4365,6 +4579,7 @@ def get_server_info(server_id):
 @app.route('/api/servers', methods=['GET'])
 def get_servers():
     amnezia_manager.prune_expired_clients()
+    vless_sni_conflicts = amnezia_manager._vless_stream_sni_conflicts()
 
     # Update server status based on actual interface state
     for server in amnezia_manager.config["servers"]:
@@ -4395,7 +4610,15 @@ def get_servers():
             server['mtu'] = 1420  # Default value
 
     amnezia_manager.save_config()
-    return jsonify(amnezia_manager.config["servers"])
+    servers_view = []
+    for server in amnezia_manager.config["servers"]:
+        view = dict(server)
+        if server.get("protocol") == "vless":
+            view["vless_warnings"] = amnezia_manager.vless_server_warnings(
+                server, vless_sni_conflicts
+            )
+        servers_view.append(view)
+    return jsonify(servers_view)
 
 @app.route('/api/system/iptables-test')
 def iptables_test():
@@ -4780,6 +5003,8 @@ def register_satellite_route():
             base_url=data.get("base_url"),
             api_key=data.get("api_key"),
             label=data.get("label"),
+            nginx_user=data.get("nginx_user"),
+            nginx_password=data.get("nginx_password"),
         )
     except ValueError as e:
         return jsonify({"error": str(e)}), 400

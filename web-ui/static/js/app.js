@@ -1040,6 +1040,10 @@ class AmneziaApp {
                             <p class="text-xs text-gray-500">Subscription: <span class="font-mono">${this.getVlessSubscriptionUrl(server)}</span>
                                 <button onclick="amneziaApp.copyToClipboard('${btoa(this.getVlessSubscriptionUrl(server))}')" class="ml-2 text-blue-600 hover:text-blue-800 text-xs">Copy</button>
                             </p>
+                            ${(server.vless_warnings || []).length ? `
+                            <div class="mt-2 rounded border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-800">
+                                ${(server.vless_warnings || []).map(w => `<div>⚠ ${this.escapeHtml(w)}</div>`).join('')}
+                            </div>` : ''}
                         ` : ''}
                         ${server.mode === 'edge_linked' && server.upstream ? `<p class="text-xs text-gray-500">Upstream: ${server.upstream.endpoint} via ${server.upstream.interface}</p>` : ''}
                         ${server.mode === 'edge_linked' ? `<p class="text-xs text-gray-500">Failover: ${server.linked_failover_mode || 'fail_close'} | Routing: ${server.routing_state || 'upstream'} | Egress: ${server.egress_interface || 'eth+'}</p>` : ''}
@@ -2607,9 +2611,14 @@ app.loadSatellites = function() {
             list.innerHTML = sats.map(s => {
                 const lastSync = s.last_sync_at ? new Date(s.last_sync_at * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC' : 'never';
                 const err = s.last_error ? `<p class="text-xs text-red-600 mt-1">⚠ Last error: ${s.last_error}</p>` : '';
-                const servers = (s.servers || []).map(sv =>
-                    `<li class="text-xs"><span>${sv.flag_emoji || '🌍'} ${sv.display_location || sv.name || sv.id} <span class="text-gray-400">(${sv.country_code || '—'})</span> · ${sv.domain || sv.public_ip}</span></li>`
-                ).join('') || '<li class="text-xs text-gray-500">Нет VLESS-серверов на спутнике.</li>';
+                const servers = (s.servers || []).map(sv => {
+                    const target = `${s.id}:${sv.id}`;
+                    return `<li class="text-xs">
+                        <span>${sv.flag_emoji || '🌍'} ${sv.display_location || sv.name || sv.id} <span class="text-gray-400">(${sv.country_code || '—'})</span> · ${sv.domain || sv.public_ip}</span>
+                        <span class="ml-1 text-gray-400">id: <code>${sv.id}</code></span>
+                        <span class="ml-1 text-purple-700">broadcast: <code>${target}</code></span>
+                    </li>`;
+                }).join('') || '<li class="text-xs text-gray-500">Нет VLESS-серверов на спутнике.</li>';
                 return `
                 <div class="border rounded-lg p-3 bg-white">
                     <div class="flex justify-between items-start gap-2">

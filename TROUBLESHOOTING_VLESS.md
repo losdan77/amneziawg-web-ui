@@ -110,7 +110,45 @@ SNI-маску `vkvideo.ru` и его варианты) — пересоздай
 
 ---
 
-## 4. xray в crash-loop из-за плохого config.json
+## 4. Несколько VLESS-серверов на одной VPS используют один REALITY SNI
+
+Если `use_stream=true`, все VLESS-серверы делят внешний порт 443. До Xray
+соединение сначала попадает в nginx stream, а он умеет выбрать backend только
+по TLS SNI из ClientHello.
+
+Поэтому на одной VPS нельзя бездумно создавать несколько VLESS-серверов с
+одинаковым `REALITY mask (dest)`, например `vkvideo.ru:443` на всех карточках.
+nginx увидит один и тот же SNI и отправит трафик только в один Xray inbound.
+Клиенты другого inbound будут отвергаться Xray, хотя AmneziaWG на этой же VPS
+продолжит работать нормально.
+
+### Как проверить
+
+В админке во вкладке **Servers** у VLESS-карточек появится предупреждение
+`REALITY SNI conflict on port 443`, если такой конфликт найден.
+
+Вручную:
+```bash
+docker compose exec web-ui cat /etc/nginx/stream_reality.conf
+```
+
+Если один и тот же домен-маска встречается у нескольких VLESS-серверов, это
+конфликт.
+
+### Как исправить без поломки бизнес-логики
+
+- Лучший вариант: держать **один VLESS-сервер на одну VPS** и создавать на нём
+  клиентов через общую подписку `/api/sub/user/<token>`.
+- Если на одной VPS нужны несколько VLESS-карточек, задавайте каждой уникальный
+  `REALITY mask (dest)`: например одному `www.microsoft.com:443`, другому
+  `www.apple.com:443`, третьему `cdn.jsdelivr.net:443`. После этого создайте
+  новый VLESS-сервер и сделайте `Broadcast`/`Provision` для пользователей.
+- Старый конфликтующий сервер лучше не удалять сразу: сначала раскатайте новый,
+  убедитесь, что HAPP обновил подписку, потом удаляйте старый.
+
+---
+
+## 5. xray в crash-loop из-за плохого config.json
 
 ```bash
 docker compose ps        # xray должен быть Up, а не Restarting
@@ -126,7 +164,7 @@ docker compose logs xray --tail=80
 
 ---
 
-## 5. iptables MASQUERADE не настроен на host
+## 6. iptables MASQUERADE не настроен на host
 
 VLESS-трафик внутри контейнера выходит через `eth0`. Для NAT в интернет
 нужен iptables MASQUERADE на хосте. В нашем образе это автоматизировано
@@ -149,7 +187,7 @@ sudo sysctl -w net.ipv4.ip_forward=1
 
 ---
 
-## 6. У клиента (телефона) DNS-leak / DNS не работает
+## 7. У клиента (телефона) DNS-leak / DNS не работает
 
 REALITY+XHTTP туннелирует TCP/UDP, но не DNS-запросы автоматически. HAPP
 по умолчанию использует системные DNS. Если у оператора связи DNS отравлен —
@@ -162,7 +200,7 @@ REALITY+XHTTP туннелирует TCP/UDP, но не DNS-запросы ав�
 
 ---
 
-## 7. xhttp Host-mismatch (для bridge / chain режима)
+## 8. xhttp Host-mismatch (для bridge / chain режима)
 
 Если использовали кнопку **🔗 Цепочка (обход WL)** для российского relay,
 но потом изменили на сервере `host` или `domain` — chain-конфиг на bridge VPS
@@ -183,7 +221,7 @@ docker compose logs web-ui --tail=50 | grep -E 'error|failed'
 ```
 
 Если в xray-логах есть `accepted ... -> direct` строки при попытке клиента
-коннектиться, но клиент висит — это либо #1 (SNI), либо #5 (iptables).
+коннектиться, но клиент висит — это либо #1 (SNI), либо #6 (iptables).
 
 Если xray не видит `accepted` вовсе — клиент даже не доходит до xray, дело
-в #2 (DNS), #3 (nginx-stream) или #4 (xray не запустился).
+в #2 (DNS), #3 (nginx-stream), #4 (SNI conflict) или #5 (xray не запустился).
