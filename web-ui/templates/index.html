@@ -138,15 +138,32 @@
                         </p>
                     </div>
 
+                    <div class="mb-4">
+                        <label class="block text-sm font-medium text-gray-700">VLESS network</label>
+                        <select id="vlessTransport" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                            <option value="tcp" selected>TCP / RAW + REALITY (competitor-like)</option>
+                            <option value="xhttp">XHTTP + REALITY (previous mode)</option>
+                        </select>
+                        <p class="text-gray-500 text-xs mt-1">HAPP shows this as Network: TCP when the generated link uses type=tcp.</p>
+                    </div>
+
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div>
-                            <label class="block text-sm font-medium text-gray-700">Client address (your domain) *</label>
-                            <input type="text" id="vlessDomain" placeholder="vpn.example.com"
+                            <label class="block text-sm font-medium text-gray-700">Client address (domain or IP) *</label>
+                            <input type="text" id="vlessDomain" placeholder="72.61.94.106 or vpn.example.com"
                                    class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
                             <p class="text-gray-500 text-xs mt-1">Должен резолвиться на этот сервер; используется в vless:// и HTTP Host.</p>
                             <p id="vlessDomainError" class="text-red-500 text-xs mt-1 hidden"></p>
                         </div>
-                        <div>
+                        <div id="vlessTcpFlowWrap">
+                            <label class="block text-sm font-medium text-gray-700">TCP flow</label>
+                            <select id="vlessFlow" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                                <option value="" selected>None (matches competitor screenshots)</option>
+                                <option value="xtls-rprx-vision">xtls-rprx-vision</option>
+                            </select>
+                            <p class="text-gray-500 text-xs mt-1">Start with None for maximum HAPP compatibility; test Vision separately.</p>
+                        </div>
+                        <div id="vlessXhttpModeWrap">
                             <label class="block text-sm font-medium text-gray-700">XHTTP mode</label>
                             <select id="vlessXhttpMode" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
                                 <option value="packet-up" selected>packet-up (рекомендуется — лучший обход DPI)</option>
@@ -159,7 +176,7 @@
                     </div>
 
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
-                        <div>
+                        <div id="vlessPathWrap">
                             <label class="block text-sm font-medium text-gray-700">Secret path *</label>
                             <div class="flex gap-2">
                                 <input type="text" id="vlessPath" placeholder="/secret-path"
@@ -189,7 +206,7 @@
                     <div class="mt-4">
                         <label class="block text-sm font-medium text-gray-700">REALITY mask (dest) — маскировка под сайт</label>
                         <div class="flex gap-2">
-                            <input type="text" id="vlessRealityDest" placeholder="web.max.ru:443"
+                            <input type="text" id="vlessRealityDest" placeholder="microsoft.com:443"
                                    list="sniPresetList"
                                    class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
                             <button type="button" id="loadSniPresetsBtn"
@@ -607,6 +624,12 @@
                                     <option value="forever">Forever</option>
                                 </select>
                             </div>
+                            <div class="mt-2 flex flex-wrap gap-1">
+                                <button type="button" onclick="amneziaApp.setDurationPreset('newUserDuration', 1, 'm')" class="px-2 py-1 text-xs rounded border border-gray-300 bg-white hover:bg-gray-50">1 month</button>
+                                <button type="button" onclick="amneziaApp.setDurationPreset('newUserDuration', 3, 'm')" class="px-2 py-1 text-xs rounded border border-gray-300 bg-white hover:bg-gray-50">3 months</button>
+                                <button type="button" onclick="amneziaApp.setDurationPreset('newUserDuration', 6, 'm')" class="px-2 py-1 text-xs rounded border border-gray-300 bg-white hover:bg-gray-50">6 months</button>
+                                <button type="button" onclick="amneziaApp.setDurationPreset('newUserDuration', 1, 'y')" class="px-2 py-1 text-xs rounded border border-gray-300 bg-white hover:bg-gray-50">1 year</button>
+                            </div>
                             <input type="date" id="newUserDurationDate"
                                    class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm hidden">
                             <p class="text-gray-500 text-xs mt-1">Any positive number, or pick an exact date.</p>
@@ -631,7 +654,7 @@
                             <p class="text-gray-500 text-xs mt-1">Локальный сервер: ID из карточки во вкладке Servers. Спутник: значение broadcast из списка спутников, например <code>sat-12345678:abc123</code>.</p>
                         </div>
                         <div>
-                            <label class="block text-xs font-medium text-gray-700">Duration for new clients</label>
+                            <label class="block text-xs font-medium text-gray-700">Fallback duration</label>
                             <div class="mt-1 flex gap-2">
                                 <input type="number" id="broadcastDurationAmount" min="1" value="1"
                                        class="block w-20 border border-gray-300 rounded-md px-2 py-1 text-sm">
@@ -647,8 +670,15 @@
                                     <option value="forever">Forever</option>
                                 </select>
                             </div>
+                            <div class="mt-2 flex flex-wrap gap-1">
+                                <button type="button" onclick="amneziaApp.setDurationPreset('broadcastDuration', 1, 'm')" class="px-2 py-1 text-xs rounded border border-gray-300 bg-white hover:bg-gray-50">1 month</button>
+                                <button type="button" onclick="amneziaApp.setDurationPreset('broadcastDuration', 3, 'm')" class="px-2 py-1 text-xs rounded border border-gray-300 bg-white hover:bg-gray-50">3 months</button>
+                                <button type="button" onclick="amneziaApp.setDurationPreset('broadcastDuration', 6, 'm')" class="px-2 py-1 text-xs rounded border border-gray-300 bg-white hover:bg-gray-50">6 months</button>
+                                <button type="button" onclick="amneziaApp.setDurationPreset('broadcastDuration', 1, 'y')" class="px-2 py-1 text-xs rounded border border-gray-300 bg-white hover:bg-gray-50">1 year</button>
+                            </div>
                             <input type="date" id="broadcastDurationDate"
                                    class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm hidden">
+                            <p class="text-gray-500 text-xs mt-1">Broadcast preserves each user's current expiry; this is used only if no expiry can be inferred.</p>
                         </div>
                         <div class="flex items-end">
                             <button onclick="amneziaApp.broadcastServer()"

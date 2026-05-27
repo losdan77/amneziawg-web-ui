@@ -199,8 +199,9 @@ This is the killer feature: existing users automatically pick up the new server.
    `Finland #1`, on a third subdomain.
 2. Note its `id` (visible in the server card under "ID: …" or returned by the API).
 3. **Users tab** → in the purple "📡 Раскатать новый сервер всем активным
-   пользователям" block, paste the new server's ID, choose duration (`1m`
-   matches what your test user already has), click **Broadcast**. Or via curl:
+   пользователям" block, paste the new server's ID and click **Broadcast**.
+   Broadcast preserves each user's existing `expires_at`; the `duration` field
+   is only a fallback if no existing expiry can be inferred. Or via curl:
 
    ```bash
    curl -u admin:changeme -X POST https://your-vps-domain/api/users/broadcast \

@@ -44,6 +44,14 @@ class AmneziaApp {
             this.toggleProtocolFields(serverProtocol.value || 'wireguard');
         }
 
+        const vlessTransport = this.getElement('vlessTransport');
+        if (vlessTransport) {
+            vlessTransport.addEventListener('change', () => {
+                this.toggleVlessTransportFields();
+            });
+            this.toggleVlessTransportFields();
+        }
+
         const genVlessPathBtn = this.getElement('genVlessPathBtn');
         if (genVlessPathBtn) {
             genVlessPathBtn.addEventListener('click', () => {
@@ -221,6 +229,20 @@ class AmneziaApp {
         if (portInput && !isVless) {
             portInput.value = portInput.value || '51820';
         }
+        if (isVless) {
+            this.toggleVlessTransportFields();
+        }
+    }
+
+    toggleVlessTransportFields() {
+        const transport = (this.getElement('vlessTransport')?.value || 'tcp').toLowerCase();
+        const isXhttp = transport === 'xhttp';
+        const tcpFlowWrap = this.getElement('vlessTcpFlowWrap');
+        const xhttpModeWrap = this.getElement('vlessXhttpModeWrap');
+        const pathWrap = this.getElement('vlessPathWrap');
+        if (tcpFlowWrap) tcpFlowWrap.classList.toggle('hidden', isXhttp);
+        if (xhttpModeWrap) xhttpModeWrap.classList.toggle('hidden', !isXhttp);
+        if (pathWrap) pathWrap.classList.toggle('hidden', !isXhttp);
     }
 
     generateVlessPath() {
@@ -633,13 +655,14 @@ class AmneziaApp {
         if (protocol === 'vless') {
             const domain = (this.getElement('vlessDomain')?.value || '').trim();
             const path = (this.getElement('vlessPath')?.value || '').trim();
+            const transport = (this.getElement('vlessTransport')?.value || 'tcp').toLowerCase();
             const realityDest = (this.getElement('vlessRealityDest')?.value || '').trim();
 
             if (!domain) {
-                this.showError('vlessDomainError', 'Domain is required (must resolve to this server)');
+                this.showError('vlessDomainError', 'Client address is required (domain or server IP)');
                 isValid = false;
             }
-            if (!path || !path.startsWith('/')) {
+            if (transport === 'xhttp' && (!path || !path.startsWith('/'))) {
                 this.showError('vlessPathError', "Path is required and must start with '/'");
                 isValid = false;
             }
@@ -809,6 +832,8 @@ class AmneziaApp {
                 name: nameElement ? nameElement.value.trim() : 'New VLESS Server',
                 domain: vlessDomainVal,
                 host: vlessDomainVal,
+                transport: (this.getElement('vlessTransport')?.value || 'tcp').trim(),
+                flow: (this.getElement('vlessFlow')?.value || '').trim(),
                 path: (this.getElement('vlessPath')?.value || '').trim(),
                 xhttp_mode: (this.getElement('vlessXhttpMode')?.value || 'auto').trim(),
                 reality_dest: (this.getElement('vlessRealityDest')?.value || '').trim(),
@@ -1019,7 +1044,7 @@ class AmneziaApp {
                         </h3>
                         <p class="text-sm text-gray-600">
                             ${server.protocol === 'vless'
-                                ? `ID: ${server.id} | VLESS+REALITY+XHTTP | client TCP port: ${server.port}`
+                                ? `ID: ${server.id} | VLESS+REALITY+${this.getVlessTransportLabel(server)} | client TCP port: ${server.port}`
                                 : `ID: ${server.id} | Port: ${server.port} | Subnet: ${server.subnet} | Mode: ${server.mode || 'standalone'} ${server.obfuscation_enabled ? '| 🔒 Obfuscated' : ''}`
                             }
                         </p>
@@ -1031,7 +1056,7 @@ class AmneziaApp {
                                 ${server.country_code ? `<span class="text-gray-400">(${server.country_code})</span>` : ''}
                             </p>` : ''}
                             <p class="text-xs text-gray-500">
-                                VLESS: ${server.vless.domain}:${server.vless.port} ${server.vless.path} (${server.vless.mode})
+                                VLESS: ${this.getVlessConnectionSummary(server)}
                                 ${server.vless.security === 'reality' && server.vless.reality_dest ? ` · REALITY dest ${server.vless.reality_dest}` : ''}
                                 ${server.vless.use_stream
                                     ? `<span class="ml-1 px-1 py-0.5 rounded bg-green-100 text-green-700 font-medium">порт 443 / stream</span>`
@@ -1100,6 +1125,32 @@ class AmneziaApp {
         servers.forEach(server => {
             this.loadServerClients(server.id, server.protocol || 'wireguard');
         });
+    }
+
+    getVlessTransport(server) {
+        const raw = (server?.vless?.transport || 'xhttp').toLowerCase();
+        return raw === 'tcp' || raw === 'raw' ? 'tcp' : 'xhttp';
+    }
+
+    getVlessTransportLabel(server) {
+        if (this.getVlessTransport(server) !== 'tcp') return 'XHTTP';
+        return this.getVlessFlow(server) ? 'TCP/RAW + Vision' : 'TCP/RAW';
+    }
+
+    getVlessFlow(server) {
+        const flow = (server?.vless?.flow || '').toLowerCase();
+        return flow === 'xtls-rprx-vision' ? flow : '';
+    }
+
+    getVlessConnectionSummary(server) {
+        const vless = server?.vless || {};
+        const transport = this.getVlessTransport(server);
+        const endpoint = `${vless.domain || server.public_ip || ''}:${vless.port || server.port || 443}`;
+        if (transport === 'tcp') {
+            const flow = this.getVlessFlow(server);
+            return `${endpoint} TCP header=none flow=${flow || 'none'}`;
+        }
+        return `${endpoint} ${vless.path || '/'} (${vless.mode || 'packet-up'})`;
     }
 
     getVlessSubscriptionUrl(server) {
@@ -1344,6 +1395,15 @@ class AmneziaApp {
         ).join('');
         const hideAmount = (defaultUnit === 'forever' || defaultUnit === 'abs') ? 'opacity-50 pointer-events-none' : '';
         const showDate = defaultUnit === 'abs' ? '' : 'hidden';
+        const presets = [
+            ['1 month', 1, 'm'],
+            ['3 months', 3, 'm'],
+            ['6 months', 6, 'm'],
+            ['1 year', 1, 'y'],
+        ].map(([label, amount, unit]) =>
+            `<button type="button" onclick="amneziaApp.setDurationPreset('${prefix}', ${amount}, '${unit}')"
+                     class="px-2 py-1 text-xs rounded border border-gray-300 bg-white hover:bg-gray-50">${label}</button>`
+        ).join('');
         return `
             <div class="flex gap-2">
                 <input type="number" id="${amountId}" min="1" value="${defaultAmount}"
@@ -1354,9 +1414,23 @@ class AmneziaApp {
                     ${opts}
                 </select>
             </div>
+            <div class="mt-2 flex flex-wrap gap-1">${presets}</div>
             <input type="date" id="${dateId}"
                    class="mt-2 block w-full border border-gray-300 rounded-md px-3 py-2 ${showDate}">
         `;
+    }
+
+    setDurationPreset(prefix, amount, unit) {
+        const amountEl = document.getElementById(`${prefix}Amount`);
+        const unitEl = document.getElementById(`${prefix}Unit`);
+        const dateEl = document.getElementById(`${prefix}Date`);
+        if (amountEl) {
+            amountEl.value = String(amount);
+            amountEl.disabled = false;
+            amountEl.classList.remove('opacity-50');
+        }
+        if (unitEl) unitEl.value = unit;
+        if (dateEl) dateEl.classList.add('hidden');
     }
 
     /**
@@ -2765,7 +2839,7 @@ app.broadcastServer = function() {
         status.classList.remove('hidden');
         return;
     }
-    if (!confirm(`Provision server ${serverId} onto every active user with duration ${duration}?`)) return;
+    if (!confirm(`Provision server ${serverId} onto every active user and preserve each user's current expiry? Fallback duration: ${duration}`)) return;
     status.className = 'text-sm mt-2 text-gray-600';
     status.textContent = 'Broadcasting…';
     status.classList.remove('hidden');
@@ -2779,7 +2853,7 @@ app.broadcastServer = function() {
     .then(({ok, body}) => {
         if (!ok) throw new Error(body.error || 'Failed');
         status.className = 'text-sm mt-2 text-green-700';
-        status.textContent = `OK — added to ${body.count} user(s)`;
+        status.textContent = `OK — added to ${body.count} user(s) with preserved expiry`;
         amneziaApp.loadUsers();
     })
     .catch(e => {

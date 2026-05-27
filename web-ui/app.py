@@ -446,6 +446,12 @@ class AmneziaManager:
         grace_seconds = max(0.0, CLIENT_DELETE_GRACE_DAYS) * 24 * 60 * 60
         return now_value >= float(expires_at) + grace_seconds
 
+    def _absolute_duration_code(self, expires_at):
+        """Return a duration code that preserves an exact expiry timestamp."""
+        if expires_at is None:
+            return "forever"
+        return f"abs:{float(expires_at)}"
+
     def _sync_client_expiration_fields(self, server_client, global_client, duration_code, expires_at):
         duration_label = self._duration_label(duration_code)
         updates = {
@@ -514,6 +520,13 @@ class AmneziaManager:
             cc = self._normalize_country_code(server.get("country_code"))
             if cc and not server.get("flag_emoji"):
                 server["flag_emoji"] = self._country_code_to_flag(cc)
+                updated = True
+            vless = server.get("vless") or {}
+            if isinstance(vless, dict) and not vless.get("transport"):
+                vless["transport"] = "xhttp"
+                updated = True
+            if isinstance(vless, dict) and vless.get("transport") in ("tcp", "raw") and "flow" not in vless:
+                vless["flow"] = "xtls-rprx-vision"
                 updated = True
 
         # Seed top-level keys for the user-level subscription model.
@@ -1092,8 +1105,42 @@ class AmneziaManager:
             raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
         return value
 
+    def _normalize_vless_transport(self, transport, default="tcp"):
+        value = str(transport or default).strip().lower()
+        aliases = {
+            "tcp": "tcp",
+            "raw": "tcp",
+            "xhttp": "xhttp",
+        }
+        if value not in aliases:
+            raise ValueError("transport must be one of: tcp, raw, xhttp")
+        return aliases[value]
+
+    def _vless_transport(self, vless):
+        # Missing transport means an older server created before TCP/RAW support.
+        # Keep those on xhttp so regeneration does not silently change live links.
+        return self._normalize_vless_transport((vless or {}).get("transport"), default="xhttp")
+
+    def _normalize_vless_flow(self, flow, transport="tcp"):
+        if self._normalize_vless_transport(transport, default="tcp") != "tcp":
+            return ""
+        value = str(flow or "").strip().lower()
+        aliases = {
+            "": "",
+            "none": "",
+            "off": "",
+            "vision": "xtls-rprx-vision",
+            "xtls-rprx-vision": "xtls-rprx-vision",
+        }
+        if value not in aliases:
+            raise ValueError("flow must be one of: none, xtls-rprx-vision")
+        return aliases[value]
+
+    def _vless_flow(self, vless):
+        return self._normalize_vless_flow((vless or {}).get("flow"), self._vless_transport(vless))
+
     def _vless_is_reality(self, vless):
-        """REALITY+XHTTP terminates TLS in Xray; legacy mode uses Nginx TLS + xhttp with security none."""
+        """REALITY terminates TLS-like handshakes in Xray for xhttp or tcp/raw."""
         if not vless:
             return False
         if vless.get("security") == "reality":
@@ -1103,7 +1150,7 @@ class AmneziaManager:
     def _normalize_reality_dest(self, dest):
         raw = str(dest or "").strip()
         if not raw:
-            raw = "www.microsoft.com:443"
+            raw = "microsoft.com:443"
         if ":" in raw:
             host_part, port_part = raw.rsplit(":", 1)
             host_part = host_part.strip().lower()
@@ -1451,28 +1498,35 @@ class AmneziaManager:
         """
         Generate xray config with one inbound per VLESS server.
         - Legacy (security=tls): xhttp with security none; TLS is terminated by nginx in front.
-        - REALITY: xhttp + security reality; TLS is handled by Xray (publish inbound_port on the host).
+        - REALITY: xhttp or tcp/raw + security reality; TLS-like handshakes are handled by Xray.
         """
         inbounds = []
         for server in self.config.get("servers", []):
             if server.get("protocol") != "vless":
                 continue
             vless = server.get("vless") or {}
+            transport = self._vless_transport(vless)
+            flow = self._vless_flow(vless)
             inbound_port = vless.get("inbound_port")
             domain = vless.get("domain")
             path = vless.get("path")
             mode = vless.get("mode") or "stream-up"
             host = vless.get("host") or domain
-            if not inbound_port or not domain or not path:
+            if not inbound_port or not domain:
+                continue
+            if transport == "xhttp" and not path:
                 continue
 
             clients = []
             for client in server.get("clients", []):
-                if self._is_client_expired(client):
+                if self._should_delete_expired_client(client):
                     continue
                 if not client.get("uuid"):
                     continue
-                clients.append({"id": client["uuid"], "email": self._sanitize_label(client.get("name"), "client")})
+                item = {"id": client["uuid"], "email": self._sanitize_label(client.get("name"), "client")}
+                if self._vless_is_reality(vless) and transport == "tcp" and flow:
+                    item["flow"] = flow
+                clients.append(item)
 
             # Common XHTTP anti-DPI parameters shared by REALITY and legacy inbounds.
             # Kept in one place so both paths benefit from the same masking tuning.
@@ -1503,7 +1557,7 @@ class AmneziaManager:
             }
 
             if self._vless_is_reality(vless):
-                reality_dest = vless.get("reality_dest") or "www.microsoft.com:443"
+                reality_dest = vless.get("reality_dest") or "microsoft.com:443"
                 server_names = vless.get("reality_server_names") or self._reality_server_names_for_host(
                     reality_dest.split(":")[0]
                 )
@@ -1516,7 +1570,7 @@ class AmneziaManager:
                 if not priv:
                     continue
                 stream_settings = {
-                    "network": "xhttp",
+                    "network": "raw" if transport == "tcp" else "xhttp",
                     "security": "reality",
                     "realitySettings": {
                         "show": False,
@@ -1534,6 +1588,12 @@ class AmneziaManager:
                     "xhttpSettings": dict(common_xhttp),
                     "sockopt": dict(common_sockopt),
                 }
+                if transport == "tcp":
+                    stream_settings.pop("xhttpSettings", None)
+                    stream_settings["rawSettings"] = {
+                        "acceptProxyProtocol": False,
+                        "header": {"type": "none"},
+                    }
             else:
                 stream_settings = {
                     "network": "xhttp",
@@ -1596,9 +1656,20 @@ class AmneziaManager:
     def create_vless_server(self, server_data):
         server_name = server_data.get("name", "New VLESS Server")
         domain = self._validate_domain(server_data.get("domain"))
-        path = self._normalize_vless_path(server_data.get("path"))
-        mode = self._normalize_xhttp_mode(server_data.get("xhttp_mode") or server_data.get("mode"))
-        host = self._validate_domain(server_data.get("host") or domain)
+        transport = self._normalize_vless_transport(
+            server_data.get("transport") or server_data.get("network"),
+            default="tcp",
+        )
+        if transport == "xhttp":
+            path = self._normalize_vless_path(server_data.get("path"))
+            mode = self._normalize_xhttp_mode(server_data.get("xhttp_mode") or server_data.get("mode"))
+            host = self._validate_domain(server_data.get("host") or domain)
+        else:
+            raw_path = str(server_data.get("path") or "").strip()
+            path = self._normalize_vless_path(raw_path) if raw_path else ""
+            mode = ""
+            host = domain
+        flow = self._normalize_vless_flow(server_data.get("flow"), transport)
         reality_dest, dest_host = self._normalize_reality_dest(server_data.get("reality_dest"))
         server_names = self._reality_server_names_for_host(dest_host)
         priv, pub = self._generate_reality_keypair()
@@ -1660,7 +1731,8 @@ class AmneziaManager:
                 "mode": mode,
                 "host": host,
                 "security": "reality",
-                "transport": "xhttp",
+                "transport": transport,
+                "flow": flow,
                 "encryption": "none",
                 "subscription_id": subscription_id,
                 # inbound_port: what Xray actually listens on (9443+ in stream mode)
@@ -1781,6 +1853,8 @@ class AmneziaManager:
         exit_pbk = vless.get('reality_public_key') or ''
         exit_sid = vless.get('reality_short_id') or ''
         exit_fp = vless.get('reality_fingerprint') or 'chrome'
+        exit_transport = self._vless_transport(vless)
+        exit_flow = self._vless_flow(vless)
 
         # Socket options reused on both bridge inbound and the chain-to-exit outbound.
         # BBR improves throughput on congested RU links; TFO shortens repeat RTTs.
@@ -1898,6 +1972,17 @@ class AmneziaManager:
         }
 
         # ── Client vless:// link pointing to the bridge ───────────────────────
+        if exit_transport == "tcp":
+            chain = bridge_config["outbounds"][0]
+            chain["settings"]["vnext"][0]["users"][0]["flow"] = exit_flow
+            chain_stream = chain["streamSettings"]
+            chain_stream["network"] = "raw"
+            chain_stream.pop("xhttpSettings", None)
+            chain_stream["rawSettings"] = {
+                "acceptProxyProtocol": False,
+                "header": {"type": "none"},
+            }
+
         label = self._sanitize_label(f"{server.get('name', 'VPN')}-via-Bridge")
         client_link = (
             f"vless://{bridge_uuid}@{bridge_ip}:{bridge_port}"
@@ -1950,6 +2035,8 @@ class AmneziaManager:
         path = vless.get("path") or "/"
         mode = vless.get("mode") or "stream-up"
         host = vless.get("host") or domain
+        transport = self._vless_transport(vless)
+        flow = self._vless_flow(vless)
 
         if label_style == "memevpn":
             label = self._format_memevpn_subscription_label(server)
@@ -1963,20 +2050,35 @@ class AmneziaManager:
             pbk = vless.get("reality_public_key") or ""
             sid = vless.get("reality_short_id") or ""
             # `spx` maps to client reality spiderX (/); improves compatibility with REALITY-capable apps (HAPP, v2rayN, etc.).
-            q = (
-                "encryption=none"
-                "&security=reality"
-                "&type=xhttp"
-                f"&path={quote(path, safe='')}"
-                f"&mode={quote(mode, safe='')}"
-                f"&host={quote(host, safe='')}"
-                f"&sni={quote(sni, safe='')}"
-                f"&fp={quote(fp, safe='')}"
-                f"&pbk={quote(pbk, safe='')}"
-                f"&sid={quote(sid, safe='')}"
-                f"&spx={quote('/', safe='')}"
-                "&flow="
-            )
+            if transport == "tcp":
+                parts = [
+                    "encryption=none",
+                    "security=reality",
+                    "type=tcp",
+                    "headerType=none",
+                    f"sni={quote(sni, safe='')}",
+                    f"fp={quote(fp, safe='')}",
+                    f"pbk={quote(pbk, safe='')}",
+                    f"sid={quote(sid, safe='')}",
+                ]
+                if flow:
+                    parts.append(f"flow={quote(flow, safe='')}")
+                q = "&".join(parts)
+            else:
+                q = (
+                    "encryption=none"
+                    "&security=reality"
+                    "&type=xhttp"
+                    f"&path={quote(path, safe='')}"
+                    f"&mode={quote(mode, safe='')}"
+                    f"&host={quote(host, safe='')}"
+                    f"&sni={quote(sni, safe='')}"
+                    f"&fp={quote(fp, safe='')}"
+                    f"&pbk={quote(pbk, safe='')}"
+                    f"&sid={quote(sid, safe='')}"
+                    f"&spx={quote('/', safe='')}"
+                    "&flow="
+                )
         else:
             q = (
                 "encryption=none"
@@ -1989,7 +2091,7 @@ class AmneziaManager:
         return f"vless://{client_config['uuid']}@{domain}:{port}?{q}#{quote(label, safe='')}"
 
     def add_vless_client(self, server_id, client_name, duration_code="forever", user_id=None):
-        """Add a client to a VLESS xhttp server (link/QR only).
+        """Add a client to a VLESS server (link/QR only).
 
         ``user_id`` (optional) ties this client to a logical user owner so the
         multi-server subscription endpoint can collect all of a user's clients
@@ -2223,6 +2325,47 @@ class AmneziaManager:
             self._remote_client_is_live_for_broadcast(remote, now_ts)
             for remote in record.get("remote_clients", [])
         )
+
+    def _broadcast_duration_for_user(self, uid, user_record, fallback_duration_code):
+        """Preserve a user's current subscription expiry when adding a server.
+
+        Broadcast should not sell/extend time. It creates a client on the new
+        server with the same effective expiry the user already has elsewhere.
+        If the user has a permanent client, the new one is permanent too.
+        """
+        now_ts = time.time()
+        expiries = []
+        has_forever = False
+
+        for _server, client in self._get_user_clients(uid):
+            exp = client.get("expires_at")
+            if exp is None:
+                has_forever = True
+            else:
+                try:
+                    expiries.append(float(exp))
+                except (TypeError, ValueError):
+                    pass
+
+        for remote in (user_record or {}).get("remote_clients", []):
+            if not self._remote_client_is_live_for_broadcast(remote, now_ts):
+                continue
+            exp = remote.get("expires_at")
+            if exp is None:
+                has_forever = True
+            else:
+                try:
+                    expiries.append(float(exp))
+                except (TypeError, ValueError):
+                    pass
+
+        if has_forever:
+            return "forever"
+        if expiries:
+            # Use the subscription expiry visible to HAPP (latest active/grace
+            # client expiry), preserving remaining time instead of adding more.
+            return self._absolute_duration_code(max(expiries))
+        return self._normalize_duration_code(fallback_duration_code)
 
     def _find_satellite_server_for_broadcast(self, target):
         """Resolve a satellite broadcast target.
@@ -2834,10 +2977,11 @@ class AmneziaManager:
                 continue
             if only_active and not self._user_has_live_clients_for_broadcast(uid, user_record):
                 continue
+            user_duration = self._broadcast_duration_for_user(uid, user_record, duration_code)
             if local_server is not None:
                 try:
                     _, provisioned, _ = self.provision_user(
-                        uid, duration_code, server_ids=[server_id]
+                        uid, user_duration, server_ids=[server_id]
                     )
                 except Exception as e:
                     print(f"broadcast: skipping user {uid} due to {e}")
@@ -2849,7 +2993,7 @@ class AmneziaManager:
             sat_id, sat, srv = satellite_target
             try:
                 entry = self._provision_single_satellite_server_for_user(
-                    uid, duration_code, user_record, sat_id, sat, srv
+                    uid, user_duration, user_record, sat_id, sat, srv
                 )
                 added.append({"user_id": uid, **entry})
             except Exception as e:
@@ -4880,6 +5024,8 @@ def broadcast_route():
     """Provision a newly added VLESS server onto all existing users.
 
     Body: {"server_id": "<id>", "duration": "1m", "only_active": true}
+    ``duration`` is only a fallback. Existing users are provisioned with their
+    current subscription expiry preserved as ``abs:<expires_at>``.
     """
     data = request.json or {}
     server_id = data.get('server_id')
