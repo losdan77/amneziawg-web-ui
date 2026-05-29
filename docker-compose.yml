@@ -71,33 +71,33 @@ services:
         echo "[xray] waiting for $$CFG ..."
         while [ ! -f "$$CFG" ]; do sleep 1; done
         last=""
+        pid=""
+        trap 'if [ -n "$$pid" ]; then kill "$$pid" 2>/dev/null || true; wait "$$pid" 2>/dev/null || true; fi; exit 0' TERM INT
         while true; do
           cur="$$(sha256sum "$$CFG" 2>/dev/null | awk '{print $$1}' || true)"
           if [ -n "$$cur" ] && [ "$$cur" != "$$last" ]; then
-            echo "[xray] config changed, restarting xray"
-            last="$$cur"
-            # Run xray in background and restart on next change.
-            /usr/bin/xray -config "$$CFG" &
+            echo "[xray] config changed, validating"
+            if ! /usr/bin/xray run -test -config "$$CFG"; then
+              echo "[xray] invalid config, keeping current process"
+              sleep 5
+              continue
+            fi
+            if [ -n "$$pid" ] && kill -0 "$$pid" 2>/dev/null; then
+              echo "[xray] stopping previous pid=$$pid"
+              kill "$$pid" 2>/dev/null || true
+              wait "$$pid" 2>/dev/null || true
+            fi
+            echo "[xray] starting xray"
+            /usr/bin/xray run -config "$$CFG" &
             pid="$!"
-            # Poll until hash changes, then terminate xray.
-            while true; do
-              sleep 2
-              nxt="$$(sha256sum "$$CFG" 2>/dev/null | awk '{print $$1}' || true)"
-              if [ -n "$$nxt" ] && [ "$$nxt" != "$$last" ]; then
-                echo "[xray] change detected, stopping pid=$$pid"
-                kill "$$pid" 2>/dev/null || true
-                wait "$$pid" 2>/dev/null || true
-                break
-              fi
-              # If xray crashed, break and let outer loop restart it.
-              if ! kill -0 "$$pid" 2>/dev/null; then
-                echo "[xray] process exited, restarting"
-                break
-              fi
-            done
-          else
-            sleep 2
+            last="$$cur"
           fi
+          if [ -n "$$pid" ] && ! kill -0 "$$pid" 2>/dev/null; then
+            echo "[xray] process exited, retrying current config"
+            pid=""
+            last=""
+          fi
+          sleep 2
         done
     ports:
       # Direct VLESS+REALITY+XHTTP (no stream routing): each server listens on XRAY_BASE_PORT+N.

@@ -1147,6 +1147,109 @@ class AmneziaManager:
             return True
         return bool(vless.get("reality_private_key"))
 
+    def _xray_sockopt(self, *, tcp_no_delay=False):
+        """Socket options shared by VLESS inbounds and bridge outbounds."""
+        opt = {
+            "tcpFastOpen": True,
+            "tcpKeepAliveInterval": 15,
+            "tcpKeepAliveIdle": 60,
+            "tcpUserTimeout": 10000,
+            "tcpCongestion": "bbr",
+        }
+        if tcp_no_delay:
+            opt["tcpNoDelay"] = True
+        return opt
+
+    def _xray_sniffing(self, *, metadata_only=True):
+        return {
+            "enabled": True,
+            "destOverride": ["http", "tls", "quic"],
+            "metadataOnly": bool(metadata_only),
+            "routeOnly": True,
+        }
+
+    def _xray_xhttp_settings(self, path, mode, host=None):
+        compact_mode = str(mode or "").replace("-", "").lower()
+        xhttp = {
+            "path": path,
+            "mode": mode,
+        }
+        if host:
+            xhttp["host"] = host
+
+        extra = {
+            # Current XHTTP schema keeps tuning knobs under `extra`.
+            "xPaddingBytes": "100-1000",
+            "noGRPCHeader": False,
+            "noSSEHeader": False,
+        }
+        if compact_mode in {"streamup", "auto"}:
+            extra["scStreamUpServerSecs"] = "20-80"
+        if compact_mode in {"packetup", "auto"}:
+            extra.update({
+                "scMaxEachPostBytes": 1000000,
+                "scMinPostsIntervalMs": 30,
+                "scMaxBufferedPosts": 30,
+            })
+        xhttp["extra"] = extra
+        return xhttp
+
+    def _xray_routing(self, direct_tag="direct"):
+        return {
+            "domainStrategy": "IPIfNonMatch",
+            "rules": [
+                {
+                    "type": "field",
+                    "protocol": ["bittorrent"],
+                    "outboundTag": "blocked",
+                },
+                {
+                    "type": "field",
+                    "network": "tcp,udp",
+                    "outboundTag": direct_tag,
+                },
+            ],
+        }
+
+    def _validate_xray_config_file(self, config_path):
+        xray_bin = "/usr/bin/xray"
+        if not os.path.exists(xray_bin) or not os.access(xray_bin, os.X_OK):
+            print(f"Skipping Xray config validation: {xray_bin} is not executable")
+            return
+        result = subprocess.run(
+            [xray_bin, "run", "-test", "-config", config_path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "").strip()
+            raise ValueError(f"Xray config validation failed: {details}")
+
+    def _write_validated_xray_config(self, config):
+        os.makedirs(XRAY_CONFIG_DIR, exist_ok=True)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=XRAY_CONFIG_DIR,
+                prefix=".config.",
+                suffix=".json",
+                delete=False,
+            ) as tmp:
+                tmp_path = tmp.name
+                json.dump(config, tmp, indent=2)
+                tmp.write("\n")
+            self._validate_xray_config_file(tmp_path)
+            os.replace(tmp_path, XRAY_CONFIG_FILE)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
     def _normalize_reality_dest(self, dest):
         raw = str(dest or "").strip()
         if not raw:
@@ -1528,33 +1631,8 @@ class AmneziaManager:
                     item["flow"] = flow
                 clients.append(item)
 
-            # Common XHTTP anti-DPI parameters shared by REALITY and legacy inbounds.
-            # Kept in one place so both paths benefit from the same masking tuning.
-            common_xhttp = {
-                "path": path,
-                "mode": mode,
-                "host": host,
-                # Random padding per packet defeats traffic-size fingerprinting by DPI.
-                "xPaddingBytes": "100-1000",
-                # Limit individual POST chunk size to stay within typical browser upload range.
-                "scMaxEachPostBytes": 1000000,
-                # Minimum interval between consecutive upstream POSTs (ms).
-                "scMinPostsIntervalMs": 30,
-                # Cap buffered packet-up posts per session; prevents a single client from
-                # allocating unbounded memory and keeps the burst pattern close to a browser.
-                "scMaxBufferedPosts": 30,
-                # Keep default SSE-style Content-Type header so traffic mimics EventSource streams.
-                "noSSEHeader": False,
-            }
-            # Socket-level options applied to the Xray inbound socket. BBR gives more stable
-            # throughput under loss (common on congested RU ISP links) and shifts RTT patterns
-            # away from the default cubic signature. Kernels without BBR fall back silently.
-            common_sockopt = {
-                "tcpcongestion": "bbr",
-                "tcpKeepAliveInterval": 30,
-                "tcpKeepAliveIdle": 300,
-                "tcpFastOpen": True,
-            }
+            common_xhttp = self._xray_xhttp_settings(path, mode, host) if transport == "xhttp" else None
+            common_sockopt = self._xray_sockopt(tcp_no_delay=(transport == "xhttp"))
 
             if self._vless_is_reality(vless):
                 reality_dest = vless.get("reality_dest") or "microsoft.com:443"
@@ -1574,18 +1652,21 @@ class AmneziaManager:
                     "security": "reality",
                     "realitySettings": {
                         "show": False,
-                        # `target` is the current RealityObject name; `dest` is a compatible alias (XTLS docs).
+                        # Keep both names for compatibility across Xray releases and client examples.
+                        "dest": reality_dest,
                         "target": reality_dest,
                         "xver": 0,
+                        "spiderX": "/",
                         "serverNames": server_names,
                         "privateKey": priv,
+                        "publicKey": vless.get("reality_public_key") or "",
                         "shortIds": short_ids,
                         # Allow up to 70 s clock drift between client and server.
                         # Without this, a client with a slightly off clock gets silently rejected by
                         # Reality's timestamp check — looks like the VPN "doesn't connect".
                         "maxTimeDiff": 70000,
                     },
-                    "xhttpSettings": dict(common_xhttp),
+                    "xhttpSettings": dict(common_xhttp) if common_xhttp else {},
                     "sockopt": dict(common_sockopt),
                 }
                 if transport == "tcp":
@@ -1598,7 +1679,7 @@ class AmneziaManager:
                 stream_settings = {
                     "network": "xhttp",
                     "security": "none",
-                    "xhttpSettings": dict(common_xhttp),
+                    "xhttpSettings": dict(common_xhttp or self._xray_xhttp_settings(path, mode, host)),
                     "sockopt": dict(common_sockopt),
                 }
 
@@ -1611,11 +1692,16 @@ class AmneziaManager:
                     "clients": clients,
                     "decryption": "none"
                 },
+                "sniffing": self._xray_sniffing(metadata_only=True),
                 "streamSettings": stream_settings,
             })
 
         config = {
-            "log": {"loglevel": "warning"},
+            "log": {
+                "loglevel": "info",
+                "access": "/dev/stdout",
+                "error": "/dev/stderr",
+            },
             "dns": {
                 # DoH-first resolver list encrypts the resolver's own lookups so that
                 # upstream providers / observers cannot see which domains (including
@@ -1634,24 +1720,18 @@ class AmneziaManager:
                     "protocol": "freedom",
                     "settings": {"domainStrategy": "UseIP"},
                     "tag": "direct",
-                    # BBR on the outbound socket stabilises throughput for exit-to-internet
-                    # traffic; TFO reduces RTT for repeat connections to popular origins.
-                    "streamSettings": {
-                        "sockopt": {
-                            "tcpcongestion": "bbr",
-                            "tcpFastOpen": True,
-                        }
-                    },
-                }
+                    "streamSettings": {"sockopt": self._xray_sockopt()},
+                },
+                {"protocol": "blackhole", "tag": "blocked"},
             ],
+            "routing": self._xray_routing("direct"),
         }
 
         try:
-            os.makedirs(XRAY_CONFIG_DIR, exist_ok=True)
-            with open(XRAY_CONFIG_FILE, "w") as f:
-                json.dump(config, f, indent=2)
+            self._write_validated_xray_config(config)
         except Exception as e:
             print(f"Failed writing xray config: {e}")
+            raise
 
     def create_vless_server(self, server_data):
         server_name = server_data.get("name", "New VLESS Server")
@@ -1857,20 +1937,19 @@ class AmneziaManager:
         exit_flow = self._vless_flow(vless)
 
         # Socket options reused on both bridge inbound and the chain-to-exit outbound.
-        # BBR improves throughput on congested RU links; TFO shortens repeat RTTs.
-        bridge_sockopt = {
-            "tcpcongestion": "bbr",
-            "tcpKeepAliveInterval": 30,
-            "tcpKeepAliveIdle": 300,
-            "tcpFastOpen": True,
-        }
+        # Keep them aligned with the main VLESS config so bridge mode behaves the same.
+        bridge_sockopt = self._xray_sockopt(tcp_no_delay=True)
 
         # ── Compose bridge Xray config ────────────────────────────────────────
         bridge_config = {
             # `info` (one step above default `warning`) prints chain-to-exit
             # dial errors and rejection reasons — without it a host/key
             # mismatch is invisible past the first `accepted` line.
-            "log": {"loglevel": "info"},
+            "log": {
+                "loglevel": "info",
+                "access": "/dev/stdout",
+                "error": "/dev/stderr",
+            },
             "dns": {
                 # DoH first so the bridge VPS doesn't leak exit-domain lookups to its ISP.
                 "servers": [
@@ -1889,28 +1968,23 @@ class AmneziaManager:
                     "clients": [{"id": bridge_uuid, "email": "bridge"}],
                     "decryption": "none"
                 },
+                "sniffing": self._xray_sniffing(metadata_only=True),
                 "streamSettings": {
                     "network": "xhttp",
                     "security": "reality",
                     "realitySettings": {
                         "show": False,
+                        "dest": bridge_reality_dest,
                         "target": bridge_reality_dest,
                         "xver": 0,
+                        "spiderX": "/",
                         "serverNames": bridge_server_names,
                         "privateKey": bridge_priv,
+                        "publicKey": bridge_pub,
                         "shortIds": [bridge_short_id],
                         "maxTimeDiff": 70000,
                     },
-                    "xhttpSettings": {
-                        "path": bridge_path,
-                        "mode": "packet-up",
-                        "host": bridge_dest_host,
-                        "xPaddingBytes": "100-1000",
-                        "scMaxEachPostBytes": 1000000,
-                        "scMinPostsIntervalMs": 30,
-                        "scMaxBufferedPosts": 30,
-                        "noSSEHeader": False,
-                    },
+                    "xhttpSettings": self._xray_xhttp_settings(bridge_path, "packet-up", bridge_dest_host),
                     "sockopt": dict(bridge_sockopt),
                 }
             }],
@@ -1937,37 +2011,39 @@ class AmneziaManager:
                             "serverName": exit_sni,
                             "publicKey": exit_pbk,
                             "shortId": exit_sid,
+                            "spiderX": "/",
                             # Tolerate clock drift on the RU bridge (often on virtualised VPS
                             # with poor NTP sync) — matches the exit inbound setting.
                             "maxTimeDiff": 70000,
                         },
-                        "xhttpSettings": {
-                            "mode": exit_mode,
-                            "path": exit_path,
-                            # XHTTP Host header must match what the exit inbound
-                            # was created with (the server's `host` field, not the
-                            # Reality SNI mask).
-                            "host": exit_host,
-                            # Mirror the exit inbound's XHTTP tuning so the chain's
-                            # upstream leg has the same browser-like pattern as clients.
-                            "xPaddingBytes": "100-1000",
-                            "scMaxEachPostBytes": 1000000,
-                            "scMinPostsIntervalMs": 30,
-                            "scMaxBufferedPosts": 30,
-                            "noSSEHeader": False,
-                        },
+                        # XHTTP Host header must match what the exit inbound was
+                        # created with, not the Reality SNI mask.
+                        "xhttpSettings": self._xray_xhttp_settings(exit_path, exit_mode, exit_host),
                         "sockopt": dict(bridge_sockopt),
                     }
                 },
-                {"protocol": "freedom", "tag": "direct"}
+                {"protocol": "freedom", "tag": "direct"},
+                {"protocol": "blackhole", "tag": "blocked"},
             ],
             "routing": {
                 "domainStrategy": "IPIfNonMatch",
-                "rules": [{
-                    "type": "field",
-                    "inboundTag": ["bridge-inbound"],
-                    "outboundTag": "chain-to-exit"
-                }]
+                "rules": [
+                    {
+                        "type": "field",
+                        "protocol": ["bittorrent"],
+                        "outboundTag": "blocked",
+                    },
+                    {
+                        "type": "field",
+                        "inboundTag": ["bridge-inbound"],
+                        "outboundTag": "chain-to-exit"
+                    },
+                    {
+                        "type": "field",
+                        "network": "tcp,udp",
+                        "outboundTag": "direct",
+                    },
+                ]
             }
         }
 
@@ -2060,6 +2136,7 @@ class AmneziaManager:
                     f"fp={quote(fp, safe='')}",
                     f"pbk={quote(pbk, safe='')}",
                     f"sid={quote(sid, safe='')}",
+                    f"spx={quote('/', safe='')}",
                 ]
                 if flow:
                     parts.append(f"flow={quote(flow, safe='')}")
@@ -2861,6 +2938,83 @@ class AmneziaManager:
         workers = max(1, min(max_workers, len(host_port_list) or 1))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             return list(pool.map(_probe, host_port_list))
+
+    def vless_connection_preflight(self, server_id, timeout=3):
+        server = next((s for s in self.config.get("servers", []) if s.get("id") == server_id), None)
+        if not server or server.get("protocol") != "vless":
+            raise ValueError("VLESS server not found")
+
+        vless = server.get("vless") or {}
+        checks = []
+
+        def add(name, ok, detail="", **extra):
+            item = {"name": name, "ok": bool(ok)}
+            if detail:
+                item["detail"] = str(detail)
+            item.update(extra)
+            checks.append(item)
+
+        if os.path.exists(XRAY_CONFIG_FILE):
+            try:
+                self._validate_xray_config_file(XRAY_CONFIG_FILE)
+                add("xray_config", True, "config.json passes xray run -test")
+            except Exception as e:
+                add("xray_config", False, str(e)[:500])
+        else:
+            add("xray_config", False, f"{XRAY_CONFIG_FILE} does not exist")
+
+        inbound_port = vless.get("inbound_port")
+        if inbound_port:
+            try:
+                with socket.create_connection(("xray", int(inbound_port)), timeout=timeout):
+                    add("xray_inbound_port", True, f"xray:{inbound_port} accepts TCP")
+            except Exception as e:
+                add("xray_inbound_port", False, f"xray:{inbound_port} is not reachable: {str(e)[:160]}")
+        else:
+            add("xray_inbound_port", False, "missing vless.inbound_port")
+
+        if self._vless_is_reality(vless):
+            reality_dest = vless.get("reality_dest") or "microsoft.com:443"
+            result = self.test_sni_reachability([reality_dest], timeout=timeout, max_workers=1)[0]
+            add(
+                "reality_dest",
+                result.get("ok"),
+                result.get("tls_version") or result.get("error") or "",
+                host=result.get("host"),
+                latency_ms=result.get("latency_ms"),
+            )
+
+        if vless.get("use_stream"):
+            conflicts = self._vless_stream_sni_conflicts()
+            own_conflicts = []
+            for sn in (vless.get("reality_server_names") or []):
+                refs = conflicts.get(str(sn or "").strip().lower()) or []
+                if refs:
+                    own_conflicts.append({"sni": sn, "servers": refs})
+            add("stream_sni_conflicts", not own_conflicts, "no conflicts" if not own_conflicts else "SNI is reused", conflicts=own_conflicts)
+
+            try:
+                with open(NGINX_STREAM_CONFIG_FILE) as f:
+                    stream_conf = f.read()
+                expected_port = str(inbound_port or "")
+                names = [str(sn or "").strip() for sn in (vless.get("reality_server_names") or []) if str(sn or "").strip()]
+                mapped = bool(expected_port) and any(sn in stream_conf and expected_port in stream_conf for sn in names)
+                add("nginx_stream_map", mapped, "SNI is mapped to Xray inbound" if mapped else "SNI/port mapping not found")
+            except Exception as e:
+                add("nginx_stream_map", False, str(e)[:160])
+
+        try:
+            result = subprocess.run(["nginx", "-t"], capture_output=True, text=True, timeout=10, check=False)
+            add("nginx_config", result.returncode == 0, (result.stderr or result.stdout or "").strip()[-500:])
+        except Exception as e:
+            add("nginx_config", False, str(e)[:160])
+
+        return {
+            "server_id": server_id,
+            "server_name": server.get("name"),
+            "ok": all(c.get("ok") for c in checks),
+            "checks": checks,
+        }
 
     def set_promo_lines(self, lines):
         cleaned = []
@@ -4890,6 +5044,15 @@ def vless_test_sni():
         "tested_from": amnezia_manager.public_ip,
     }
     return jsonify({"results": results, "summary": summary})
+
+
+@app.route('/api/servers/<server_id>/vless/preflight', methods=['GET', 'POST'])
+def vless_connection_preflight(server_id):
+    try:
+        result = amnezia_manager.vless_connection_preflight(server_id)
+        return jsonify(result), (200 if result.get("ok") else 409)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
 
 
 @app.route('/api/servers/<server_id>/bridge', methods=['POST'])
