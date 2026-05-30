@@ -43,6 +43,8 @@ services:
       # Internal-only ports for stream-routed REALITY inbounds (port-443 whitelist bypass mode).
       # nginx stream proxies from external :443 to xray:9443+ by SNI — no host-port publishing needed.
       - XRAY_STREAM_BASE_PORT=9443
+      # Own-domain REALITY fallback target from the xray container to web-ui nginx HTTPS.
+      - XRAY_REALITY_FALLBACK_TARGET=${XRAY_REALITY_FALLBACK_TARGET:-web-ui:4443}
       # MemeVPN multi-server subscription branding & cadence.
       - MEMEVPN_BRAND=${MEMEVPN_BRAND:-MemeVPN}
       - MEMEVPN_SUB_UPDATE_HOURS=${MEMEVPN_SUB_UPDATE_HOURS:-24}

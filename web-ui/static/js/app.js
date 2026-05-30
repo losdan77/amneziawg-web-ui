@@ -52,6 +52,14 @@ class AmneziaApp {
             this.toggleVlessTransportFields();
         }
 
+        const vlessRealityProfile = this.getElement('vlessRealityProfile');
+        if (vlessRealityProfile) {
+            vlessRealityProfile.addEventListener('change', () => {
+                this.toggleVlessRealityProfileFields();
+            });
+            this.toggleVlessRealityProfileFields();
+        }
+
         const genVlessPathBtn = this.getElement('genVlessPathBtn');
         if (genVlessPathBtn) {
             genVlessPathBtn.addEventListener('click', () => {
@@ -243,6 +251,16 @@ class AmneziaApp {
         if (tcpFlowWrap) tcpFlowWrap.classList.toggle('hidden', isXhttp);
         if (xhttpModeWrap) xhttpModeWrap.classList.toggle('hidden', !isXhttp);
         if (pathWrap) pathWrap.classList.toggle('hidden', !isXhttp);
+        this.toggleVlessRealityProfileFields();
+    }
+
+    toggleVlessRealityProfileFields() {
+        const profile = (this.getElement('vlessRealityProfile')?.value || 'own_domain').toLowerCase();
+        const isExternalMask = profile === 'external_mask';
+        const destWrap = this.getElement('vlessRealityDestWrap');
+        const presetsPanel = this.getElement('sniPresetsPanel');
+        if (destWrap) destWrap.classList.toggle('hidden', !isExternalMask);
+        if (!isExternalMask && presetsPanel) presetsPanel.classList.add('hidden');
     }
 
     generateVlessPath() {
@@ -294,6 +312,9 @@ class AmneziaApp {
                     </div>
                     <span class="text-gray-500">${p.desc}</span>`;
                 btn.addEventListener('click', () => {
+                    const profile = this.getElement('vlessRealityProfile');
+                    if (profile) profile.value = 'external_mask';
+                    this.toggleVlessRealityProfileFields();
                     const destInput = this.getElement('vlessRealityDest');
                     if (destInput) destInput.value = p.host;
                     const panel = this.getElement('sniPresetsPanel');
@@ -656,17 +677,26 @@ class AmneziaApp {
             const domain = (this.getElement('vlessDomain')?.value || '').trim();
             const path = (this.getElement('vlessPath')?.value || '').trim();
             const transport = (this.getElement('vlessTransport')?.value || 'tcp').toLowerCase();
+            const realityProfile = (this.getElement('vlessRealityProfile')?.value || 'own_domain').toLowerCase();
             const realityDest = (this.getElement('vlessRealityDest')?.value || '').trim();
 
             if (!domain) {
                 this.showError('vlessDomainError', 'Client address is required (domain or server IP)');
                 isValid = false;
             }
+            if (realityProfile === 'own_domain' && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(domain)) {
+                this.showError('vlessDomainError', 'Own-domain REALITY needs a DNS name such as alb13.memeinternet.site');
+                isValid = false;
+            }
             if (transport === 'xhttp' && (!path || !path.startsWith('/'))) {
                 this.showError('vlessPathError', "Path is required and must start with '/'");
                 isValid = false;
             }
-            if (realityDest && !/^[a-z0-9.-]+(?::\d+)?$/i.test(realityDest)) {
+            if (realityProfile === 'external_mask' && !realityDest) {
+                this.showError('vlessRealityDestError', 'REALITY mask is required for external mask mode');
+                isValid = false;
+            }
+            if (realityProfile === 'external_mask' && realityDest && !/^[a-z0-9.-]+(?::\d+)?$/i.test(realityDest)) {
                 this.showError('vlessRealityDestError', 'REALITY dest: use host or host:port (e.g. www.microsoft.com:443)');
                 isValid = false;
             }
@@ -836,6 +866,7 @@ class AmneziaApp {
                 flow: (this.getElement('vlessFlow')?.value || '').trim(),
                 path: (this.getElement('vlessPath')?.value || '').trim(),
                 xhttp_mode: (this.getElement('vlessXhttpMode')?.value || 'auto').trim(),
+                reality_profile: (this.getElement('vlessRealityProfile')?.value || 'own_domain').trim(),
                 reality_dest: (this.getElement('vlessRealityDest')?.value || '').trim(),
                 fingerprint: (this.getElement('vlessFingerprint')?.value || 'chrome').trim(),
                 use_stream: this.getElement('vlessUseStream')?.checked ?? true,
@@ -1057,7 +1088,7 @@ class AmneziaApp {
                             </p>` : ''}
                             <p class="text-xs text-gray-500">
                                 VLESS: ${this.getVlessConnectionSummary(server)}
-                                ${server.vless.security === 'reality' && server.vless.reality_dest ? ` · REALITY dest ${server.vless.reality_dest}` : ''}
+                                ${server.vless.security === 'reality' ? ` · ${this.getVlessRealityProfileLabel(server)}` : ''}
                                 ${server.vless.use_stream
                                     ? `<span class="ml-1 px-1 py-0.5 rounded bg-green-100 text-green-700 font-medium">порт 443 / stream</span>`
                                     : `<span class="ml-1 px-1 py-0.5 rounded bg-yellow-100 text-yellow-700 font-medium">прямой порт ${server.vless.inbound_port}</span>`}
@@ -1140,6 +1171,15 @@ class AmneziaApp {
     getVlessFlow(server) {
         const flow = (server?.vless?.flow || '').toLowerCase();
         return flow === 'xtls-rprx-vision' ? flow : '';
+    }
+
+    getVlessRealityProfileLabel(server) {
+        const vless = server?.vless || {};
+        const profile = (vless.reality_profile || 'external_mask').toLowerCase();
+        if (profile === 'own_domain') {
+            return `REALITY own-domain SNI ${vless.domain || ''}`;
+        }
+        return `REALITY dest ${vless.reality_dest || ''}`;
     }
 
     getVlessConnectionSummary(server) {

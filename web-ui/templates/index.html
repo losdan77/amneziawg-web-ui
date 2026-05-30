@@ -147,6 +147,15 @@
                         <p class="text-gray-500 text-xs mt-1">HAPP shows this as Network: TCP when the generated link uses type=tcp.</p>
                     </div>
 
+                    <div class="mb-4">
+                        <label class="block text-sm font-medium text-gray-700">REALITY profile</label>
+                        <select id="vlessRealityProfile" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                            <option value="own_domain" selected>Own domain + nginx fallback (Ultimate-like)</option>
+                            <option value="external_mask">External mask SNI (legacy)</option>
+                        </select>
+                        <p class="text-gray-500 text-xs mt-1">Own-domain uses the client address as SNI and sends non-REALITY TLS probes to the real nginx HTTPS site.</p>
+                    </div>
+
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div>
                             <label class="block text-sm font-medium text-gray-700">Client address (domain or IP) *</label>
@@ -158,10 +167,10 @@
                         <div id="vlessTcpFlowWrap">
                             <label class="block text-sm font-medium text-gray-700">TCP flow</label>
                             <select id="vlessFlow" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
-                                <option value="" selected>None (matches competitor screenshots)</option>
-                                <option value="xtls-rprx-vision">xtls-rprx-vision</option>
+                                <option value="xtls-rprx-vision" selected>xtls-rprx-vision</option>
+                                <option value="">None (legacy / compatibility)</option>
                             </select>
-                            <p class="text-gray-500 text-xs mt-1">Start with None for maximum HAPP compatibility; test Vision separately.</p>
+                            <p class="text-gray-500 text-xs mt-1">Matches the Ultimate-like REALITY profile; switch to None only for old clients.</p>
                         </div>
                         <div id="vlessXhttpModeWrap">
                             <label class="block text-sm font-medium text-gray-700">XHTTP mode</label>
@@ -203,7 +212,7 @@
                         </div>
                     </div>
 
-                    <div class="mt-4">
+                    <div id="vlessRealityDestWrap" class="mt-4 hidden">
                         <label class="block text-sm font-medium text-gray-700">REALITY mask (dest) — маскировка под сайт</label>
                         <div class="flex gap-2">
                             <input type="text" id="vlessRealityDest" placeholder="microsoft.com:443"

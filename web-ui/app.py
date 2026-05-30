@@ -76,6 +76,10 @@ XRAY_BASE_PORT = int(os.getenv('XRAY_BASE_PORT', '8443'))
 # These are NOT published to the host; nginx stream proxies from external :443 by SNI.
 XRAY_STREAM_BASE_PORT = int(os.getenv('XRAY_STREAM_BASE_PORT', '9443'))
 NGINX_STREAM_CONFIG_FILE = '/etc/nginx/stream_reality.conf'
+# Xray runs in a sibling Docker service. In own-domain REALITY mode it receives
+# both valid REALITY handshakes and ordinary TLS probes for the same SNI; the
+# latter must fall through to the real nginx HTTPS listener, not loop back to :443.
+REALITY_INTERNAL_FALLBACK_TARGET = os.getenv('XRAY_REALITY_FALLBACK_TARGET', 'web-ui:4443')
 PUBLIC_IP_SERVICE = 'http://ifconfig.me'
 ENABLE_OBFUSCATION = True
 
@@ -527,6 +531,18 @@ class AmneziaManager:
                 updated = True
             if isinstance(vless, dict) and vless.get("transport") in ("tcp", "raw") and "flow" not in vless:
                 vless["flow"] = "xtls-rprx-vision"
+                updated = True
+            if isinstance(vless, dict) and "reality_profile" not in vless:
+                domain = str(vless.get("domain") or "").strip().lower()
+                names = [str(n or "").strip().lower() for n in (vless.get("reality_server_names") or [])]
+                vless["reality_profile"] = "own_domain" if domain and domain in names else "external_mask"
+                updated = True
+            if (
+                isinstance(vless, dict)
+                and vless.get("reality_profile") == "own_domain"
+                and "reality_fallback_target" not in vless
+            ):
+                vless["reality_fallback_target"] = REALITY_INTERNAL_FALLBACK_TARGET
                 updated = True
 
         # Seed top-level keys for the user-level subscription model.
@@ -1139,6 +1155,48 @@ class AmneziaManager:
     def _vless_flow(self, vless):
         return self._normalize_vless_flow((vless or {}).get("flow"), self._vless_transport(vless))
 
+    def _normalize_reality_profile(self, profile):
+        value = str(profile or "").strip().lower().replace("-", "_")
+        aliases = {
+            "": "own_domain",
+            "own": "own_domain",
+            "self": "own_domain",
+            "domain": "own_domain",
+            "own_domain": "own_domain",
+            "ultimate": "own_domain",
+            "ultimate_like": "own_domain",
+            "mask": "external_mask",
+            "external": "external_mask",
+            "external_mask": "external_mask",
+            "legacy": "external_mask",
+            "sni_mask": "external_mask",
+        }
+        if value not in aliases:
+            raise ValueError("reality_profile must be one of: own_domain, external_mask")
+        return aliases[value]
+
+    def _vless_reality_profile(self, vless):
+        return self._normalize_reality_profile((vless or {}).get("reality_profile"))
+
+    def _reality_server_names_for_domain(self, domain):
+        value = self._validate_domain(domain)
+        return [value]
+
+    def _vless_reality_server_names(self, vless):
+        names = [str(n or "").strip().lower() for n in ((vless or {}).get("reality_server_names") or [])]
+        names = [n for n in names if n]
+        if names:
+            return names
+        if self._vless_reality_profile(vless) == "own_domain":
+            return self._reality_server_names_for_domain((vless or {}).get("domain"))
+        reality_dest = (vless or {}).get("reality_dest") or "microsoft.com:443"
+        return self._reality_server_names_for_host(reality_dest.split(":")[0])
+
+    def _vless_reality_target(self, vless):
+        if self._vless_reality_profile(vless) == "own_domain":
+            return (vless or {}).get("reality_fallback_target") or REALITY_INTERNAL_FALLBACK_TARGET
+        return (vless or {}).get("reality_dest") or "microsoft.com:443"
+
     def _vless_is_reality(self, vless):
         """REALITY terminates TLS-like handshakes in Xray for xhttp or tcp/raw."""
         if not vless:
@@ -1436,9 +1494,15 @@ class AmneziaManager:
             return warnings
         vless = server.get("vless") or {}
         if self._vless_is_reality(vless) and vless.get("use_stream"):
-            if not os.getenv("SSL_DOMAIN", "").strip():
+            ssl_domain = os.getenv("SSL_DOMAIN", "").strip().lower()
+            vless_domain = str(vless.get("domain") or "").strip().lower()
+            if not ssl_domain:
                 warnings.append(
                     "Port 443 stream routing needs SSL_DOMAIN configured so nginx HTTP moves to internal :4443."
+                )
+            elif self._vless_reality_profile(vless) == "own_domain" and vless_domain and ssl_domain != vless_domain:
+                warnings.append(
+                    f"Own-domain REALITY fallback works best when SSL_DOMAIN matches the VLESS domain ({vless_domain}); current SSL_DOMAIN is {ssl_domain}."
                 )
             conflicts = sni_conflicts if sni_conflicts is not None else self._vless_stream_sni_conflicts()
             own_id = server.get("id")
@@ -1557,10 +1621,8 @@ class AmneziaManager:
             }
 
             if self._vless_is_reality(vless):
-                reality_dest = vless.get("reality_dest") or "microsoft.com:443"
-                server_names = vless.get("reality_server_names") or self._reality_server_names_for_host(
-                    reality_dest.split(":")[0]
-                )
+                reality_target = self._vless_reality_target(vless)
+                server_names = self._vless_reality_server_names(vless)
                 short_ids = vless.get("reality_short_ids")
                 if not short_ids:
                     sid = vless.get("reality_short_id") or ""
@@ -1574,9 +1636,11 @@ class AmneziaManager:
                     "security": "reality",
                     "realitySettings": {
                         "show": False,
-                        # `target` is the current RealityObject name; `dest` is a compatible alias (XTLS docs).
-                        "target": reality_dest,
+                        # Own-domain mode falls back to the real nginx HTTPS listener;
+                        # legacy mode keeps using the operator-selected external mask.
+                        "target": reality_target,
                         "xver": 0,
+                        "spiderX": vless.get("reality_spiderx") or "/",
                         "serverNames": server_names,
                         "privateKey": priv,
                         "shortIds": short_ids,
@@ -1669,9 +1733,23 @@ class AmneziaManager:
             path = self._normalize_vless_path(raw_path) if raw_path else ""
             mode = ""
             host = domain
-        flow = self._normalize_vless_flow(server_data.get("flow"), transport)
-        reality_dest, dest_host = self._normalize_reality_dest(server_data.get("reality_dest"))
-        server_names = self._reality_server_names_for_host(dest_host)
+        flow_raw = server_data.get("flow")
+        if transport == "tcp" and flow_raw is None:
+            flow_raw = "xtls-rprx-vision"
+        flow = self._normalize_vless_flow(flow_raw, transport)
+        reality_profile = self._normalize_reality_profile(server_data.get("reality_profile"))
+        if reality_profile == "own_domain":
+            if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", domain):
+                raise ValueError("own-domain REALITY profile requires a DNS name, not a bare IP address")
+            reality_dest = f"{domain}:443"
+            server_names = self._reality_server_names_for_domain(domain)
+            reality_fallback_target = str(
+                server_data.get("reality_fallback_target") or REALITY_INTERNAL_FALLBACK_TARGET
+            ).strip()
+        else:
+            reality_dest, dest_host = self._normalize_reality_dest(server_data.get("reality_dest"))
+            server_names = self._reality_server_names_for_host(dest_host)
+            reality_fallback_target = ""
         priv, pub = self._generate_reality_keypair()
         short_id = self._generate_reality_short_id()
         # Non-empty shortId only: the empty string allows unauthenticated connections.
@@ -1738,7 +1816,9 @@ class AmneziaManager:
                 # inbound_port: what Xray actually listens on (9443+ in stream mode)
                 "inbound_port": inbound_port,
                 "use_stream": use_stream,
+                "reality_profile": reality_profile,
                 "reality_dest": reality_dest,
+                "reality_fallback_target": reality_fallback_target,
                 "reality_server_names": server_names,
                 "reality_private_key": priv,
                 "reality_public_key": pub,
