@@ -1093,7 +1093,7 @@ class AmneziaApp {
                                     ? `<span class="ml-1 px-1 py-0.5 rounded bg-green-100 text-green-700 font-medium">порт 443 / stream</span>`
                                     : `<span class="ml-1 px-1 py-0.5 rounded bg-yellow-100 text-yellow-700 font-medium">прямой порт ${server.vless.inbound_port}</span>`}
                             </p>
-                            <p class="text-xs text-gray-500">Subscription: <span class="font-mono">${this.getVlessSubscriptionUrl(server)}</span>
+                            <p class="text-xs text-gray-500">Admin server subscription: <span class="font-mono">${this.getVlessSubscriptionUrl(server)}</span>
                                 <button onclick="amneziaApp.copyToClipboard('${btoa(this.getVlessSubscriptionUrl(server))}')" class="ml-2 text-blue-600 hover:text-blue-800 text-xs">Copy</button>
                             </p>
                             ${(server.vless_warnings || []).length ? `

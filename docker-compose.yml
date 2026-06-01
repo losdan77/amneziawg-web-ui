@@ -48,6 +48,13 @@ services:
       # MemeVPN multi-server subscription branding & cadence.
       - MEMEVPN_BRAND=${MEMEVPN_BRAND:-MemeVPN}
       - MEMEVPN_SUB_UPDATE_HOURS=${MEMEVPN_SUB_UPDATE_HOURS:-24}
+      # HAPP subscription app-management. Hide server configs in HAPP by default.
+      # Set HAPP_PROVIDER_ID if you have one; HAPP requires it for advanced flags.
+      - HAPP_HIDE_SERVER_SETTINGS=${HAPP_HIDE_SERVER_SETTINGS:-true}
+      - HAPP_PROVIDER_ID=${HAPP_PROVIDER_ID:-}
+      # Keep legacy server-wide VLESS subscriptions admin-only by default.
+      # End users should receive per-user /api/sub/user/<token> URLs instead.
+      - PUBLIC_SERVER_SUBSCRIPTIONS=${PUBLIC_SERVER_SUBSCRIPTIONS:-false}
       # How long an expired client stays alive before the pruner deletes it
       # (gives users a window to renew without losing their config).
       - CLIENT_DELETE_GRACE_DAYS=${CLIENT_DELETE_GRACE_DAYS:-3}

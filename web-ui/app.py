@@ -15,7 +15,7 @@ import ssl
 from concurrent.futures import ThreadPoolExecutor
 import re
 from urllib.parse import quote
-from flask import Flask, render_template, request, jsonify, send_file, send_from_directory
+from flask import Flask, render_template, request, jsonify, send_file, send_from_directory, Response
 from flask_socketio import SocketIO
 import threading
 import time
@@ -28,6 +28,9 @@ STATIC_DIR = os.path.join(BASE_DIR, 'static')
 
 # Essential environment variables
 NGINX_PORT = os.getenv('NGINX_PORT', '80')
+ADMIN_USERNAME = os.getenv('NGINX_USER', 'admin')
+ADMIN_PASSWORD = os.getenv('NGINX_PASSWORD', 'changeme')
+PUBLIC_SERVER_SUBSCRIPTIONS = os.getenv('PUBLIC_SERVER_SUBSCRIPTIONS', 'false').lower() == 'true'
 AUTO_START_SERVERS = os.getenv('AUTO_START_SERVERS', 'true').lower() == 'true'
 DEFAULT_MTU = int(os.getenv('DEFAULT_MTU', '1280'))
 DEFAULT_SUBNET = os.getenv('DEFAULT_SUBNET', '10.0.0.0/24')
@@ -51,6 +54,10 @@ MEMEVPN_BRAND = os.getenv('MEMEVPN_BRAND', 'MemeVPN')
 # How often clients (HAPP/v2rayN) should refresh the subscription, in hours.
 # When you add a new VLESS server, existing users will see it after this interval.
 MEMEVPN_SUB_UPDATE_HOURS = int(os.getenv('MEMEVPN_SUB_UPDATE_HOURS', '24'))
+# HAPP app-management flags. `hide-settings` disables viewing/editing server
+# configs in HAPP; advanced HAPP parameters require ProviderID when available.
+HAPP_HIDE_SERVER_SETTINGS = os.getenv('HAPP_HIDE_SERVER_SETTINGS', 'true').lower() == 'true'
+HAPP_PROVIDER_ID = os.getenv('HAPP_PROVIDER_ID', '').strip()
 
 # ── Federation / satellite mode ─────────────────────────────────────────────
 # When SATELLITE_API_KEY is set, this instance exposes an authenticated
@@ -212,6 +219,47 @@ socketio = SocketIO(
     cors_allowed_origins="*",  # Allow all origins for development
     path='/socket.io'  # Explicitly set the path
 )
+
+def _admin_auth_ok():
+    auth = request.authorization
+    if not auth:
+        return False
+    return (
+        secrets.compare_digest(auth.username or "", ADMIN_USERNAME)
+        and secrets.compare_digest(auth.password or "", ADMIN_PASSWORD)
+    )
+
+def _admin_auth_required():
+    return Response(
+        "Admin authentication required",
+        401,
+        {"WWW-Authenticate": 'Basic realm="AmneziaWG Web UI"'},
+    )
+
+@app.before_request
+def protect_admin_api():
+    """Defense-in-depth for direct Flask access.
+
+    nginx already protects admin routes, but if port 5000 is ever exposed by
+    mistake, Flask must not serve raw server/client configs without admin auth.
+    Personal subscription URLs remain public because clients need to fetch them.
+    """
+    if request.method == "OPTIONS":
+        return None
+
+    path = request.path or ""
+    if not path.startswith("/api/"):
+        return None
+    if path.startswith("/api/satellite/"):
+        return None
+    if path.startswith("/api/sub/user/"):
+        return None
+    if path.startswith("/api/sub/vless/") and PUBLIC_SERVER_SUBSCRIPTIONS:
+        return None
+
+    if _admin_auth_ok():
+        return None
+    return _admin_auth_required()
 
 class AmneziaManager:
     def __init__(self):
@@ -5018,7 +5066,10 @@ def vless_subscription(subscription_id):
         except Exception:
             continue
 
-    return app.response_class("\n".join(lines) + ("\n" if lines else ""), mimetype="text/plain")
+    body_lines = _happ_subscription_management_comments() + lines
+    body = "\n".join(body_lines) + ("\n" if body_lines else "")
+    response = app.response_class(body, mimetype="text/plain")
+    return _apply_happ_subscription_management_headers(response)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5143,6 +5194,25 @@ def _require_satellite_auth():
     if auth.removeprefix("Bearer ").strip() != SATELLITE_API_KEY:
         return jsonify({"error": "invalid api key"}), 403
     return None
+
+
+def _apply_happ_subscription_management_headers(response):
+    """Attach HAPP app-management headers to subscription responses."""
+    if HAPP_PROVIDER_ID:
+        response.headers["providerid"] = HAPP_PROVIDER_ID
+    if HAPP_HIDE_SERVER_SETTINGS:
+        response.headers["hide-settings"] = "1"
+    return response
+
+
+def _happ_subscription_management_comments():
+    """Plain-text HAPP metadata comments for non-base64 subscriptions."""
+    comments = []
+    if HAPP_PROVIDER_ID:
+        comments.append(f"#providerid {HAPP_PROVIDER_ID}")
+    if HAPP_HIDE_SERVER_SETTINGS:
+        comments.append("#hide-settings: 1")
+    return comments
 
 
 @app.route('/api/satellite/ping', methods=['GET'])
@@ -5323,6 +5393,7 @@ def user_subscription(token):
     body_text = "\n".join(lines) + ("\n" if lines else "")
     encoded = base64.b64encode(body_text.encode("utf-8")).decode("ascii")
     response = app.response_class(encoded, mimetype="text/plain; charset=utf-8")
+    _apply_happ_subscription_management_headers(response)
 
     # HAPP / v2rayN / Hiddify standard subscription headers.
     profile_title = f"{MEMEVPN_BRAND} | {record.get('name') or user_id}"
