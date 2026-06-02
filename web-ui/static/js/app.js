@@ -27,6 +27,8 @@ class AmneziaApp {
     }
 
     setupEventListeners() {
+        this.promoteSharedUpstreamSettings();
+
         // Server form submission
         const serverForm = this.getElement('serverForm');
         if (serverForm) {
@@ -58,6 +60,13 @@ class AmneziaApp {
                 this.toggleVlessRealityProfileFields();
             });
             this.toggleVlessRealityProfileFields();
+        }
+
+        const vlessUseUpstream = this.getElement('vlessUseUpstream');
+        if (vlessUseUpstream) {
+            vlessUseUpstream.addEventListener('change', () => {
+                this.toggleUpstreamSettings(this.shouldShowUpstreamSettings());
+            });
         }
 
         const genVlessPathBtn = this.getElement('genVlessPathBtn');
@@ -134,9 +143,9 @@ class AmneziaApp {
         const serverMode = this.getElement('serverMode');
         if (serverMode) {
             serverMode.addEventListener('change', (e) => {
-                this.toggleUpstreamSettings(e.target.value === 'edge_linked');
+                this.toggleUpstreamSettings(this.shouldShowUpstreamSettings());
             });
-            this.toggleUpstreamSettings(serverMode.value === 'edge_linked');
+            this.toggleUpstreamSettings(this.shouldShowUpstreamSettings());
         }
 
         const upstreamImportConfig = this.getElement('upstreamImportConfig');
@@ -218,6 +227,23 @@ class AmneziaApp {
         }
     }
 
+    promoteSharedUpstreamSettings() {
+        const upstreamSettings = document.getElementById('upstreamSettings');
+        const wireguardFields = document.getElementById('wireguardFields');
+        if (!upstreamSettings || !wireguardFields || !wireguardFields.parentNode) return;
+        if (upstreamSettings.parentElement === wireguardFields) {
+            wireguardFields.insertAdjacentElement('afterend', upstreamSettings);
+        }
+    }
+
+    shouldShowUpstreamSettings() {
+        const protocol = (this.getElement('serverProtocol')?.value || 'wireguard').toLowerCase();
+        if (protocol === 'vless') {
+            return !!this.getElement('vlessUseUpstream')?.checked;
+        }
+        return this.getElement('serverMode')?.value === 'edge_linked';
+    }
+
     toggleProtocolFields(protocol) {
         const selected = (protocol || 'wireguard').toLowerCase();
         const vlessFields = this.getElement('vlessFields');
@@ -240,6 +266,7 @@ class AmneziaApp {
         if (isVless) {
             this.toggleVlessTransportFields();
         }
+        this.toggleUpstreamSettings(this.shouldShowUpstreamSettings());
     }
 
     toggleVlessTransportFields() {
@@ -381,6 +408,8 @@ class AmneziaApp {
     }
 
     toggleUpstreamSettings(show) {
+        const protocol = (this.getElement('serverProtocol')?.value || 'wireguard').toLowerCase();
+        const isWireGuard = protocol !== 'vless';
         const upstreamSettings = this.getElement('upstreamSettings');
         if (upstreamSettings) {
             upstreamSettings.classList.toggle('hidden', !show);
@@ -391,22 +420,22 @@ class AmneziaApp {
         const obfuscationError = this.getElement('obfuscationError');
 
         if (obfuscationToggleRow) {
-            obfuscationToggleRow.classList.toggle('hidden', show);
+            obfuscationToggleRow.classList.toggle('hidden', show && isWireGuard);
         }
         if (obfuscationCheckbox) {
-            if (show) {
+            if (show && isWireGuard) {
                 obfuscationCheckbox.checked = true;
                 obfuscationCheckbox.disabled = true;
             } else {
                 obfuscationCheckbox.disabled = false;
             }
-            this.toggleObfuscationParams(show ? false : obfuscationCheckbox.checked);
+            this.toggleObfuscationParams((show && isWireGuard) ? false : obfuscationCheckbox.checked);
         }
         if (obfuscationParams) {
-            obfuscationParams.classList.toggle('hidden', show);
+            obfuscationParams.classList.toggle('hidden', show && isWireGuard);
             const controls = obfuscationParams.querySelectorAll('input, select, textarea, button');
             controls.forEach((control) => {
-                control.disabled = show;
+                control.disabled = show && isWireGuard;
             });
         }
         if (obfuscationError) {
@@ -700,6 +729,20 @@ class AmneziaApp {
                 this.showError('vlessRealityDestError', 'REALITY dest: use host or host:port (e.g. www.microsoft.com:443)');
                 isValid = false;
             }
+            if (this.getElement('vlessUseUpstream')?.checked) {
+                const importedConfig = this.getElement('upstreamImportConfig')?.value?.trim() || '';
+                if (!importedConfig) {
+                    this.showError('upstreamImportError', 'Paste imported EU client config for VLESS Linked Edge mode');
+                    isValid = false;
+                } else {
+                    try {
+                        this.parseAmneziaConfigPreview(importedConfig);
+                    } catch (error) {
+                        this.showError('upstreamImportError', `Config parse error: ${error.message}`);
+                        isValid = false;
+                    }
+                }
+            }
 
             return isValid;
         }
@@ -857,11 +900,13 @@ class AmneziaApp {
         let formData;
         if (protocol === 'vless') {
             const vlessDomainVal = (this.getElement('vlessDomain')?.value || '').trim();
+            const vlessLinked = this.getElement('vlessUseUpstream')?.checked ?? false;
             formData = {
                 protocol: 'vless',
                 name: nameElement ? nameElement.value.trim() : 'New VLESS Server',
                 domain: vlessDomainVal,
                 host: vlessDomainVal,
+                mode: vlessLinked ? 'edge_linked' : 'standalone',
                 transport: (this.getElement('vlessTransport')?.value || 'tcp').trim(),
                 flow: (this.getElement('vlessFlow')?.value || '').trim(),
                 path: (this.getElement('vlessPath')?.value || '').trim(),
@@ -875,6 +920,13 @@ class AmneziaApp {
                 flag_emoji: (this.getElement('vlessFlagEmoji')?.value || '').trim(),
                 display_location: (this.getElement('vlessDisplayLocation')?.value || '').trim(),
             };
+            if (vlessLinked) {
+                formData.upstream = {
+                    import_config: upstreamImportConfigElement ? upstreamImportConfigElement.value.trim() : '',
+                    failover_mode: upstreamFailoverModeElement ? upstreamFailoverModeElement.value : 'fail_close',
+                    split_ru_local: splitRuLocalElement ? splitRuLocalElement.checked : true
+                };
+            }
         } else {
             formData = {
                 protocol: 'wireguard',

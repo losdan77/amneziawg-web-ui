@@ -250,6 +250,16 @@
                         <strong>Режим direct (порт 8443+):</strong> откройте порт, показанный на карточке сервера (docker-compose публикует 8443–8642 к Xray).
                         Подписка и QR совместимы с HAPP / v2rayNG / Nekoray.
                     </p>
+                    <div class="mt-4 p-3 rounded-lg bg-emerald-50 border border-emerald-200">
+                        <label class="inline-flex items-center text-sm font-medium text-emerald-800">
+                            <input type="checkbox" id="vlessUseUpstream" class="mr-2 h-4 w-4">
+                            Route this VLESS server through upstream AmneziaWG
+                        </label>
+                        <p class="text-emerald-700 text-xs mt-1">
+                            For RU bridge mode: HAPP connects to this VLESS inbound, then Xray egress goes through the imported EU AmneziaWG tunnel.
+                            Russian destination CIDRs can stay on the RU VPS local interface via split routing.
+                        </p>
+                    </div>
                 </div>
 
                 <div id="wireguardFields">

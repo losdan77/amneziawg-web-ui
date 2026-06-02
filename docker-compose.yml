@@ -7,11 +7,12 @@ services:
     image: amneziawg-web-ui:local
     container_name: amneziawg-web-ui
     restart: unless-stopped
-    depends_on:
-      - xray
     ports:
       - "80:80"
       - "443:443"
+      # Direct VLESS+REALITY+XHTTP/TCP (when use_stream=false).
+      # Xray shares this container's network namespace, so direct ports are published here.
+      - "8443-8642:8443-8642/tcp"
       # WireGuard/AmneziaWG ports (example; keep/adjust as needed)
       - "43457:43457/udp"
       - "45297:45297/udp"
@@ -43,6 +44,8 @@ services:
       # Internal-only ports for stream-routed REALITY inbounds (port-443 whitelist bypass mode).
       # nginx stream proxies from external :443 to xray:9443+ by SNI — no host-port publishing needed.
       - XRAY_STREAM_BASE_PORT=9443
+      # Xray shares the web-ui network namespace so linked VLESS can use AWG policy routing.
+      - XRAY_UPSTREAM_HOST=127.0.0.1
       # Own-domain REALITY fallback target from the xray container to web-ui nginx HTTPS.
       - XRAY_REALITY_FALLBACK_TARGET=${XRAY_REALITY_FALLBACK_TARGET:-web-ui:4443}
       # MemeVPN multi-server subscription branding & cadence.
@@ -67,6 +70,11 @@ services:
     image: teddysun/xray:26.3.27
     container_name: amneziawg-xray
     restart: unless-stopped
+    depends_on:
+      - web-ui
+    network_mode: "service:web-ui"
+    cap_add:
+      - NET_ADMIN
     volumes:
       - /etc/amnezia:/etc/amnezia
     # Auto-restart xray when config.json changes (simple watchdog).
@@ -108,10 +116,5 @@ services:
             sleep 2
           fi
         done
-    ports:
-      # Direct VLESS+REALITY+XHTTP (no stream routing): each server listens on XRAY_BASE_PORT+N.
-      # Open these on your host firewall when use_stream=false.
-      - "8443-8642:8443-8642/tcp"
-      # Stream-routed VLESS servers (port-443 whitelist bypass) use ports 9443-9642 INTERNALLY ONLY.
-      # nginx stream in the web-ui container proxies external :443 → xray:9443+N by SNI.
-      # No host-port mapping needed for 9443-9642.
+    # Xray shares web-ui's network namespace. Do not publish ports here; direct VLESS
+    # ports are published by web-ui, and stream-routed ports stay internal.

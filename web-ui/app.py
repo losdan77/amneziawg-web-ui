@@ -82,6 +82,9 @@ XRAY_BASE_PORT = int(os.getenv('XRAY_BASE_PORT', '8443'))
 # Ports 9443-9642: internal-only Xray inbounds for stream-routed (port-443) REALITY servers.
 # These are NOT published to the host; nginx stream proxies from external :443 by SNI.
 XRAY_STREAM_BASE_PORT = int(os.getenv('XRAY_STREAM_BASE_PORT', '9443'))
+# Hostname/IP nginx uses to reach Xray. In the default compose file Xray shares
+# the web-ui network namespace so it can route marked VLESS egress via AWG.
+XRAY_UPSTREAM_HOST = os.getenv('XRAY_UPSTREAM_HOST', 'xray')
 NGINX_STREAM_CONFIG_FILE = '/etc/nginx/stream_reality.conf'
 # Xray runs in a sibling Docker service. In own-domain REALITY mode it receives
 # both valid REALITY handshakes and ordinary TLS probes for the same SNI; the
@@ -273,6 +276,11 @@ class AmneziaManager:
         self.migrate_server_link_fields()
         self.migrate_vless_metadata()
 
+        # Auto-start servers based on environment variable. Linked VLESS servers
+        # need their AWG policy routes in place before Xray accepts traffic.
+        if AUTO_START_SERVERS:
+            self.auto_start_servers()
+
         # Keep derived configs in sync on every startup.
         # This ensures nginx/xray configs are regenerated after container restarts.
         try:
@@ -281,10 +289,6 @@ class AmneziaManager:
             self._write_vless_stream_config()
         except Exception as e:
             print(f"Failed initializing vless configs: {e}")
-
-        # Auto-start servers based on environment variable
-        if AUTO_START_SERVERS:
-            self.auto_start_servers()
 
         self.start_client_expiration_worker()
         self.start_link_health_worker()
@@ -675,7 +679,10 @@ class AmneziaManager:
                     continue
 
                 if not upstream.get("interface"):
-                    upstream["interface"] = f"{server['interface']}-up"
+                    if server.get("protocol") == "vless":
+                        upstream["interface"] = f"vl-{server.get('id', 'vless')}-up"[:15]
+                    else:
+                        upstream["interface"] = f"{server['interface']}-up"
                     updated = True
                 if not upstream.get("config_path"):
                     upstream["config_path"] = os.path.join(
@@ -693,11 +700,11 @@ class AmneziaManager:
                     upstream["client_public_key"] = self.execute_command(f"echo '{upstream['private_key']}' | wg pubkey") or ""
                     updated = True
                 if not upstream.get("table_id"):
-                    try:
-                        table_offset = int(server["id"][:2], 16) % 100
-                    except ValueError:
-                        table_offset = random.randint(1, 99)
-                    upstream["table_id"] = 200 + table_offset
+                    base = 300 if server.get("protocol") == "vless" else 200
+                    upstream["table_id"] = self._allocate_upstream_table_id(base=base)
+                    updated = True
+                if server.get("protocol") == "vless" and not upstream.get("fwmark"):
+                    upstream["fwmark"] = self._allocate_upstream_fwmark()
                     updated = True
 
                 if server.get("linked_failover_mode") not in ("fail_close", "fail_open"):
@@ -732,6 +739,43 @@ class AmneziaManager:
         if isinstance(value, bool):
             return value
         return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    def _allocate_upstream_table_id(self, base=200, span=500):
+        used = set()
+        for server in self.config.get("servers", []):
+            upstream = server.get("upstream") or {}
+            table_id = upstream.get("table_id")
+            try:
+                if table_id:
+                    used.add(int(table_id))
+            except (TypeError, ValueError):
+                continue
+        for candidate in range(int(base), int(base) + int(span)):
+            if candidate not in used:
+                return candidate
+        return int(base) + random.randint(1, int(span) - 1)
+
+    def _allocate_upstream_fwmark(self, base=0xA000, span=0x0FFF):
+        used = set()
+        for server in self.config.get("servers", []):
+            upstream = server.get("upstream") or {}
+            fwmark = upstream.get("fwmark")
+            try:
+                if fwmark:
+                    used.add(int(fwmark))
+            except (TypeError, ValueError):
+                continue
+        for candidate in range(int(base), int(base) + int(span)):
+            if candidate not in used:
+                return candidate
+        return int(base) + random.randint(1, int(span) - 1)
+
+    def _server_has_linked_upstream(self, server):
+        return (
+            bool(server)
+            and server.get("mode") == "edge_linked"
+            and isinstance(server.get("upstream"), dict)
+        )
 
     def _normalize_cidr_list(self, entries):
         cidrs = []
@@ -885,8 +929,11 @@ class AmneziaManager:
         """Switch linked server egress between upstream and local."""
         if target_state not in ("upstream", "local"):
             return False
-        if server.get("mode") != "edge_linked":
+        if not self._server_has_linked_upstream(server):
             return False
+
+        if server.get("protocol") == "vless":
+            return self.switch_vless_egress(server, target_state)
 
         interface = server.get("interface")
         subnet = server.get("subnet")
@@ -914,14 +961,43 @@ class AmneziaManager:
         print(f"Linked server {server.get('name')} switched routing to {target_state}")
         return True
 
+    def switch_vless_egress(self, server, target_state):
+        upstream_interface = ((server.get("upstream") or {}).get("interface"))
+        if target_state == "upstream":
+            if not upstream_interface:
+                return False
+            if not self.start_upstream_link(server):
+                if server.get("linked_failover_mode") == "fail_open":
+                    self.cleanup_vless_upstream_routing(server)
+                    server["routing_state"] = "local"
+                    server["egress_interface"] = "eth+"
+                else:
+                    self.configure_vless_fail_closed_routing(server)
+                    server["routing_state"] = "upstream"
+                    server["egress_interface"] = upstream_interface
+                    self.save_config()
+                    self._write_xray_config()
+                return server.get("linked_failover_mode") != "fail_open"
+            server["egress_interface"] = upstream_interface
+            server["routing_state"] = "upstream"
+        else:
+            self.cleanup_vless_upstream_routing(server)
+            server["egress_interface"] = "eth+"
+            server["routing_state"] = "local"
+
+        self.save_config()
+        self._write_xray_config()
+        print(f"Linked VLESS server {server.get('name')} switched routing to {target_state}")
+        return True
+
     def link_health_worker(self):
         """Monitor linked servers and apply failover policy."""
         while not self.stop_expiration_worker.is_set():
             try:
                 for server in self.config.get("servers", []):
-                    if server.get("mode") != "edge_linked":
+                    if not self._server_has_linked_upstream(server):
                         continue
-                    if not self.is_interface_running(server.get("interface")):
+                    if server.get("protocol") != "vless" and not self.is_interface_running(server.get("interface")):
                         continue
 
                     failover_mode = server.get("linked_failover_mode", "fail_close")
@@ -936,6 +1012,13 @@ class AmneziaManager:
                             self.switch_server_egress(server, "local")
                             print(f"Linked health degraded for {server.get('name')}, switched to local egress")
                         elif failover_mode == "fail_close":
+                            if server.get("protocol") == "vless":
+                                self.configure_vless_fail_closed_routing(server)
+                                if server.get("routing_state") != "upstream":
+                                    server["routing_state"] = "upstream"
+                                    server["egress_interface"] = (server.get("upstream") or {}).get("interface")
+                                    self.save_config()
+                                    self._write_xray_config()
                             print(f"Linked health degraded for {server.get('name')} (fail_close active)")
             except Exception as e:
                 print(f"Failed linked health check: {e}")
@@ -1003,8 +1086,21 @@ class AmneziaManager:
         """Auto-start servers that have config files and were running before"""
         print("Checking for existing servers to auto-start...")
         for server in self.config.get("servers", []):
-            # Only WireGuard/AmneziaWG servers are started by this container.
-            if server.get("protocol") != "wireguard":
+            if server.get("protocol") == "vless":
+                if self._server_has_linked_upstream(server) and server.get("auto_start", True):
+                    print(f"Auto-starting VLESS upstream link: {server.get('name')}")
+                    if self.start_upstream_link(server):
+                        server["routing_state"] = "upstream"
+                        server["egress_interface"] = (server.get("upstream") or {}).get("interface")
+                    elif server.get("linked_failover_mode") == "fail_open":
+                        self.cleanup_vless_upstream_routing(server)
+                        server["routing_state"] = "local"
+                        server["egress_interface"] = "eth+"
+                    else:
+                        self.configure_vless_fail_closed_routing(server)
+                        server["routing_state"] = "upstream"
+                        server["egress_interface"] = (server.get("upstream") or {}).get("interface")
+                    self.save_config()
                 continue
 
             config_path = server.get("config_path")
@@ -1401,7 +1497,7 @@ class AmneziaManager:
             # - Disable basic auth for this location, otherwise clients get 401 and never reach xray.
             lines.append(f"location ^~ {path} {{")
             lines.append("    auth_basic off;")
-            lines.append(f"    proxy_pass http://xray:{int(inbound_port)};")
+            lines.append(f"    proxy_pass http://{XRAY_UPSTREAM_HOST}:{int(inbound_port)};")
             lines.append("    proxy_http_version 1.1;")
             lines.append("    proxy_buffering off;")
             lines.append("    proxy_request_buffering off;")
@@ -1541,6 +1637,10 @@ class AmneziaManager:
         if not server or server.get("protocol") != "vless":
             return warnings
         vless = server.get("vless") or {}
+        if self._server_has_linked_upstream(server) and XRAY_UPSTREAM_HOST not in ("127.0.0.1", "localhost"):
+            warnings.append(
+                "Linked VLESS via AmneziaWG requires Xray to share the web-ui network namespace; set XRAY_UPSTREAM_HOST=127.0.0.1 and use the updated docker-compose.yml."
+            )
         if self._vless_is_reality(vless) and vless.get("use_stream"):
             ssl_domain = os.getenv("SSL_DOMAIN", "").strip().lower()
             vless_domain = str(vless.get("domain") or "").strip().lower()
@@ -1579,7 +1679,7 @@ class AmneziaManager:
         upstream_blocks = []
         for port in sorted(port_set):
             upstream_blocks.append(
-                f"    upstream xray_{port} {{\n        server xray:{port};\n    }}"
+                f"    upstream xray_{port} {{\n        server {XRAY_UPSTREAM_HOST}:{port};\n    }}"
             )
 
         map_body = "\n".join(map_lines) if map_lines else ""
@@ -1613,6 +1713,22 @@ class AmneziaManager:
         - REALITY: xhttp or tcp/raw + security reality; TLS-like handshakes are handled by Xray.
         """
         inbounds = []
+        outbounds = [
+            {
+                "protocol": "freedom",
+                "settings": {"domainStrategy": "UseIP"},
+                "tag": "direct",
+                # BBR on the outbound socket stabilises throughput for exit-to-internet
+                # traffic; TFO reduces RTT for repeat connections to popular origins.
+                "streamSettings": {
+                    "sockopt": {
+                        "tcpcongestion": "bbr",
+                        "tcpFastOpen": True,
+                    }
+                },
+            }
+        ]
+        routing_rules = []
         for server in self.config.get("servers", []):
             if server.get("protocol") != "vless":
                 continue
@@ -1714,8 +1830,9 @@ class AmneziaManager:
                     "sockopt": dict(common_sockopt),
                 }
 
+            inbound_tag = f"vless-{server.get('id')}"
             inbounds.append({
-                "tag": f"vless-{server.get('id')}",
+                "tag": inbound_tag,
                 "listen": "0.0.0.0",
                 "port": int(inbound_port),
                 "protocol": "vless",
@@ -1725,6 +1842,31 @@ class AmneziaManager:
                 },
                 "streamSettings": stream_settings,
             })
+
+            if self._server_has_linked_upstream(server):
+                outbound_tag = "direct"
+                if server.get("routing_state", "upstream") == "upstream":
+                    upstream = server.get("upstream") or {}
+                    fwmark = int(upstream.get("fwmark") or upstream.get("table_id") or 0)
+                    if fwmark:
+                        outbound_tag = f"{inbound_tag}-awg"
+                        outbounds.append({
+                            "protocol": "freedom",
+                            "settings": {"domainStrategy": "UseIP"},
+                            "tag": outbound_tag,
+                            "streamSettings": {
+                                "sockopt": {
+                                    "mark": fwmark,
+                                    "tcpcongestion": "bbr",
+                                    "tcpFastOpen": True,
+                                }
+                            },
+                        })
+                routing_rules.append({
+                    "type": "field",
+                    "inboundTag": [inbound_tag],
+                    "outboundTag": outbound_tag,
+                })
 
         config = {
             "log": {"loglevel": "warning"},
@@ -1741,22 +1883,13 @@ class AmneziaManager:
                 "queryStrategy": "UseIP",
             },
             "inbounds": inbounds,
-            "outbounds": [
-                {
-                    "protocol": "freedom",
-                    "settings": {"domainStrategy": "UseIP"},
-                    "tag": "direct",
-                    # BBR on the outbound socket stabilises throughput for exit-to-internet
-                    # traffic; TFO reduces RTT for repeat connections to popular origins.
-                    "streamSettings": {
-                        "sockopt": {
-                            "tcpcongestion": "bbr",
-                            "tcpFastOpen": True,
-                        }
-                    },
-                }
-            ],
+            "outbounds": outbounds,
         }
+        if routing_rules:
+            config["routing"] = {
+                "domainStrategy": "IPIfNonMatch",
+                "rules": routing_rules,
+            }
 
         try:
             os.makedirs(XRAY_CONFIG_DIR, exist_ok=True)
@@ -1774,12 +1907,14 @@ class AmneziaManager:
         )
         if transport == "xhttp":
             path = self._normalize_vless_path(server_data.get("path"))
-            mode = self._normalize_xhttp_mode(server_data.get("xhttp_mode") or server_data.get("mode"))
+            legacy_mode = str(server_data.get("mode") or "").strip().lower()
+            legacy_xhttp_mode = legacy_mode if legacy_mode not in ("standalone", "edge_linked") else ""
+            xhttp_mode = self._normalize_xhttp_mode(server_data.get("xhttp_mode") or legacy_xhttp_mode)
             host = self._validate_domain(server_data.get("host") or domain)
         else:
             raw_path = str(server_data.get("path") or "").strip()
             path = self._normalize_vless_path(raw_path) if raw_path else ""
-            mode = ""
+            xhttp_mode = ""
             host = domain
         flow_raw = server_data.get("flow")
         if transport == "tcp" and flow_raw is None:
@@ -1825,6 +1960,28 @@ class AmneziaManager:
         use_stream = bool(server_data.get("use_stream", True))
 
         server_id = str(uuid.uuid4())[:6]
+        server_mode = str(server_data.get("mode", "standalone")).strip().lower()
+        if server_mode not in ("standalone", "edge_linked"):
+            raise ValueError("mode must be 'standalone' or 'edge_linked'")
+        auto_start = self._to_bool(server_data.get("auto_start"), True)
+        upstream_config = None
+        failover_mode = None
+        routing_state = None
+        egress_interface = "eth+"
+        upstream_mtu = DEFAULT_MTU
+        if server_mode == "edge_linked":
+            upstream_interface = f"vl-{server_id}-up"[:15]
+            upstream_config, failover_mode, upstream_mtu, _ = self.build_imported_upstream_config(
+                server_id=server_id,
+                upstream_interface=upstream_interface,
+                upstream_data=server_data.get("upstream") or {},
+                mtu=DEFAULT_MTU,
+                table_base=300,
+                include_fwmark=True,
+            )
+            routing_state = "upstream"
+            egress_interface = upstream_interface
+
         subscription_id = self._generate_subscription_id()
         if use_stream:
             inbound_port = self._allocate_xray_stream_inbound_port()
@@ -1842,6 +1999,13 @@ class AmneziaManager:
             "status": "ready",
             "public_ip": self.public_ip,
             "created_at": time.time(),
+            "mode": server_mode,
+            "auto_start": auto_start,
+            "upstream": upstream_config,
+            "egress_interface": egress_interface,
+            "linked_failover_mode": failover_mode,
+            "routing_state": routing_state,
+            "mtu": upstream_mtu,
             "clients": [],
             # Location metadata used by the multi-server subscription endpoint.
             "country_code": country_code,
@@ -1854,7 +2018,7 @@ class AmneziaManager:
                 "port": client_port,
                 "client_port": client_port,
                 "path": path,
-                "mode": mode,
+                "mode": xhttp_mode,
                 "host": host,
                 "security": "reality",
                 "transport": transport,
@@ -1878,6 +2042,29 @@ class AmneziaManager:
 
         self.config["servers"].append(server_config)
         self.save_config()
+
+        if upstream_config:
+            with open(upstream_config["config_path"], "w") as f:
+                f.write(self.generate_upstream_config_content(upstream_config, upstream_mtu))
+            if auto_start:
+                if self.start_upstream_link(server_config):
+                    server_config["routing_state"] = "upstream"
+                    server_config["egress_interface"] = upstream_config["interface"]
+                elif failover_mode == "fail_open":
+                    self.cleanup_vless_upstream_routing(server_config)
+                    server_config["routing_state"] = "local"
+                    server_config["egress_interface"] = "eth+"
+                else:
+                    self.configure_vless_fail_closed_routing(server_config)
+                    server_config["routing_state"] = "upstream"
+                    server_config["egress_interface"] = upstream_config["interface"]
+                self.save_config()
+            else:
+                self.configure_vless_fail_closed_routing(server_config)
+                server_config["routing_state"] = "upstream"
+                server_config["egress_interface"] = upstream_config["interface"]
+                self.save_config()
+
         self._write_xray_config()
         self._write_vless_nginx_locations()
         self._write_vless_stream_config()
@@ -3298,6 +3485,101 @@ class AmneziaManager:
 
         return interface_data, peer_data
 
+    def build_imported_upstream_config(
+        self,
+        *,
+        server_id,
+        upstream_interface,
+        upstream_data,
+        mtu,
+        table_base=200,
+        include_fwmark=False,
+    ):
+        failover_mode = str(upstream_data.get("failover_mode", "fail_close")).strip().lower()
+        if failover_mode not in ("fail_close", "fail_open"):
+            raise ValueError("upstream.failover_mode must be fail_close or fail_open")
+
+        import_config_text = str(upstream_data.get("import_config", "")).strip()
+        if not import_config_text:
+            raise ValueError("Linked Edge mode requires imported EU client config")
+
+        split_ru_local = self._to_bool(upstream_data.get("split_ru_local"), True)
+        imported_obfuscation = {}
+        interface_cfg, peer_cfg = self.parse_amnezia_config_text(import_config_text)
+        endpoint_value = peer_cfg.get("Endpoint", "")
+        public_key_value = peer_cfg.get("PublicKey", "")
+        allowed_ips_value = peer_cfg.get("AllowedIPs", "0.0.0.0/0")
+        local_address_value = interface_cfg.get("Address", "172.31.254.2/30")
+        try:
+            keepalive_value = int(peer_cfg.get("PersistentKeepalive", 25))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("PersistentKeepalive in imported config must be integer") from exc
+        if keepalive_value < 1 or keepalive_value > 120:
+            raise ValueError("PersistentKeepalive must be between 1 and 120")
+
+        try:
+            imported_mtu = int(interface_cfg.get("MTU", mtu))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("MTU in imported config must be integer") from exc
+        if imported_mtu < 1280 or imported_mtu > 1440:
+            raise ValueError("MTU in imported config must be between 1280 and 1440")
+        mtu = imported_mtu
+
+        for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
+            if key in interface_cfg and str(interface_cfg.get(key)).strip():
+                try:
+                    imported_obfuscation[key] = int(str(interface_cfg[key]).strip())
+                except ValueError as exc:
+                    raise ValueError(f"Invalid upstream obfuscation value for {key}") from exc
+        if len(imported_obfuscation) != 9:
+            raise ValueError("Imported config must include all obfuscation parameters (Jc..H4)")
+        imported_obfuscation = self.validate_obfuscation_params(imported_obfuscation, mtu)
+
+        endpoint_host, endpoint_port = self.parse_endpoint(endpoint_value, DEFAULT_PORT)
+        if not endpoint_host or not endpoint_port:
+            raise ValueError("For edge_linked mode, upstream endpoint must be in host:port format")
+        if endpoint_port < 1 or endpoint_port > 65535:
+            raise ValueError("Upstream endpoint port must be between 1 and 65535")
+        if not public_key_value:
+            raise ValueError("For edge_linked mode, upstream public key is required")
+        try:
+            ipaddress.ip_interface(local_address_value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid upstream local_address: {local_address_value}") from exc
+
+        upstream_keys = self.generate_wireguard_keys()
+        upstream_private_key = (
+            interface_cfg.get("PrivateKey", "")
+            or str(upstream_data.get("private_key", "")).strip()
+            or upstream_keys["private_key"]
+        )
+        upstream_client_public_key = str(upstream_data.get("client_public_key", "")).strip()
+        if not upstream_client_public_key:
+            if upstream_private_key:
+                upstream_client_public_key = self.execute_command(f"echo '{upstream_private_key}' | wg pubkey") or ""
+            else:
+                upstream_client_public_key = upstream_keys["public_key"]
+
+        upstream_config = {
+            "interface": upstream_interface,
+            "config_path": os.path.join(WIREGUARD_CONFIG_DIR, f"{upstream_interface}.conf"),
+            "endpoint": f"{endpoint_host}:{endpoint_port}",
+            "public_key": public_key_value,
+            "private_key": upstream_private_key,
+            "client_public_key": upstream_client_public_key,
+            "preshared_key": peer_cfg.get("PresharedKey", ""),
+            "allowed_ips": allowed_ips_value,
+            "local_address": local_address_value,
+            "persistent_keepalive": keepalive_value,
+            "obfuscation_enabled": True,
+            "obfuscation_params": imported_obfuscation,
+            "table_id": self._allocate_upstream_table_id(base=table_base),
+            "split_ru_local": split_ru_local,
+        }
+        if include_fwmark:
+            upstream_config["fwmark"] = self._allocate_upstream_fwmark()
+        return upstream_config, failover_mode, mtu, imported_obfuscation
+
     def generate_upstream_config_content(self, upstream, mtu):
         config = f"""[Interface]
 PrivateKey = {upstream['private_key']}
@@ -3332,6 +3614,9 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
 
     def configure_upstream_routing(self, server):
         """Route server subnet traffic through upstream interface."""
+        if server.get("protocol") == "vless":
+            return self.configure_vless_upstream_routing(server)
+
         upstream = server.get("upstream") or {}
         table_id = int(upstream.get("table_id", 200))
         server_subnet = server["subnet"]
@@ -3374,13 +3659,128 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         )
         return True
 
+    def _vless_upstream_route_context(self, server):
+        upstream = server.get("upstream") or {}
+        table_id = int(upstream.get("table_id", 300))
+        fwmark = int(upstream.get("fwmark") or table_id)
+        upstream_interface = upstream.get("interface")
+        endpoint_host, endpoint_port = self.parse_endpoint(upstream.get("endpoint"), DEFAULT_PORT)
+        endpoint_ip = self.resolve_ipv4(endpoint_host) if endpoint_host else None
+        endpoint_ip = endpoint_ip or endpoint_host
+        gateway, default_device = self.get_default_route_info()
+        return upstream, table_id, fwmark, upstream_interface, endpoint_host, endpoint_port, endpoint_ip, gateway, default_device
+
+    def _install_vless_mark_rule(self, fwmark, table_id):
+        priority = 10000 + int(table_id)
+        self.execute_command(
+            f"ip rule add fwmark {int(fwmark)} table {int(table_id)} priority {priority} 2>/dev/null || true"
+        )
+
+    def _install_vless_endpoint_route(self, endpoint_ip, gateway, default_device):
+        if not endpoint_ip:
+            return
+        if default_device:
+            if gateway:
+                self.execute_command(f"ip route replace {endpoint_ip}/32 via {gateway} dev {default_device}")
+            else:
+                self.execute_command(f"ip route replace {endpoint_ip}/32 dev {default_device}")
+        elif gateway:
+            self.execute_command(f"ip route replace {endpoint_ip}/32 via {gateway}")
+
+    def _install_vless_ru_split_routes(self, table_id, gateway, default_device, split_ru_local):
+        ru_route_count = 0
+        if split_ru_local and default_device and self.ru_split_cidrs:
+            for cidr in self.ru_split_cidrs:
+                if gateway:
+                    self.execute_command(f"ip route replace {cidr} via {gateway} dev {default_device} table {int(table_id)}")
+                else:
+                    self.execute_command(f"ip route replace {cidr} dev {default_device} table {int(table_id)}")
+                ru_route_count += 1
+        return ru_route_count
+
+    def configure_vless_upstream_routing(self, server):
+        """Route Xray-marked VLESS egress through the imported AWG upstream."""
+        (
+            upstream, table_id, fwmark, upstream_interface, endpoint_host,
+            endpoint_port, endpoint_ip, gateway, default_device
+        ) = self._vless_upstream_route_context(server)
+        if not upstream_interface or not endpoint_host:
+            return False
+
+        self._install_vless_mark_rule(fwmark, table_id)
+        self.execute_command(f"ip route replace default dev {upstream_interface} table {table_id}")
+        self._install_vless_endpoint_route(endpoint_ip, gateway, default_device)
+
+        split_ru_local = self._to_bool(upstream.get("split_ru_local"), True)
+        ru_route_count = self._install_vless_ru_split_routes(
+            table_id, gateway, default_device, split_ru_local
+        )
+
+        # Marked packets are created by Xray itself, not by a WG client subnet.
+        # Masquerade them on the AWG uplink so the EU peer sees the tunnel IP.
+        self.execute_command(
+            "iptables -t nat -C POSTROUTING "
+            f"-m mark --mark {fwmark} -o {upstream_interface} -j MASQUERADE "
+            "2>/dev/null || "
+            "iptables -t nat -A POSTROUTING "
+            f"-m mark --mark {fwmark} -o {upstream_interface} -j MASQUERADE"
+        )
+        print(
+            f"VLESS upstream routing configured: server={server.get('name')}, "
+            f"table={table_id}, mark={fwmark}, endpoint={endpoint_host}:{endpoint_port}, "
+            f"iface={upstream_interface}, split_ru_local={split_ru_local}, ru_routes={ru_route_count}"
+        )
+        return True
+
+    def configure_vless_fail_closed_routing(self, server):
+        """Keep linked VLESS from leaking direct if the AWG upstream is down."""
+        (
+            upstream, table_id, fwmark, upstream_interface, endpoint_host,
+            endpoint_port, endpoint_ip, gateway, default_device
+        ) = self._vless_upstream_route_context(server)
+        if not upstream_interface:
+            return False
+        self._install_vless_mark_rule(fwmark, table_id)
+        self.execute_command(f"ip route replace blackhole default table {table_id}")
+        self._install_vless_endpoint_route(endpoint_ip, gateway, default_device)
+        split_ru_local = self._to_bool(upstream.get("split_ru_local"), True)
+        ru_route_count = self._install_vless_ru_split_routes(
+            table_id, gateway, default_device, split_ru_local
+        )
+        print(
+            f"VLESS fail-close routing configured: server={server.get('name')}, "
+            f"table={table_id}, mark={fwmark}, split_ru_local={split_ru_local}, "
+            f"ru_routes={ru_route_count}"
+        )
+        return True
+
     def cleanup_upstream_routing(self, server):
+        if server.get("protocol") == "vless":
+            return self.cleanup_vless_upstream_routing(server)
+
         upstream = server.get("upstream") or {}
         table_id = int(upstream.get("table_id", 200))
         server_subnet = server.get("subnet")
         if server_subnet:
             self.execute_command(f"ip rule del from {server_subnet} table {table_id} priority {10000 + table_id} 2>/dev/null || true")
         self.execute_command(f"ip route flush table {table_id} 2>/dev/null || true")
+        return True
+
+    def cleanup_vless_upstream_routing(self, server):
+        upstream = server.get("upstream") or {}
+        table_id = int(upstream.get("table_id", 300))
+        fwmark = int(upstream.get("fwmark") or table_id)
+        upstream_interface = upstream.get("interface")
+        self.execute_command(
+            f"ip rule del fwmark {fwmark} table {table_id} priority {10000 + table_id} 2>/dev/null || true"
+        )
+        self.execute_command(f"ip route flush table {table_id} 2>/dev/null || true")
+        if upstream_interface:
+            self.execute_command(
+                "iptables -t nat -D POSTROUTING "
+                f"-m mark --mark {fwmark} -o {upstream_interface} -j MASQUERADE "
+                "2>/dev/null || true"
+            )
         return True
 
     def start_upstream_link(self, server):
@@ -3706,6 +4106,11 @@ H4 = {obfuscation_params['H4']}
             return False
 
         if server.get("protocol") == "vless":
+            if self._server_has_linked_upstream(server):
+                self.stop_upstream_link(server)
+            upstream_conf_path = ((server.get("upstream") or {}).get("config_path"))
+            if upstream_conf_path and os.path.exists(upstream_conf_path):
+                os.remove(upstream_conf_path)
             # Remove all clients associated with this server
             self.config["clients"] = {
                 k: v for k, v in self.config.get("clients", {}).items()
@@ -4162,7 +4567,7 @@ PersistentKeepalive = {keepalive}
         server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
         if not server:
             return False, "Server not found"
-        if server.get("mode") != "edge_linked":
+        if not self._server_has_linked_upstream(server):
             return False, "Failover mode can be changed only for linked servers"
 
         mode_value = str(new_mode or "").strip().lower()
@@ -4171,12 +4576,17 @@ PersistentKeepalive = {keepalive}
 
         server["linked_failover_mode"] = mode_value
 
-        # Apply immediately for running servers.
-        if self.is_interface_running(server.get("interface")):
+        # Apply immediately for running WireGuard servers and always-on VLESS.
+        if server.get("protocol") == "vless" or self.is_interface_running(server.get("interface")):
             healthy, _ = self.is_upstream_healthy(server)
             if mode_value == "fail_close":
                 if healthy:
                     self.switch_server_egress(server, "upstream")
+                elif server.get("protocol") == "vless":
+                    self.configure_vless_fail_closed_routing(server)
+                    server["routing_state"] = "upstream"
+                    server["egress_interface"] = (server.get("upstream") or {}).get("interface")
+                    self._write_xray_config()
             else:
                 if not healthy:
                     self.switch_server_egress(server, "local")
@@ -4795,6 +5205,11 @@ def get_server_info(server_id):
             "public_ip": server.get("public_ip"),
             "clients_count": len(server.get("clients", [])),
             "created_at": server.get("created_at"),
+            "mode": server.get("mode", "standalone"),
+            "egress_interface": server.get("egress_interface", "eth+"),
+            "linked_failover_mode": server.get("linked_failover_mode"),
+            "routing_state": server.get("routing_state"),
+            "upstream": server.get("upstream"),
             "vless": vless,
         })
 
@@ -4858,6 +5273,19 @@ def get_servers():
         if server.get("protocol") == "vless":
             if "status" not in server:
                 server["status"] = "ready"
+            if amnezia_manager._server_has_linked_upstream(server):
+                if "linked_failover_mode" not in server or server["linked_failover_mode"] not in ("fail_close", "fail_open"):
+                    server["linked_failover_mode"] = "fail_close"
+                if "routing_state" not in server or server["routing_state"] not in ("upstream", "local"):
+                    server["routing_state"] = "upstream"
+                expected_egress = "eth+" if server["routing_state"] == "local" else ((server.get("upstream") or {}).get("interface"))
+                server["egress_interface"] = expected_egress or "eth+"
+            else:
+                server["mode"] = "standalone"
+                server["upstream"] = None
+                server["linked_failover_mode"] = None
+                server["routing_state"] = None
+                server["egress_interface"] = "eth+"
             continue
         if "mode" not in server:
             server["mode"] = "standalone"
