@@ -1643,10 +1643,11 @@ class AmneziaManager:
             )
         if self._vless_is_reality(vless) and vless.get("use_stream"):
             ssl_domain = os.getenv("SSL_DOMAIN", "").strip().lower()
+            ssl_email = os.getenv("SSL_EMAIL", "").strip()
             vless_domain = str(vless.get("domain") or "").strip().lower()
-            if not ssl_domain:
+            if NGINX_PORT == "443" and (not ssl_domain or not ssl_email):
                 warnings.append(
-                    "Port 443 stream routing needs SSL_DOMAIN configured so nginx HTTP moves to internal :4443."
+                    "Port 443 stream routing needs both SSL_DOMAIN and SSL_EMAIL configured so nginx HTTP moves to internal :4443 and nginx stream can own external :443."
                 )
             elif self._vless_reality_profile(vless) == "own_domain" and vless_domain and ssl_domain != vless_domain:
                 warnings.append(
@@ -1839,6 +1840,10 @@ class AmneziaManager:
                 "settings": {
                     "clients": clients,
                     "decryption": "none"
+                },
+                "sniffing": {
+                    "enabled": True,
+                    "destOverride": ["http", "tls", "quic"],
                 },
                 "streamSettings": stream_settings,
             })
@@ -2375,6 +2380,7 @@ class AmneziaManager:
                     f"fp={quote(fp, safe='')}",
                     f"pbk={quote(pbk, safe='')}",
                     f"sid={quote(sid, safe='')}",
+                    f"spx={quote(vless.get('reality_spiderx') or '/', safe='')}",
                 ]
                 if flow:
                     parts.append(f"flow={quote(flow, safe='')}")
