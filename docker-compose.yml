@@ -10,9 +10,6 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      # Direct VLESS+REALITY+XHTTP/TCP (when use_stream=false).
-      # Xray shares this container's network namespace, so direct ports are published here.
-      - "8443-8642:8443-8642/tcp"
       # WireGuard/AmneziaWG ports (example; keep/adjust as needed)
       - "43457:43457/udp"
       - "45297:45297/udp"
@@ -40,14 +37,23 @@ services:
       - SSL_EMAIL=${SSL_EMAIL:-}
       - SSL_DOMAIN=${SSL_DOMAIN:-}
       - AUTO_START_SERVERS=true
-      - XRAY_BASE_PORT=8443
       # Internal-only ports for stream-routed REALITY inbounds (port-443 whitelist bypass mode).
       # nginx stream proxies from external :443 to xray:9443+ by SNI — no host-port publishing needed.
       - XRAY_STREAM_BASE_PORT=9443
       # Xray shares the web-ui network namespace so linked VLESS can use AWG policy routing.
       - XRAY_UPSTREAM_HOST=127.0.0.1
-      # Own-domain REALITY fallback target from the xray container to web-ui nginx HTTPS.
-      - XRAY_REALITY_FALLBACK_TARGET=${XRAY_REALITY_FALLBACK_TARGET:-web-ui:4443}
+      # Own-domain REALITY fallback target. Xray shares web-ui's network namespace,
+      # so localhost is the most reliable path to nginx HTTPS on internal :4443.
+      - XRAY_REALITY_FALLBACK_TARGET=${XRAY_REALITY_FALLBACK_TARGET:-127.0.0.1:4443}
+      # Restrictive-network defaults: prefer IPv4, avoid TCP Fast Open unless
+      # the host/network is known to handle it cleanly.
+      - XRAY_DNS_QUERY_STRATEGY=${XRAY_DNS_QUERY_STRATEGY:-UseIPv4}
+      - XRAY_DOMAIN_STRATEGY=${XRAY_DOMAIN_STRATEGY:-UseIPv4}
+      - XRAY_TCP_FAST_OPEN=${XRAY_TCP_FAST_OPEN:-false}
+      - XRAY_TCP_MAX_SEG=${XRAY_TCP_MAX_SEG:-0}
+      - XRAY_REALITY_MAX_TIME_DIFF_MS=${XRAY_REALITY_MAX_TIME_DIFF_MS:-70000}
+      - XRAY_REALITY_SHORT_ID_BYTES=${XRAY_REALITY_SHORT_ID_BYTES:-8}
+      - XRAY_WS_EARLY_DATA_BYTES=${XRAY_WS_EARLY_DATA_BYTES:-2560}
       # MemeVPN multi-server subscription branding & cadence.
       - MEMEVPN_BRAND=${MEMEVPN_BRAND:-MemeVPN}
       - MEMEVPN_SUB_UPDATE_HOURS=${MEMEVPN_SUB_UPDATE_HOURS:-24}
@@ -116,5 +122,6 @@ services:
             sleep 2
           fi
         done
-    # Xray shares web-ui's network namespace. Do not publish ports here; direct VLESS
-    # ports are published by web-ui, and stream-routed ports stay internal.
+    # Xray shares web-ui's network namespace. Do not publish ports here; VLESS is
+    # always reached through nginx stream on external TCP :443, while Xray's
+    # 9443+ inbounds stay internal.

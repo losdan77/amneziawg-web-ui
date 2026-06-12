@@ -66,9 +66,9 @@
                         <label class="block text-sm font-medium text-gray-700">Protocol *</label>
                         <select id="serverProtocol" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
                             <option value="wireguard">AmneziaWG (WireGuard)</option>
-                            <option value="vless">VLESS + REALITY + XHTTP (Xray)</option>
+                            <option value="vless">VLESS (Xray)</option>
                         </select>
-                        <p class="text-gray-500 text-xs mt-1">WireGuard is managed by this UI. VLESS uses the Xray container (REALITY TLS + XHTTP).</p>
+                        <p class="text-gray-500 text-xs mt-1">WireGuard is managed by this UI. VLESS uses the Xray container (TCP/REALITY, XHTTP/REALITY, or WebSocket/TLS).</p>
                     </div>
                     <div id="vlessSubscriptionHint" class="hidden">
                         <label class="block text-sm font-medium text-gray-700">Subscription</label>
@@ -77,7 +77,7 @@
                 </div>
 
                 <div id="vlessFields" class="border rounded-lg p-4 bg-gray-50 hidden">
-                    <h3 class="text-lg font-medium mb-3">VLESS + REALITY + XHTTP</h3>
+                    <h3 class="text-lg font-medium mb-3">VLESS Transport</h3>
 
                     <!-- Location / branding (multi-server subscription) -->
                     <div class="mb-4 p-3 rounded-lg bg-emerald-50 border border-emerald-200">
@@ -126,15 +126,15 @@
                         </p>
                     </div>
 
-                    <!-- Port 443 stream routing toggle -->
+                    <!-- Port 443 stream routing is mandatory for VLESS -->
                     <div class="mb-4 p-3 rounded-lg bg-blue-50 border border-blue-200">
-                        <label class="inline-flex items-center text-sm font-medium text-blue-800">
-                            <input type="checkbox" id="vlessUseStream" checked class="mr-2 h-4 w-4">
+                        <div class="text-sm font-medium text-blue-800">
+                            <input type="hidden" id="vlessUseStream" value="true">
                             Использовать порт 443 (обход SNI-based белых списков)
-                        </label>
+                        </div>
                         <p class="text-blue-700 text-xs mt-1">
                             <strong>Рекомендуется.</strong> nginx stream проксирует внешний :443 к Xray по SNI. Нужен SSL (SSL_DOMAIN).
-                            Обходит ISP, которые фильтруют по SNI-имени, но не по IP. Без галочки — Xray слушает на 8443+.
+                            Все VLESS-клиенты получают внешний TCP-порт 443; внутренние Xray-порты 9443+ наружу не публикуются.
                         </p>
                     </div>
 
@@ -143,11 +143,12 @@
                         <select id="vlessTransport" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
                             <option value="tcp" selected>TCP / RAW + REALITY (competitor-like)</option>
                             <option value="xhttp">XHTTP + REALITY (previous mode)</option>
+                            <option value="ws">WebSocket + TLS (competitor-like fallback)</option>
                         </select>
-                        <p class="text-gray-500 text-xs mt-1">HAPP shows this as Network: TCP when the generated link uses type=tcp.</p>
+                        <p class="text-gray-500 text-xs mt-1">HAPP shows TCP/Reality or WebSocket/TLS from the generated VLESS link.</p>
                     </div>
 
-                    <div class="mb-4">
+                    <div id="vlessRealityProfileWrap" class="mb-4">
                         <label class="block text-sm font-medium text-gray-700">REALITY profile</label>
                         <select id="vlessRealityProfile" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
                             <option value="own_domain" selected>Own domain + nginx fallback (Ultimate-like)</option>
@@ -247,7 +248,6 @@
 
                     <p class="text-gray-500 text-xs mt-3">
                         <strong>Режим stream (порт 443):</strong> никаких дополнительных правил файрвола не нужно — трафик идёт через уже открытый :443.
-                        <strong>Режим direct (порт 8443+):</strong> откройте порт, показанный на карточке сервера (docker-compose публикует 8443–8642 к Xray).
                         Подписка и QR совместимы с HAPP / v2rayNG / Nekoray.
                     </p>
                     <div class="mt-4 p-3 rounded-lg bg-emerald-50 border border-emerald-200">

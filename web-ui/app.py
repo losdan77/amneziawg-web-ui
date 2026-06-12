@@ -59,6 +59,16 @@ MEMEVPN_SUB_UPDATE_HOURS = int(os.getenv('MEMEVPN_SUB_UPDATE_HOURS', '24'))
 HAPP_HIDE_SERVER_SETTINGS = os.getenv('HAPP_HIDE_SERVER_SETTINGS', 'true').lower() == 'true'
 HAPP_PROVIDER_ID = os.getenv('HAPP_PROVIDER_ID', '').strip()
 
+# Xray/VLESS hardening knobs. Defaults favor compatibility on restrictive
+# mobile networks; operators can opt into the faster but more brittle options.
+XRAY_DNS_QUERY_STRATEGY = os.getenv('XRAY_DNS_QUERY_STRATEGY', 'UseIPv4').strip() or 'UseIPv4'
+XRAY_DOMAIN_STRATEGY = os.getenv('XRAY_DOMAIN_STRATEGY', 'UseIPv4').strip() or 'UseIPv4'
+XRAY_TCP_FAST_OPEN = os.getenv('XRAY_TCP_FAST_OPEN', 'false').lower() == 'true'
+XRAY_TCP_MAX_SEG = int(os.getenv('XRAY_TCP_MAX_SEG', '0') or '0')
+XRAY_REALITY_MAX_TIME_DIFF_MS = int(os.getenv('XRAY_REALITY_MAX_TIME_DIFF_MS', '70000'))
+XRAY_REALITY_SHORT_ID_BYTES = max(1, min(8, int(os.getenv('XRAY_REALITY_SHORT_ID_BYTES', '8') or '8')))
+XRAY_WS_EARLY_DATA_BYTES = max(0, min(8192, int(os.getenv('XRAY_WS_EARLY_DATA_BYTES', '2560') or '2560')))
+
 # ── Federation / satellite mode ─────────────────────────────────────────────
 # When SATELLITE_API_KEY is set, this instance exposes an authenticated
 # /api/satellite/* API that a remote "hub" instance can call to provision
@@ -78,7 +88,6 @@ WIREGUARD_CONFIG_DIR = os.path.join(CONFIG_DIR, 'amneziawg')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'web_config.json')
 XRAY_CONFIG_DIR = os.path.join(CONFIG_DIR, 'xray')
 XRAY_CONFIG_FILE = os.path.join(XRAY_CONFIG_DIR, 'config.json')
-XRAY_BASE_PORT = int(os.getenv('XRAY_BASE_PORT', '8443'))
 # Ports 9443-9642: internal-only Xray inbounds for stream-routed (port-443) REALITY servers.
 # These are NOT published to the host; nginx stream proxies from external :443 by SNI.
 XRAY_STREAM_BASE_PORT = int(os.getenv('XRAY_STREAM_BASE_PORT', '9443'))
@@ -89,7 +98,7 @@ NGINX_STREAM_CONFIG_FILE = '/etc/nginx/stream_reality.conf'
 # Xray runs in a sibling Docker service. In own-domain REALITY mode it receives
 # both valid REALITY handshakes and ordinary TLS probes for the same SNI; the
 # latter must fall through to the real nginx HTTPS listener, not loop back to :443.
-REALITY_INTERNAL_FALLBACK_TARGET = os.getenv('XRAY_REALITY_FALLBACK_TARGET', 'web-ui:4443')
+REALITY_INTERNAL_FALLBACK_TARGET = os.getenv('XRAY_REALITY_FALLBACK_TARGET', '127.0.0.1:4443')
 PUBLIC_IP_SERVICE = 'http://ifconfig.me'
 ENABLE_OBFUSCATION = True
 
@@ -592,10 +601,29 @@ class AmneziaManager:
             if (
                 isinstance(vless, dict)
                 and vless.get("reality_profile") == "own_domain"
-                and "reality_fallback_target" not in vless
+                and (
+                    "reality_fallback_target" not in vless
+                    or str(vless.get("reality_fallback_target") or "").strip() == "web-ui:4443"
+                )
             ):
                 vless["reality_fallback_target"] = REALITY_INTERNAL_FALLBACK_TARGET
                 updated = True
+            if isinstance(vless, dict):
+                # New deployments use only external TCP :443 for VLESS. Existing
+                # direct-port servers are converted at metadata level so
+                # regenerated links advertise the stream endpoint too.
+                if not vless.get("use_stream"):
+                    vless["use_stream"] = True
+                    updated = True
+                if server.get("port") != 443:
+                    server["port"] = 443
+                    updated = True
+                if vless.get("port") != 443:
+                    vless["port"] = 443
+                    updated = True
+                if vless.get("client_port") != 443:
+                    vless["client_port"] = 443
+                    updated = True
 
         # Seed top-level keys for the user-level subscription model.
         if "users" not in self.config:
@@ -1247,7 +1275,7 @@ class AmneziaManager:
     def _normalize_vless_path(self, path):
         value = str(path or "").strip()
         if not value:
-            raise ValueError("path is required for VLESS xhttp")
+            raise ValueError("path is required for VLESS HTTP transports")
         if not value.startswith("/"):
             raise ValueError("path must start with '/'")
         if re.search(r"\s", value):
@@ -1271,9 +1299,11 @@ class AmneziaManager:
             "tcp": "tcp",
             "raw": "tcp",
             "xhttp": "xhttp",
+            "ws": "ws",
+            "websocket": "ws",
         }
         if value not in aliases:
-            raise ValueError("transport must be one of: tcp, raw, xhttp")
+            raise ValueError("transport must be one of: tcp, raw, xhttp, ws, websocket")
         return aliases[value]
 
     def _vless_transport(self, vless):
@@ -1456,7 +1486,12 @@ class AmneziaManager:
         return self._parse_x25519_cli_output(out, r.returncode)
 
     def _generate_reality_short_id(self):
-        return secrets.token_hex(4)
+        # Xray allows up to 8 bytes (16 hex chars). Use the full length for new
+        # servers to reduce active-probing guessability without affecting UX.
+        return secrets.token_hex(XRAY_REALITY_SHORT_ID_BYTES)
+
+    def _generate_reality_spiderx(self):
+        return self._generate_random_path()
 
     def _generate_random_path(self):
         """Random URL path that looks like a legit API endpoint."""
@@ -1488,17 +1523,22 @@ class AmneziaManager:
             vless = server.get("vless") or {}
             if self._vless_is_reality(vless):
                 continue
+            transport = self._vless_transport(vless)
             path = vless.get("path")
             inbound_port = vless.get("inbound_port")
             if not path or not inbound_port:
                 continue
             # IMPORTANT:
-            # - Use prefix match (^~) to allow xhttp internal URL variants (e.g. with trailing slash / query).
+            # - Use prefix match (^~) to allow HTTP transport URL variants (e.g. trailing slash / query).
             # - Disable basic auth for this location, otherwise clients get 401 and never reach xray.
             lines.append(f"location ^~ {path} {{")
             lines.append("    auth_basic off;")
             lines.append(f"    proxy_pass http://{XRAY_UPSTREAM_HOST}:{int(inbound_port)};")
             lines.append("    proxy_http_version 1.1;")
+            if transport == "ws":
+                lines.append("    proxy_set_header Upgrade $http_upgrade;")
+                lines.append('    proxy_set_header Connection "upgrade";')
+                lines.append("    proxy_cache off;")
             lines.append("    proxy_buffering off;")
             lines.append("    proxy_request_buffering off;")
             lines.append("    proxy_read_timeout 86400s;")
@@ -1518,23 +1558,6 @@ class AmneziaManager:
 
         # Reload nginx best-effort.
         self.execute_command("nginx -s reload 2>/dev/null || true")
-
-    def _allocate_xray_inbound_port(self):
-        used = set()
-        for server in self.config.get("servers", []):
-            vless = server.get("vless") or {}
-            port = vless.get("inbound_port")
-            if port:
-                try:
-                    used.add(int(port))
-                except ValueError:
-                    continue
-        # Try a small range.
-        for offset in range(0, 200):
-            candidate = XRAY_BASE_PORT + offset
-            if candidate not in used:
-                return candidate
-        raise ValueError("No free xray inbound ports available")
 
     def _allocate_xray_stream_inbound_port(self):
         """Allocate an internal-only port for stream-routed (port 443) REALITY inbounds.
@@ -1641,7 +1664,29 @@ class AmneziaManager:
             warnings.append(
                 "Linked VLESS via AmneziaWG requires Xray to share the web-ui network namespace; set XRAY_UPSTREAM_HOST=127.0.0.1 and use the updated docker-compose.yml."
             )
+        transport = self._vless_transport(vless)
+        if transport == "ws" and not self._vless_is_reality(vless):
+            ssl_domain = os.getenv("SSL_DOMAIN", "").strip().lower()
+            ssl_email = os.getenv("SSL_EMAIL", "").strip()
+            vless_domain = str(vless.get("domain") or "").strip().lower()
+            if NGINX_PORT == "443" and (not ssl_domain or not ssl_email):
+                warnings.append(
+                    "WebSocket+TLS needs SSL_DOMAIN and SSL_EMAIL configured so nginx can terminate HTTPS on internal :4443 behind the external :443 stream listener."
+                )
+            elif vless_domain and ssl_domain != vless_domain:
+                warnings.append(
+                    f"WebSocket+TLS certificate SNI should match the VLESS domain ({vless_domain}); current SSL_DOMAIN is {ssl_domain}."
+                )
         if self._vless_is_reality(vless) and vless.get("use_stream"):
+            short_ids = [
+                str(sid or "").strip()
+                for sid in (vless.get("reality_short_ids") or [vless.get("reality_short_id")])
+                if str(sid or "").strip()
+            ]
+            if any(len(sid) < 16 for sid in short_ids):
+                warnings.append(
+                    "REALITY shortId is shorter than the recommended 8 bytes (16 hex chars). Existing clients keep working, but new/rotated servers should use a full-length shortId."
+                )
             ssl_domain = os.getenv("SSL_DOMAIN", "").strip().lower()
             ssl_email = os.getenv("SSL_EMAIL", "").strip()
             vless_domain = str(vless.get("domain") or "").strip().lower()
@@ -1717,14 +1762,14 @@ class AmneziaManager:
         outbounds = [
             {
                 "protocol": "freedom",
-                "settings": {"domainStrategy": "UseIP"},
+                "settings": {"domainStrategy": XRAY_DOMAIN_STRATEGY},
                 "tag": "direct",
                 # BBR on the outbound socket stabilises throughput for exit-to-internet
-                # traffic; TFO reduces RTT for repeat connections to popular origins.
+                # traffic; TFO is opt-in because some restrictive networks mishandle it.
                 "streamSettings": {
                     "sockopt": {
                         "tcpcongestion": "bbr",
-                        "tcpFastOpen": True,
+                        "tcpFastOpen": XRAY_TCP_FAST_OPEN,
                     }
                 },
             }
@@ -1743,7 +1788,7 @@ class AmneziaManager:
             host = vless.get("host") or domain
             if not inbound_port or not domain:
                 continue
-            if transport == "xhttp" and not path:
+            if transport in ("xhttp", "ws") and not path:
                 continue
 
             clients = []
@@ -1782,8 +1827,10 @@ class AmneziaManager:
                 "tcpcongestion": "bbr",
                 "tcpKeepAliveInterval": 30,
                 "tcpKeepAliveIdle": 300,
-                "tcpFastOpen": True,
+                "tcpFastOpen": XRAY_TCP_FAST_OPEN,
             }
+            if XRAY_TCP_MAX_SEG > 0:
+                common_sockopt["tcpMaxSeg"] = XRAY_TCP_MAX_SEG
 
             if self._vless_is_reality(vless):
                 reality_target = self._vless_reality_target(vless)
@@ -1812,7 +1859,7 @@ class AmneziaManager:
                         # Allow up to 70 s clock drift between client and server.
                         # Without this, a client with a slightly off clock gets silently rejected by
                         # Reality's timestamp check — looks like the VPN "doesn't connect".
-                        "maxTimeDiff": 70000,
+                        "maxTimeDiff": XRAY_REALITY_MAX_TIME_DIFF_MS,
                     },
                     "xhttpSettings": dict(common_xhttp),
                     "sockopt": dict(common_sockopt),
@@ -1824,12 +1871,24 @@ class AmneziaManager:
                         "header": {"type": "none"},
                     }
             else:
-                stream_settings = {
-                    "network": "xhttp",
-                    "security": "none",
-                    "xhttpSettings": dict(common_xhttp),
-                    "sockopt": dict(common_sockopt),
-                }
+                if transport == "ws":
+                    stream_settings = {
+                        "network": "websocket",
+                        "security": "none",
+                        "wsSettings": {
+                            "acceptProxyProtocol": False,
+                            "path": path,
+                            "host": host,
+                        },
+                        "sockopt": dict(common_sockopt),
+                    }
+                else:
+                    stream_settings = {
+                        "network": "xhttp",
+                        "security": "none",
+                        "xhttpSettings": dict(common_xhttp),
+                        "sockopt": dict(common_sockopt),
+                    }
 
             inbound_tag = f"vless-{server.get('id')}"
             inbounds.append({
@@ -1857,13 +1916,13 @@ class AmneziaManager:
                         outbound_tag = f"{inbound_tag}-awg"
                         outbounds.append({
                             "protocol": "freedom",
-                            "settings": {"domainStrategy": "UseIP"},
+                            "settings": {"domainStrategy": XRAY_DOMAIN_STRATEGY},
                             "tag": outbound_tag,
                             "streamSettings": {
                                 "sockopt": {
                                     "mark": fwmark,
                                     "tcpcongestion": "bbr",
-                                    "tcpFastOpen": True,
+                                    "tcpFastOpen": XRAY_TCP_FAST_OPEN,
                                 }
                             },
                         })
@@ -1885,7 +1944,7 @@ class AmneziaManager:
                     {"address": "https://dns.google/dns-query"},
                     "1.1.1.1",
                 ],
-                "queryStrategy": "UseIP",
+                "queryStrategy": XRAY_DNS_QUERY_STRATEGY,
             },
             "inbounds": inbounds,
             "outbounds": outbounds,
@@ -1910,12 +1969,17 @@ class AmneziaManager:
             server_data.get("transport") or server_data.get("network"),
             default="tcp",
         )
-        if transport == "xhttp":
+        if transport in ("xhttp", "ws"):
             path = self._normalize_vless_path(server_data.get("path"))
-            legacy_mode = str(server_data.get("mode") or "").strip().lower()
-            legacy_xhttp_mode = legacy_mode if legacy_mode not in ("standalone", "edge_linked") else ""
-            xhttp_mode = self._normalize_xhttp_mode(server_data.get("xhttp_mode") or legacy_xhttp_mode)
             host = self._validate_domain(server_data.get("host") or domain)
+            if transport == "xhttp":
+                legacy_mode = str(server_data.get("mode") or "").strip().lower()
+                legacy_xhttp_mode = legacy_mode if legacy_mode not in ("standalone", "edge_linked") else ""
+                xhttp_mode = self._normalize_xhttp_mode(server_data.get("xhttp_mode") or legacy_xhttp_mode)
+            else:
+                if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", domain):
+                    raise ValueError("WebSocket+TLS requires a DNS name with a valid SSL certificate, not a bare IP address")
+                xhttp_mode = ""
         else:
             raw_path = str(server_data.get("path") or "").strip()
             path = self._normalize_vless_path(raw_path) if raw_path else ""
@@ -1925,23 +1989,36 @@ class AmneziaManager:
         if transport == "tcp" and flow_raw is None:
             flow_raw = "xtls-rprx-vision"
         flow = self._normalize_vless_flow(flow_raw, transport)
-        reality_profile = self._normalize_reality_profile(server_data.get("reality_profile"))
-        if reality_profile == "own_domain":
-            if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", domain):
-                raise ValueError("own-domain REALITY profile requires a DNS name, not a bare IP address")
-            reality_dest = f"{domain}:443"
-            server_names = self._reality_server_names_for_domain(domain)
-            reality_fallback_target = str(
-                server_data.get("reality_fallback_target") or REALITY_INTERNAL_FALLBACK_TARGET
-            ).strip()
+        is_reality_transport = transport in ("tcp", "xhttp")
+        if is_reality_transport:
+            reality_profile = self._normalize_reality_profile(server_data.get("reality_profile"))
+            if reality_profile == "own_domain":
+                if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", domain):
+                    raise ValueError("own-domain REALITY profile requires a DNS name, not a bare IP address")
+                reality_dest = f"{domain}:443"
+                server_names = self._reality_server_names_for_domain(domain)
+                reality_fallback_target = str(
+                    server_data.get("reality_fallback_target") or REALITY_INTERNAL_FALLBACK_TARGET
+                ).strip()
+            else:
+                reality_dest, dest_host = self._normalize_reality_dest(server_data.get("reality_dest"))
+                server_names = self._reality_server_names_for_host(dest_host)
+                reality_fallback_target = ""
+            priv, pub = self._generate_reality_keypair()
+            short_id = self._generate_reality_short_id()
+            # Non-empty shortId only: the empty string allows unauthenticated connections.
+            short_ids = [short_id]
+            reality_spiderx = str(server_data.get("reality_spiderx") or self._generate_reality_spiderx()).strip()
         else:
-            reality_dest, dest_host = self._normalize_reality_dest(server_data.get("reality_dest"))
-            server_names = self._reality_server_names_for_host(dest_host)
+            reality_profile = ""
+            reality_dest = ""
+            server_names = []
             reality_fallback_target = ""
-        priv, pub = self._generate_reality_keypair()
-        short_id = self._generate_reality_short_id()
-        # Non-empty shortId only: the empty string allows unauthenticated connections.
-        short_ids = [short_id]
+            priv = ""
+            pub = ""
+            short_id = ""
+            short_ids = []
+            reality_spiderx = ""
 
         # Location metadata for the multi-server MemeVPN subscription (HAPP labels).
         # All optional — old code paths that don't set these still work.
@@ -1959,10 +2036,9 @@ class AmneziaManager:
         if fingerprint not in _valid_fps:
             fingerprint = "chrome"
 
-        # use_stream=True: Xray listens on an internal-only port; nginx stream proxies
-        # external :443 to it based on the REALITY mask-domain SNI.  This is required for
-        # ISPs that use whitelist-based blocking (port 443 + whitelisted SNI = allowed).
-        use_stream = bool(server_data.get("use_stream", True))
+        # VLESS is always client-facing on external TCP :443. Xray listens on an
+        # internal-only port and nginx stream proxies :443 to it by REALITY SNI.
+        use_stream = True
 
         server_id = str(uuid.uuid4())[:6]
         server_mode = str(server_data.get("mode", "standalone")).strip().lower()
@@ -1988,12 +2064,8 @@ class AmneziaManager:
             egress_interface = upstream_interface
 
         subscription_id = self._generate_subscription_id()
-        if use_stream:
-            inbound_port = self._allocate_xray_stream_inbound_port()
-            client_port = 443
-        else:
-            inbound_port = self._allocate_xray_inbound_port()
-            client_port = inbound_port
+        inbound_port = self._allocate_xray_stream_inbound_port()
+        client_port = 443
 
         server_config = {
             "id": server_id,
@@ -2025,7 +2097,7 @@ class AmneziaManager:
                 "path": path,
                 "mode": xhttp_mode,
                 "host": host,
-                "security": "reality",
+                "security": "reality" if is_reality_transport else "tls",
                 "transport": transport,
                 "flow": flow,
                 "encryption": "none",
@@ -2041,7 +2113,10 @@ class AmneziaManager:
                 "reality_public_key": pub,
                 "reality_short_id": short_id,
                 "reality_short_ids": short_ids,
+                "reality_spiderx": reality_spiderx,
                 "reality_fingerprint": fingerprint,
+                "tls_fingerprint": fingerprint,
+                "ws_early_data": XRAY_WS_EARLY_DATA_BYTES if transport == "ws" else 0,
             },
         }
 
@@ -2124,6 +2199,7 @@ class AmneziaManager:
         # ── Generate fresh cryptographic material for the bridge inbound ────
         bridge_priv, bridge_pub = self._generate_reality_keypair()
         bridge_short_id = self._generate_reality_short_id()
+        bridge_spiderx = self._generate_reality_spiderx()
         bridge_uuid = str(uuid.uuid4())
 
         # ── Create a dedicated exit-node client for the bridge ───────────────
@@ -2137,9 +2213,11 @@ class AmneziaManager:
         )
         if existing_bridge_client:
             exit_uuid = existing_bridge_client['uuid']
+            exit_spiderx = existing_bridge_client.get('reality_spiderx') or vless.get('reality_spiderx') or '/'
         else:
             new_client, _, _ = self.add_vless_client(server_id, bridge_client_name, "forever")
             exit_uuid = new_client['uuid']
+            exit_spiderx = new_client.get('reality_spiderx') or vless.get('reality_spiderx') or '/'
 
         # ── Exit node connection parameters ──────────────────────────────────
         # `exit_host` is the HTTP Host header the exit's xhttp inbound expects
@@ -2177,13 +2255,17 @@ class AmneziaManager:
         exit_flow = self._vless_flow(vless)
 
         # Socket options reused on both bridge inbound and the chain-to-exit outbound.
-        # BBR improves throughput on congested RU links; TFO shortens repeat RTTs.
+        # BBR improves throughput on congested RU links; TFO is opt-in for compatibility.
         bridge_sockopt = {
             "tcpcongestion": "bbr",
             "tcpKeepAliveInterval": 30,
             "tcpKeepAliveIdle": 300,
-            "tcpFastOpen": True,
+            "tcpFastOpen": XRAY_TCP_FAST_OPEN,
         }
+        if XRAY_TCP_MAX_SEG > 0:
+            bridge_sockopt["tcpMaxSeg"] = XRAY_TCP_MAX_SEG
+        bridge_outbound_sockopt = dict(bridge_sockopt)
+        bridge_outbound_sockopt["domainStrategy"] = XRAY_DOMAIN_STRATEGY
 
         # ── Compose bridge Xray config ────────────────────────────────────────
         bridge_config = {
@@ -2198,7 +2280,7 @@ class AmneziaManager:
                     {"address": "https://dns.google/dns-query"},
                     "1.1.1.1",
                 ],
-                "queryStrategy": "UseIP"
+                "queryStrategy": XRAY_DNS_QUERY_STRATEGY
             },
             "inbounds": [{
                 "tag": "bridge-inbound",
@@ -2219,7 +2301,8 @@ class AmneziaManager:
                         "serverNames": bridge_server_names,
                         "privateKey": bridge_priv,
                         "shortIds": [bridge_short_id],
-                        "maxTimeDiff": 70000,
+                        "spiderX": bridge_spiderx,
+                        "maxTimeDiff": XRAY_REALITY_MAX_TIME_DIFF_MS,
                     },
                     "xhttpSettings": {
                         "path": bridge_path,
@@ -2257,9 +2340,10 @@ class AmneziaManager:
                             "serverName": exit_sni,
                             "publicKey": exit_pbk,
                             "shortId": exit_sid,
+                            "spiderX": exit_spiderx,
                             # Tolerate clock drift on the RU bridge (often on virtualised VPS
                             # with poor NTP sync) — matches the exit inbound setting.
-                            "maxTimeDiff": 70000,
+                            "maxTimeDiff": XRAY_REALITY_MAX_TIME_DIFF_MS,
                         },
                         "xhttpSettings": {
                             "mode": exit_mode,
@@ -2276,10 +2360,14 @@ class AmneziaManager:
                             "scMaxBufferedPosts": 30,
                             "noSSEHeader": False,
                         },
-                        "sockopt": dict(bridge_sockopt),
+                        "sockopt": dict(bridge_outbound_sockopt),
                     }
                 },
-                {"protocol": "freedom", "tag": "direct"}
+                {
+                    "protocol": "freedom",
+                    "settings": {"domainStrategy": XRAY_DOMAIN_STRATEGY},
+                    "tag": "direct",
+                }
             ],
             "routing": {
                 "domainStrategy": "IPIfNonMatch",
@@ -2316,7 +2404,7 @@ class AmneziaManager:
             f"&fp={quote(bridge_fp, safe='')}"
             f"&pbk={quote(bridge_pub, safe='')}"
             f"&sid={quote(bridge_short_id, safe='')}"
-            f"&spx={quote('/', safe='')}"
+            f"&spx={quote(bridge_spiderx, safe='')}"
             f"&flow="
             f"#{quote(label, safe='')}"
         )
@@ -2369,6 +2457,7 @@ class AmneziaManager:
             fp = vless.get("reality_fingerprint") or "chrome"
             pbk = vless.get("reality_public_key") or ""
             sid = vless.get("reality_short_id") or ""
+            spiderx = client_config.get("reality_spiderx") or vless.get("reality_spiderx") or "/"
             # `spx` maps to client reality spiderX (/); improves compatibility with REALITY-capable apps (HAPP, v2rayN, etc.).
             if transport == "tcp":
                 parts = [
@@ -2380,7 +2469,7 @@ class AmneziaManager:
                     f"fp={quote(fp, safe='')}",
                     f"pbk={quote(pbk, safe='')}",
                     f"sid={quote(sid, safe='')}",
-                    f"spx={quote(vless.get('reality_spiderx') or '/', safe='')}",
+                    f"spx={quote(spiderx, safe='')}",
                 ]
                 if flow:
                     parts.append(f"flow={quote(flow, safe='')}")
@@ -2397,18 +2486,41 @@ class AmneziaManager:
                     f"&fp={quote(fp, safe='')}"
                     f"&pbk={quote(pbk, safe='')}"
                     f"&sid={quote(sid, safe='')}"
-                    f"&spx={quote('/', safe='')}"
+                    f"&spx={quote(spiderx, safe='')}"
                     "&flow="
                 )
         else:
-            q = (
-                "encryption=none"
-                "&security=tls"
-                "&type=xhttp"
-                f"&path={quote(path, safe='')}"
-                f"&mode={quote(mode, safe='')}"
-                f"&host={quote(host, safe='')}"
-            )
+            fp = vless.get("tls_fingerprint") or vless.get("reality_fingerprint") or "chrome"
+            if transport == "ws":
+                ws_path = path
+                try:
+                    early_data = int(vless.get("ws_early_data") or XRAY_WS_EARLY_DATA_BYTES or 0)
+                except (TypeError, ValueError):
+                    early_data = XRAY_WS_EARLY_DATA_BYTES
+                early_data = max(0, min(8192, early_data))
+                if early_data:
+                    separator = "&" if "?" in ws_path else "?"
+                    ws_path = f"{ws_path}{separator}ed={early_data}"
+                parts = [
+                    "encryption=none",
+                    "security=tls",
+                    "type=ws",
+                    f"path={quote(ws_path, safe='')}",
+                    f"host={quote(host, safe='')}",
+                    f"sni={quote(domain, safe='')}",
+                    f"fp={quote(fp, safe='')}",
+                    "alpn=http%2F1.1",
+                ]
+                q = "&".join(parts)
+            else:
+                q = (
+                    "encryption=none"
+                    "&security=tls"
+                    "&type=xhttp"
+                    f"&path={quote(path, safe='')}"
+                    f"&mode={quote(mode, safe='')}"
+                    f"&host={quote(host, safe='')}"
+                )
         return f"vless://{client_config['uuid']}@{domain}:{port}?{q}#{quote(label, safe='')}"
 
     def add_vless_client(self, server_id, client_name, duration_code="forever", user_id=None):
@@ -2463,6 +2575,7 @@ class AmneziaManager:
             "protocol": "vless",
             "uuid": vless_uuid,
             "user_id": user_id or None,
+            "reality_spiderx": self._generate_reality_spiderx(),
         }
 
         server.setdefault("clients", []).append(client_config)

@@ -272,20 +272,31 @@ class AmneziaApp {
     toggleVlessTransportFields() {
         const transport = (this.getElement('vlessTransport')?.value || 'tcp').toLowerCase();
         const isXhttp = transport === 'xhttp';
+        const isWs = transport === 'ws' || transport === 'websocket';
+        const isReality = !isWs;
         const tcpFlowWrap = this.getElement('vlessTcpFlowWrap');
         const xhttpModeWrap = this.getElement('vlessXhttpModeWrap');
         const pathWrap = this.getElement('vlessPathWrap');
-        if (tcpFlowWrap) tcpFlowWrap.classList.toggle('hidden', isXhttp);
+        const realityProfileWrap = this.getElement('vlessRealityProfileWrap');
+        if (tcpFlowWrap) tcpFlowWrap.classList.toggle('hidden', transport !== 'tcp');
         if (xhttpModeWrap) xhttpModeWrap.classList.toggle('hidden', !isXhttp);
-        if (pathWrap) pathWrap.classList.toggle('hidden', !isXhttp);
+        if (pathWrap) pathWrap.classList.toggle('hidden', !(isXhttp || isWs));
+        if (realityProfileWrap) realityProfileWrap.classList.toggle('hidden', !isReality);
         this.toggleVlessRealityProfileFields();
     }
 
     toggleVlessRealityProfileFields() {
+        const transport = (this.getElement('vlessTransport')?.value || 'tcp').toLowerCase();
+        const isReality = transport !== 'ws' && transport !== 'websocket';
         const profile = (this.getElement('vlessRealityProfile')?.value || 'own_domain').toLowerCase();
         const isExternalMask = profile === 'external_mask';
         const destWrap = this.getElement('vlessRealityDestWrap');
         const presetsPanel = this.getElement('sniPresetsPanel');
+        if (!isReality) {
+            if (destWrap) destWrap.classList.add('hidden');
+            if (presetsPanel) presetsPanel.classList.add('hidden');
+            return;
+        }
         if (destWrap) destWrap.classList.toggle('hidden', !isExternalMask);
         if (!isExternalMask && presetsPanel) presetsPanel.classList.add('hidden');
     }
@@ -713,19 +724,23 @@ class AmneziaApp {
                 this.showError('vlessDomainError', 'Client address is required (domain or server IP)');
                 isValid = false;
             }
-            if (realityProfile === 'own_domain' && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(domain)) {
+            if (transport !== 'ws' && transport !== 'websocket' && realityProfile === 'own_domain' && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(domain)) {
                 this.showError('vlessDomainError', 'Own-domain REALITY needs a DNS name such as alb13.memeinternet.site');
                 isValid = false;
             }
-            if (transport === 'xhttp' && (!path || !path.startsWith('/'))) {
+            if ((transport === 'xhttp' || transport === 'ws' || transport === 'websocket') && (!path || !path.startsWith('/'))) {
                 this.showError('vlessPathError', "Path is required and must start with '/'");
                 isValid = false;
             }
-            if (realityProfile === 'external_mask' && !realityDest) {
+            if ((transport === 'ws' || transport === 'websocket') && /^\d{1,3}(?:\.\d{1,3}){3}$/.test(domain)) {
+                this.showError('vlessDomainError', 'WebSocket+TLS needs a DNS name with a valid SSL certificate');
+                isValid = false;
+            }
+            if (transport !== 'ws' && transport !== 'websocket' && realityProfile === 'external_mask' && !realityDest) {
                 this.showError('vlessRealityDestError', 'REALITY mask is required for external mask mode');
                 isValid = false;
             }
-            if (realityProfile === 'external_mask' && realityDest && !/^[a-z0-9.-]+(?::\d+)?$/i.test(realityDest)) {
+            if (transport !== 'ws' && transport !== 'websocket' && realityProfile === 'external_mask' && realityDest && !/^[a-z0-9.-]+(?::\d+)?$/i.test(realityDest)) {
                 this.showError('vlessRealityDestError', 'REALITY dest: use host or host:port (e.g. www.microsoft.com:443)');
                 isValid = false;
             }
@@ -914,7 +929,7 @@ class AmneziaApp {
                 reality_profile: (this.getElement('vlessRealityProfile')?.value || 'own_domain').trim(),
                 reality_dest: (this.getElement('vlessRealityDest')?.value || '').trim(),
                 fingerprint: (this.getElement('vlessFingerprint')?.value || 'chrome').trim(),
-                use_stream: this.getElement('vlessUseStream')?.checked ?? true,
+                use_stream: true,
                 // MemeVPN multi-server subscription metadata.
                 country_code: (this.getElement('vlessCountryCode')?.value || '').trim().toUpperCase(),
                 flag_emoji: (this.getElement('vlessFlagEmoji')?.value || '').trim(),
@@ -1127,7 +1142,7 @@ class AmneziaApp {
                         </h3>
                         <p class="text-sm text-gray-600">
                             ${server.protocol === 'vless'
-                                ? `ID: ${server.id} | VLESS+REALITY+${this.getVlessTransportLabel(server)} | client TCP port: ${server.port}`
+                                ? `ID: ${server.id} | VLESS+${this.getVlessSecurityLabel(server)}+${this.getVlessTransportLabel(server)} | client TCP port: ${server.port}`
                                 : `ID: ${server.id} | Port: ${server.port} | Subnet: ${server.subnet} | Mode: ${server.mode || 'standalone'} ${server.obfuscation_enabled ? '| 🔒 Obfuscated' : ''}`
                             }
                         </p>
@@ -1141,9 +1156,7 @@ class AmneziaApp {
                             <p class="text-xs text-gray-500">
                                 VLESS: ${this.getVlessConnectionSummary(server)}
                                 ${server.vless.security === 'reality' ? ` · ${this.getVlessRealityProfileLabel(server)}` : ''}
-                                ${server.vless.use_stream
-                                    ? `<span class="ml-1 px-1 py-0.5 rounded bg-green-100 text-green-700 font-medium">порт 443 / stream</span>`
-                                    : `<span class="ml-1 px-1 py-0.5 rounded bg-yellow-100 text-yellow-700 font-medium">прямой порт ${server.vless.inbound_port}</span>`}
+                                <span class="ml-1 px-1 py-0.5 rounded bg-green-100 text-green-700 font-medium">порт 443 / stream</span>
                             </p>
                             <p class="text-xs text-gray-500">Admin server subscription: <span class="font-mono">${this.getVlessSubscriptionUrl(server)}</span>
                                 <button onclick="amneziaApp.copyToClipboard('${btoa(this.getVlessSubscriptionUrl(server))}')" class="ml-2 text-blue-600 hover:text-blue-800 text-xs">Copy</button>
@@ -1212,11 +1225,20 @@ class AmneziaApp {
 
     getVlessTransport(server) {
         const raw = (server?.vless?.transport || 'xhttp').toLowerCase();
-        return raw === 'tcp' || raw === 'raw' ? 'tcp' : 'xhttp';
+        if (raw === 'tcp' || raw === 'raw') return 'tcp';
+        if (raw === 'ws' || raw === 'websocket') return 'ws';
+        return 'xhttp';
+    }
+
+    getVlessSecurityLabel(server) {
+        const security = (server?.vless?.security || 'reality').toLowerCase();
+        return security === 'tls' ? 'TLS' : 'REALITY';
     }
 
     getVlessTransportLabel(server) {
-        if (this.getVlessTransport(server) !== 'tcp') return 'XHTTP';
+        const transport = this.getVlessTransport(server);
+        if (transport === 'ws') return 'WebSocket';
+        if (transport !== 'tcp') return 'XHTTP';
         return this.getVlessFlow(server) ? 'TCP/RAW + Vision' : 'TCP/RAW';
     }
 
@@ -1241,6 +1263,9 @@ class AmneziaApp {
         if (transport === 'tcp') {
             const flow = this.getVlessFlow(server);
             return `${endpoint} TCP header=none flow=${flow || 'none'}`;
+        }
+        if (transport === 'ws') {
+            return `${endpoint} WebSocket TLS ${vless.path || '/'}`;
         }
         return `${endpoint} ${vless.path || '/'} (${vless.mode || 'packet-up'})`;
     }
