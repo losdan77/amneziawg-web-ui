@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## AWG 3.0 — 2026-09-07
+
+- New AWG servers default to protocol 3.0 with a shared header protection key,
+  S1–S4 padding, content padding and randomized timing ranges.
+- Build pinned official AWG3 userspace and tools; prevent old host kernel modules
+  from taking precedence. Keep the existing Xray version.
+- Preserve AWG2 ranges, S3/S4, CPS I1–I5 and AWG3 fields across client/server export
+  and AWG/VLESS upstream import, including keepalive ranges.
+- Keep existing protocol configs unchanged; add an explicit stopped-server upgrade
+  with backups, rollback and interrupted-upgrade recovery, preserving peers and keys.
+- Add protocol selection/version display and compatibility/integration tests.
+
 ## Version 2.0.0 - Bandwidth Management & IP Allocation Improvements
 
 ### New Features

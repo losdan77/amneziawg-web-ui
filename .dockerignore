@@ -1,0 +1,6 @@
+.git
+.claude
+.env
+**/__pycache__
+tests
+.test-deps

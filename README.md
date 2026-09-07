@@ -1,6 +1,11 @@
 # AmneziaWG Web UI
 # Main author: https://github.com/alexishw/amneziawg-web-ui
 
+This branch defaults to **AmneziaWG 3.0** for new servers and retains existing
+AWG 1.x/2.0 configurations. Upgrading an existing server is explicit and requires
+updated client apps/configs. See [AWG 3.0 upgrade and compatibility guide](AWG3_UPGRADE.md)
+for deployment, backups, rollback and tests.
+
 A comprehensive web-based management interface for AmneziaWG VPN servers. This service provides an easy-to-use web UI to create, manage, and monitor WireGuard VPN servers with AmneziaWG's advanced obfuscation features.
 All server configuration is done via web interface or via API endpoints. Providing env variables at docker startup is supported but doesn't make much sense: all settings can be overridden via web interface except for NGINX_PORT.
 

@@ -395,6 +395,14 @@
                     <input type="checkbox" id="autoStart" checked class="mr-2">
                     <label class="text-sm font-medium text-gray-700">Auto-start server on creation</label>
                 </div>
+                <div>
+                    <label for="awgVersion" class="block text-sm font-medium text-gray-700">AmneziaWG version</label>
+                    <select id="awgVersion" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2">
+                        <option value="3" selected>AWG 3.0 (recommended)</option>
+                        <option value="2">AWG 2.0 (legacy clients)</option>
+                    </select>
+                    <p class="text-xs text-gray-500 mt-1">AWG 3 requires a compatible client. Existing servers keep their protocol until explicitly upgraded. In Linked Edge mode this selects the entry server; the upstream keeps its imported protocol.</p>
+                </div>
                 <div id="obfuscationToggleRow" class="flex items-center">
                     <input type="checkbox" id="enableObfuscation" checked class="mr-2">
                     <label class="text-sm font-medium text-gray-700">Enable Traffic Obfuscation</label>
@@ -403,6 +411,7 @@
                 <!-- Obfuscation Parameters -->
                 <div id="obfuscationParams" class="border rounded-lg p-4 bg-gray-50">
                     <h3 class="text-lg font-medium mb-3">Obfuscation Parameters</h3>
+                    <p class="text-xs text-gray-500 mb-3">For AWG 3, a shared header protection key, content padding and timing ranges are generated automatically and included in every client config. H1–H4 accept integers or non-overlapping ranges such as 1000-1100.</p>
                     <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
                         <div>
                             <label class="block text-xs font-medium text-gray-600">Jc (4-12)</label>
@@ -428,21 +437,29 @@
                         </div>
                         <div>
                             <label class="block text-xs font-medium text-gray-600">H1</label>
-                            <input type="number" id="paramH1" value="1000" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                            <input type="text" id="paramH1" value="1000-1100" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
                         </div>
                         <div>
                             <label class="block text-xs font-medium text-gray-600">H2</label>
-                            <input type="number" id="paramH2" value="2000" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                            <input type="text" id="paramH2" value="2000-2100" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
                         </div>
                     </div>
                     <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm mt-2">
                         <div>
                             <label class="block text-xs font-medium text-gray-600">H3</label>
-                            <input type="number" id="paramH3" value="3000" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                            <input type="text" id="paramH3" value="3000-3100" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
                         </div>
                         <div>
                             <label class="block text-xs font-medium text-gray-600">H4</label>
-                            <input type="number" id="paramH4" value="4000" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                            <input type="text" id="paramH4" value="4000-4100" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                        </div>
+                        <div>
+                            <label for="paramS3" class="block text-xs font-medium text-gray-600">S3 (AWG 3: at least 12)</label>
+                            <input type="number" id="paramS3" value="12" min="0" max="150" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
+                        </div>
+                        <div>
+                            <label for="paramS4" class="block text-xs font-medium text-gray-600">S4 (AWG 3: at least 12)</label>
+                            <input type="number" id="paramS4" value="12" min="0" max="150" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">
                         </div>
                         <div class="col-span-2">
                             <button type="button" id="randomParamsBtn" class="mt-6 bg-gray-500 text-white px-3 py-1 rounded text-sm hover:bg-gray-600">

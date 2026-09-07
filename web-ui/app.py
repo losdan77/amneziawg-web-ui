@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import json
+import copy
 import subprocess
 import tempfile
 import uuid
@@ -13,6 +14,7 @@ import ipaddress
 import socket
 import ssl
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 import re
 from urllib.parse import quote
 from flask import Flask, render_template, request, jsonify, send_file, send_from_directory, Response
@@ -20,6 +22,9 @@ from flask_socketio import SocketIO
 import threading
 import time
 from datetime import datetime, timezone
+from awg_protocol import (OBFUSCATION_KEYS, V3_KEYS, generate_params, normalize_params,
+                          import_params, normalize_keepalive, protocol_version,
+                          upgrade_params, render_params, replace_interface_params)
 
 # Get the absolute path to the current directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -272,6 +277,14 @@ def protect_admin_api():
     if _admin_auth_ok():
         return None
     return _admin_auth_required()
+
+def synchronized_config(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self.config_lock:
+            return method(self, *args, **kwargs)
+    return locked
+
 
 class AmneziaManager:
     def __init__(self):
@@ -722,7 +735,7 @@ class AmneziaManager:
                     upstream["obfuscation_enabled"] = True
                     updated = True
                 if not upstream.get("obfuscation_params"):
-                    upstream["obfuscation_params"] = self.generate_obfuscation_params(server.get("mtu", DEFAULT_MTU))
+                    upstream["obfuscation_params"] = self.generate_obfuscation_params(server.get("mtu", DEFAULT_MTU), version="2")
                     updated = True
                 if not upstream.get("client_public_key") and upstream.get("private_key"):
                     upstream["client_public_key"] = self.execute_command(f"echo '{upstream['private_key']}' | wg pubkey") or ""
@@ -1142,6 +1155,15 @@ class AmneziaManager:
                     self.start_server(server.get('id'))
 
     def load_config(self):
+        # An interrupted explicit upgrade is rolled back before any auto-start.
+        journal = os.path.join(CONFIG_DIR, 'awg3-upgrade.pending.json')
+        if os.path.exists(journal):
+            with open(journal, encoding='utf-8') as f:
+                recovery = json.load(f)
+            for target, backup in recovery['files'].items():
+                with open(backup, encoding='utf-8') as f:
+                    self._atomic_config_write(target, f.read())
+            os.unlink(journal)
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
@@ -1165,8 +1187,22 @@ class AmneziaManager:
 
     def save_config(self):
         with self.config_lock:
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(self.config, f, indent=2)
+            self._atomic_config_write(CONFIG_FILE, json.dumps(self.config, indent=2))
+
+    @staticmethod
+    def _atomic_config_write(path, content):
+        """Replace a secret-bearing config without exposing a partially written file."""
+        fd, temporary = tempfile.mkstemp(prefix='.awg-', dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def execute_command(self, command):
         """Execute shell command and return result"""
@@ -3513,67 +3549,11 @@ class AmneziaManager:
         except:
             return base64.b64encode(os.urandom(32)).decode('utf-8')
 
-    def generate_obfuscation_params(self, mtu=1420):
-        import random
-        S1 = random.randint(15, min(150, mtu - 148))
-        # S2 must not be S1+56
-        s2_candidates = [s for s in range(15, min(150, mtu - 92) + 1) if s != S1 + 56]
-        S2 = random.choice(s2_candidates)
-        # Jmin/Jmax bound the per-packet junk length. The legal range is
-        # [4, MTU], but values near the extremes are either too small to
-        # perturb DPI classifiers or large enough to cause fragmentation on
-        # weak links. A realistic browser-like jitter envelope is ~[8..200]
-        # bytes, which is what the validator still allows the operator to
-        # override for imported configs.
-        jmin_lower, jmin_upper = 8, 80
-        jmax_delta_lo, jmax_delta_hi = 50, 150
-        # Clamp against the hard MTU ceiling so we never produce invalid params.
-        jmin_upper = min(jmin_upper, max(jmin_lower + 1, mtu - 2))
-        Jmin = random.randint(jmin_lower, jmin_upper)
-        jmax_lower = min(Jmin + jmax_delta_lo, mtu)
-        jmax_upper = min(Jmin + jmax_delta_hi, mtu)
-        if jmax_upper <= jmax_lower:
-            jmax_upper = min(jmax_lower + 1, mtu)
-        Jmax = random.randint(jmax_lower, jmax_upper)
-        return {
-            "Jc": random.randint(4, 12),
-            "Jmin": Jmin,
-            "Jmax": Jmax,
-            "S1": S1,
-            "S2": S2,
-            "H1": random.randint(10000, 100000),
-            "H2": random.randint(100000, 200000),
-            "H3": random.randint(200000, 300000),
-            "H4": random.randint(300000, 400000),
-            "MTU": mtu
-        }
+    def generate_obfuscation_params(self, mtu=1280, version='3'):
+        return generate_params(mtu, version)
 
     def validate_obfuscation_params(self, params, mtu):
-        """Validate Amnezia obfuscation params against MTU constraints."""
-        if not isinstance(params, dict):
-            raise ValueError("Obfuscation params must be an object")
-
-        required = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
-        normalized = {}
-        for key in required:
-            if key not in params:
-                raise ValueError(f"Missing obfuscation parameter: {key}")
-            try:
-                normalized[key] = int(params[key])
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"Obfuscation parameter {key} must be integer") from exc
-
-        if normalized["Jc"] < 4 or normalized["Jc"] > 12:
-            raise ValueError("Jc must be between 4 and 12")
-        if not (normalized["Jmin"] < normalized["Jmax"] <= mtu):
-            raise ValueError(f"Jmin must be less than Jmax and Jmax <= MTU ({mtu})")
-        if not (15 <= normalized["S1"] <= 150 and normalized["S1"] <= (mtu - 148)):
-            raise ValueError(f"S1 must be in [15,150] and <= MTU-148 ({mtu - 148})")
-        if not (15 <= normalized["S2"] <= 150 and normalized["S2"] <= (mtu - 92)):
-            raise ValueError(f"S2 must be in [15,150] and <= MTU-92 ({mtu - 92})")
-        if normalized["S1"] + 56 == normalized["S2"]:
-            raise ValueError("S1 + 56 must not equal S2")
-        return normalized
+        return normalize_params(params, mtu)
 
     def get_default_route_info(self):
         """Return default route gateway and device."""
@@ -3618,12 +3598,16 @@ class AmneziaManager:
 
         sections = {"Interface": {}, "Peer": {}}
         current_section = None
+        seen_sections = set()
         for raw_line in str(config_text).splitlines():
-            line = raw_line.strip()
+            line = raw_line.split("#", 1)[0].strip()
             if not line or line.startswith("#") or line.startswith(";"):
                 continue
             if line.startswith("[") and line.endswith("]"):
                 section_name = line[1:-1].strip()
+                if section_name in sections and section_name in seen_sections:
+                    raise ValueError("Imported config must contain exactly one Interface and one Peer")
+                seen_sections.add(section_name)
                 current_section = section_name if section_name in sections else None
                 continue
             if "=" not in line or not current_section:
@@ -3672,12 +3656,7 @@ class AmneziaManager:
         public_key_value = peer_cfg.get("PublicKey", "")
         allowed_ips_value = peer_cfg.get("AllowedIPs", "0.0.0.0/0")
         local_address_value = interface_cfg.get("Address", "172.31.254.2/30")
-        try:
-            keepalive_value = int(peer_cfg.get("PersistentKeepalive", 25))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("PersistentKeepalive in imported config must be integer") from exc
-        if keepalive_value < 1 or keepalive_value > 120:
-            raise ValueError("PersistentKeepalive must be between 1 and 120")
+        keepalive_value = normalize_keepalive(peer_cfg.get("PersistentKeepalive", 25))
 
         try:
             imported_mtu = int(interface_cfg.get("MTU", mtu))
@@ -3687,15 +3666,7 @@ class AmneziaManager:
             raise ValueError("MTU in imported config must be between 1280 and 1440")
         mtu = imported_mtu
 
-        for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
-            if key in interface_cfg and str(interface_cfg.get(key)).strip():
-                try:
-                    imported_obfuscation[key] = int(str(interface_cfg[key]).strip())
-                except ValueError as exc:
-                    raise ValueError(f"Invalid upstream obfuscation value for {key}") from exc
-        if len(imported_obfuscation) != 9:
-            raise ValueError("Imported config must include all obfuscation parameters (Jc..H4)")
-        imported_obfuscation = self.validate_obfuscation_params(imported_obfuscation, mtu)
+        imported_obfuscation = import_params(interface_cfg, mtu)
 
         endpoint_host, endpoint_port = self.parse_endpoint(endpoint_value, DEFAULT_PORT)
         if not endpoint_host or not endpoint_port:
@@ -3752,16 +3723,7 @@ Table = off
 
         params = upstream.get("obfuscation_params")
         if upstream.get("obfuscation_enabled") and params:
-            config += f"""Jc = {params['Jc']}
-Jmin = {params['Jmin']}
-Jmax = {params['Jmax']}
-S1 = {params['S1']}
-S2 = {params['S2']}
-H1 = {params['H1']}
-H2 = {params['H2']}
-H3 = {params['H3']}
-H4 = {params['H4']}
-"""
+            config += render_params(params)
 
         config += f"""
 [Peer]
@@ -3970,6 +3932,7 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         self.execute_command(f"/usr/bin/awg-quick down {upstream_interface} 2>/dev/null || true")
         return True
 
+    @synchronized_config
     def create_wireguard_server(self, server_data):
         """Create a new WireGuard server configuration with environment defaults"""
         server_name = server_data.get('name', 'New Server')
@@ -4020,13 +3983,29 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         # Generate server keys
         server_keys = self.generate_wireguard_keys()
 
+        awg_version = str(server_data.get('awg_version', '3'))
+        if awg_version not in ('2', '3'):
+            raise ValueError('awg_version must be 2 or 3')
+
         # Generate and use provided obfuscation parameters if enabled
         obfuscation_params = None
         if enable_obfuscation:
             if 'obfuscation_params' in server_data:
-                obfuscation_params = self.validate_obfuscation_params(server_data['obfuscation_params'], mtu)
+                supplied = server_data['obfuscation_params']
+                if not isinstance(supplied, dict):
+                    raise ValueError('Obfuscation params must be an object')
+                if awg_version == '3':
+                    # Older API callers still submit the nine legacy fields.
+                    # Fill only absent AWG3 fields; reject explicitly invalid values.
+                    supplied = dict(supplied)
+                    defaults = upgrade_params({}, mtu)
+                    for key in ('S3', 'S4') + V3_KEYS:
+                        supplied.setdefault(key, defaults[key])
+                elif any(key in supplied for key in V3_KEYS):
+                    raise ValueError('AWG 3 parameters require awg_version=3')
+                obfuscation_params = self.validate_obfuscation_params(supplied, mtu)
             else:
-                obfuscation_params = self.generate_obfuscation_params(mtu)
+                obfuscation_params = self.generate_obfuscation_params(mtu, awg_version)
 
         # Parse subnet for server IP
         subnet_parts = subnet.split('/')
@@ -4049,12 +4028,7 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
             public_key_value = peer_cfg.get("PublicKey", "")
             allowed_ips_value = peer_cfg.get("AllowedIPs", "0.0.0.0/0")
             local_address_value = interface_cfg.get("Address", "172.31.254.2/30")
-            try:
-                keepalive_value = int(peer_cfg.get("PersistentKeepalive", 25))
-            except (TypeError, ValueError) as exc:
-                raise ValueError("PersistentKeepalive in imported config must be integer") from exc
-            if keepalive_value < 1 or keepalive_value > 120:
-                raise ValueError("PersistentKeepalive must be between 1 and 120")
+            keepalive_value = normalize_keepalive(peer_cfg.get("PersistentKeepalive", 25))
             imported_private_key = interface_cfg.get("PrivateKey", "")
             imported_preshared_key = peer_cfg.get("PresharedKey", "")
             try:
@@ -4064,15 +4038,7 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
             if imported_mtu < 1280 or imported_mtu > 1440:
                 raise ValueError("MTU in imported config must be between 1280 and 1440")
             mtu = imported_mtu
-            for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
-                if key in interface_cfg and str(interface_cfg.get(key)).strip():
-                    try:
-                        imported_obfuscation[key] = int(str(interface_cfg[key]).strip())
-                    except ValueError as exc:
-                        raise ValueError(f"Invalid upstream obfuscation value for {key}") from exc
-            if len(imported_obfuscation) != 9:
-                raise ValueError("Imported config must include all obfuscation parameters (Jc..H4)")
-            imported_obfuscation = self.validate_obfuscation_params(imported_obfuscation, mtu)
+            imported_obfuscation = import_params(interface_cfg, mtu)
 
             endpoint_host, endpoint_port = self.parse_endpoint(endpoint_value, DEFAULT_PORT)
 
@@ -4099,8 +4065,8 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
                     upstream_client_public_key = upstream_keys["public_key"]
             upstream_preshared_key = imported_preshared_key
 
-            # In linked mode, use imported/derived upstream obfuscation for RU entry server too.
-            obfuscation_params = dict(imported_obfuscation)
+            # Entry and egress are separate interfaces: retain the selected entry
+            # version while preserving the imported EU protocol independently.
 
             try:
                 table_offset = int(server_id[:2], 16) % 100
@@ -4138,16 +4104,7 @@ MTU = {mtu}
 
         # Add obfuscation parameters if enabled
         if enable_obfuscation and obfuscation_params:
-            server_config_content += f"""Jc = {obfuscation_params['Jc']}
-Jmin = {obfuscation_params['Jmin']}
-Jmax = {obfuscation_params['Jmax']}
-S1 = {obfuscation_params['S1']}
-S2 = {obfuscation_params['S2']}
-H1 = {obfuscation_params['H1']}
-H2 = {obfuscation_params['H2']}
-H3 = {obfuscation_params['H3']}
-H4 = {obfuscation_params['H4']}
-"""
+            server_config_content += render_params(obfuscation_params)
 
         server_config = {
             "id": server_id,
@@ -4166,6 +4123,7 @@ H4 = {obfuscation_params['H4']}
             "bandwidth_tier": bandwidth_tier,
             "obfuscation_enabled": enable_obfuscation,
             "obfuscation_params": obfuscation_params,
+            "awg_version": protocol_version(obfuscation_params, enable_obfuscation),
             "auto_start": auto_start,
             "dns": dns_servers,  # Store DNS servers
             "mode": mode,
@@ -4195,6 +4153,78 @@ H4 = {obfuscation_params['H4']}
 
         return server_config
     
+    def upgrade_server_awg3(self, server_id):
+        """Explicit, recoverable upgrade of a stopped entry interface and its clients."""
+        with self.config_lock:
+            server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
+            if server is None:
+                return None
+            if server.get('protocol') == 'vless' or not server.get('obfuscation_enabled'):
+                raise ValueError('Only AmneziaWG servers can be upgraded')
+            if protocol_version(server.get('obfuscation_params')) == '3':
+                return server
+            if server.get('status') != 'stopped':
+                raise ValueError('Stop the server before upgrading to AWG 3')
+            # Check real interface presence; an old UI status is not enough.
+            probe = subprocess.run(['ip', 'link', 'show', 'dev', server['interface']],
+                                   capture_output=True, text=True)
+            if probe.returncode == 0:
+                raise ValueError('The interface is still active; stop it before upgrading')
+            if probe.returncode != 1 or 'does not exist' not in probe.stderr.lower():
+                raise ValueError('Cannot verify that the interface is stopped')
+
+            config_path = server['config_path']
+            with open(config_path, encoding='utf-8') as f:
+                old_config_text = f.read()
+            # Use actual on-disk fields as the source, retaining manual AWG2 additions.
+            interface_text = old_config_text.split('[Peer]', 1)[0]
+            on_disk = {}
+            for line in interface_text.splitlines():
+                key, sep, value = line.split('#', 1)[0].partition('=')
+                if sep:
+                    on_disk[key.strip()] = value.strip()
+            old_params = import_params(on_disk, server['mtu'])
+            new_params = upgrade_params(old_params, server['mtu'])
+            new_config_text = replace_interface_params(old_config_text, new_params)
+            backup_dir = os.path.join(CONFIG_DIR, 'backups',
+                                      f"awg3-{server_id}-{time.time_ns()}")
+            os.makedirs(backup_dir, mode=0o700)
+            backup_config = os.path.join(backup_dir, os.path.basename(config_path))
+            backup_json = os.path.join(backup_dir, 'web_config.json')
+            old_state = copy.deepcopy(self.config)
+            self._atomic_config_write(backup_config, old_config_text)
+            self._atomic_config_write(backup_json, json.dumps(old_state, indent=2))
+            journal = os.path.join(CONFIG_DIR, 'awg3-upgrade.pending.json')
+            if os.path.exists(journal):
+                raise ValueError('An incomplete AWG upgrade needs recovery; restart the container')
+            self._atomic_config_write(journal, json.dumps({'files': {
+                config_path: backup_config, CONFIG_FILE: backup_json}}))
+            try:
+                server['obfuscation_params'] = new_params
+                server['awg_version'] = '3'
+                server['awg3_backup_path'] = backup_dir
+                # Both indexes are persisted separately in older web_config.json files.
+                clients = server.get('clients', []) + [
+                    c for c in self.config.get('clients', {}).values()
+                    if c.get('server_id') == server_id]
+                for client in clients:
+                    client['obfuscation_enabled'] = True
+                    client['obfuscation_params'] = dict(new_params)
+                    global_client = self.config.get('clients', {}).get(client['id'])
+                    if global_client is not None:
+                        global_client['obfuscation_enabled'] = True
+                        global_client['obfuscation_params'] = dict(new_params)
+                self._atomic_config_write(config_path, new_config_text)
+                self.save_config()
+                os.unlink(journal)
+            except Exception:
+                self.config = old_state
+                self._atomic_config_write(config_path, old_config_text)
+                self.save_config()
+                os.unlink(journal)
+                raise
+            return server
+
     def apply_live_config(self, interface):
         """Apply the latest config to the running WireGuard interface using wg syncconf."""
         try:
@@ -4261,6 +4291,7 @@ H4 = {obfuscation_params['H4']}
         # or raise an error
         raise ValueError(f"No available IP addresses in subnet {subnet}")
 
+    @synchronized_config
     def delete_server(self, server_id):
         """Delete a server and all its clients"""
         server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
@@ -4306,6 +4337,7 @@ H4 = {obfuscation_params['H4']}
         self.save_config()
         return True
 
+    @synchronized_config
     def add_wireguard_client(self, server_id, client_name, duration_code="forever"):
         """Add a client to a WireGuard server.
 
@@ -4352,7 +4384,9 @@ H4 = {obfuscation_params['H4']}
         # fixed 25-second WireGuard beacons produce across every client on a
         # server. Range 15..30 stays within values real clients commonly use
         # so the traffic still looks like legitimate WireGuard.
-        persistent_keepalive = random.randint(15, 30)
+        persistent_keepalive = ("15-30" if protocol_version(server.get("obfuscation_params"),
+                                                        server.get("obfuscation_enabled")) == "3"
+                                else random.randint(15, 30))
 
         client_config = {
             "id": client_id,
@@ -4405,6 +4439,7 @@ AllowedIPs = {client_ip}/32
         config_content = self.generate_wireguard_client_config(server, client_config, include_comments=True)
         return client_config, config_content, False
 
+    @synchronized_config
     def delete_client(self, server_id, client_id, reason="manual"):
         """Delete a client from a server and update the config file"""
         server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
@@ -4568,19 +4603,10 @@ MTU = {server['mtu']}
         # Add obfuscation parameters if enabled
         if client_config['obfuscation_enabled'] and client_config['obfuscation_params']:
             params = client_config['obfuscation_params']
-            config += f"""Jc = {params['Jc']}
-Jmin = {params['Jmin']}
-Jmax = {params['Jmax']}
-S1 = {params['S1']}
-S2 = {params['S2']}
-H1 = {params['H1']}
-H2 = {params['H2']}
-H3 = {params['H3']}
-H4 = {params['H4']}
-"""
+            config += render_params(params)
 
         # Per-client keepalive if stored (new clients); fall back to 25 for legacy entries.
-        keepalive = client_config.get('persistent_keepalive') or 25
+        keepalive = client_config.get('persistent_keepalive', 25)
         config += f"""
 [Peer]
 PublicKey = {server['server_public_key']}
@@ -4779,8 +4805,12 @@ PersistentKeepalive = {keepalive}
         print(f"Tier {tier} settings updated")
         return True
 
+    @synchronized_config
     def start_server(self, server_id):
         """Start a WireGuard server using awg-quick with iptables setup"""
+        if os.path.exists(os.path.join(CONFIG_DIR, 'awg3-upgrade.pending.json')):
+            print('Cannot start AWG while an interrupted upgrade needs recovery; restart the container')
+            return False
         server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
         if not server:
             return False
@@ -4837,6 +4867,7 @@ PersistentKeepalive = {keepalive}
 
         return False
 
+    @synchronized_config
     def stop_server(self, server_id):
         """Stop a WireGuard server using awg-quick with iptables cleanup"""
         server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
@@ -5030,6 +5061,18 @@ def delete_server(server_id):
     if amnezia_manager.delete_server(server_id):
         return jsonify({"status": "deleted", "server_id": server_id})
     return jsonify({"error": "Server not found"}), 404
+
+@app.route('/api/servers/<server_id>/upgrade-awg3', methods=['POST'])
+def upgrade_server_awg3(server_id):
+    try:
+        server = amnezia_manager.upgrade_server_awg3(server_id)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except OSError:
+        return jsonify({'error': 'Upgrade failed; check server logs and the AWG backup before retrying'}), 500
+    if server is None:
+        return jsonify({'error': 'Server not found'}), 404
+    return jsonify(server)
 
 @app.route('/api/servers/<server_id>/metadata', methods=['PATCH'])
 def update_server_metadata(server_id):

@@ -465,7 +465,7 @@ class AmneziaApp {
         const sections = { Interface: {}, Peer: {} };
         let currentSection = null;
         text.split(/\r?\n/).forEach((raw) => {
-            const line = raw.trim();
+            const line = raw.split('#')[0].trim();
             if (!line || line.startsWith('#') || line.startsWith(';')) return;
             if (line.startsWith('[') && line.endsWith(']')) {
                 const section = line.slice(1, -1).trim();
@@ -480,8 +480,8 @@ class AmneziaApp {
         const i = sections.Interface;
         const p = sections.Peer;
         const required = [
-            ['Interface', i, ['PrivateKey', 'Address', 'MTU', 'Jc', 'Jmin', 'Jmax', 'S1', 'S2', 'H1', 'H2', 'H3', 'H4']],
-            ['Peer', p, ['PublicKey', 'Endpoint', 'AllowedIPs', 'PersistentKeepalive']]
+            ['Interface', i, ['PrivateKey', 'Address']],
+            ['Peer', p, ['PublicKey', 'Endpoint']]
         ];
         for (const [name, source, keys] of required) {
             for (const key of keys) {
@@ -528,7 +528,8 @@ class AmneziaApp {
             set('previewAllowedIps', p.AllowedIPs || '-');
             set('previewKeepalive', p.PersistentKeepalive || '-');
             set('previewPresharedKey', p.PresharedKey ? 'present' : 'not set');
-            set('previewObfuscation', `Jc=${i.Jc}, Jmin=${i.Jmin}, Jmax=${i.Jmax}, S1=${i.S1}, S2=${i.S2}, H1=${i.H1}, H2=${i.H2}, H3=${i.H3}, H4=${i.H4}`);
+            const fields = ['Jc', 'Jmin', 'Jmax', 'S1', 'S2', 'S3', 'S4', 'H1', 'H2', 'H3', 'H4', 'I1', 'I2', 'I3', 'I4', 'I5', 'ContentPaddingAddition', 'RekeyAfterTime', 'RekeyTimeout', 'RejectAfterTime', 'KeepaliveTimeout', 'MaxHandshakeAttempts'];
+            set('previewObfuscation', `${i.HeaderProtectionKey ? 'AWG 3.0; header key present; ' : ''}${fields.filter(k => i[k] !== undefined).map(k => `${k}=${i[k]}`).join(', ')}`);
             preview.classList.remove('hidden');
         } catch (error) {
             emptyView();
@@ -624,6 +625,8 @@ class AmneziaApp {
         if (s1Element) s1Element.value = Math.floor(Math.random() * 136) + 15; // 15-150
         if (s2Element) s2Element.value = Math.floor(Math.random() * 136) + 15; // 15-150
         
+        if (this.getElement('paramS3')) this.getElement('paramS3').value = 12;
+        if (this.getElement('paramS4')) this.getElement('paramS4').value = 12;
         // Generate unique H values
         const hValues = new Set();
         while (hValues.size < 4) {
@@ -651,29 +654,27 @@ class AmneziaApp {
     }
 
     validateObfuscationParamsJS(params, mtu) {
-        let errors = [];
-
-        // Jmin < Jmax ≤ mtu
-        if (!(params.Jmin < params.Jmax && params.Jmax <= mtu)) {
-            errors.push(`Jmin (${params.Jmin}) must be less than Jmax (${params.Jmax}), and Jmax ≤ MTU (${mtu})`);
+        const errors = [];
+        if (!(Number.isInteger(params.Jc) && params.Jc >= 0 && params.Jc <= 65535)) errors.push('Jc must be an unsigned integer');
+        if (!(params.Jmin >= 0 && params.Jmin <= params.Jmax && params.Jmax <= mtu)) errors.push('Require 0 <= Jmin <= Jmax <= MTU');
+        const min = (this.getElement('awgVersion')?.value || '3') === '3' ? 12 : 0;
+        for (const [key, overhead] of [['S1', 148], ['S2', 92], ['S3', 64], ['S4', 32]]) {
+            if (!(Number.isInteger(params[key]) && params[key] >= min && params[key] <= mtu - overhead)) {
+                errors.push(`${key} must be within ${min}..${mtu - overhead}`);
+            }
         }
-        // Jmax > Jmin < mtu
-        if (!(params.Jmax > params.Jmin && params.Jmin < mtu)) {
-            errors.push(`Jmax (${params.Jmax}) must be greater than Jmin (${params.Jmin}), and Jmin < MTU (${mtu})`);
+        const headers = [];
+        for (const key of ['H1', 'H2', 'H3', 'H4']) {
+            const value = String(params[key]);
+            const parts = value.split('-').map(Number);
+            const lo = parts[0], hi = parts[parts.length - 1];
+            if (!/^[0-9]+(?:-[0-9]+)?$/.test(value) || lo > hi || hi > 4294967295) {
+                errors.push(`${key} must be a uint32 integer or ordered range`);
+                continue;
+            }
+            if (headers.some(([a, b]) => Math.max(a, lo) <= Math.min(b, hi))) errors.push('H1-H4 must not overlap');
+            headers.push([lo, hi]);
         }
-        // S1 ≤ (mtu - 148) and in the range from 15 to 150
-        if (!(params.S1 <= (mtu - 148) && params.S1 >= 15 && params.S1 <= 150)) {
-            errors.push(`S1 (${params.S1}) must be in [15, 150] and ≤ (MTU - 148) (${mtu - 148})`);
-        }
-        // S2 ≤ (mtu - 92) and in the range from 15 to 150
-        if (!(params.S2 <= (mtu - 92) && params.S2 >= 15 && params.S2 <= 150)) {
-            errors.push(`S2 (${params.S2}) must be in [15, 150] and ≤ (MTU - 92) (${mtu - 92})`);
-        }
-        // S1 + 56 ≠ S2
-        if (params.S1 + 56 === params.S2) {
-            errors.push(`S1 + 56 (${params.S1 + 56}) must not equal S2 (${params.S2})`);
-        }
-
         return errors;
     }
 
@@ -951,6 +952,7 @@ class AmneziaApp {
                 mtu: mtuElement ? parseInt(mtuElement.value) : 1420,
                 dns: dnsElement ? dnsElement.value.trim() : '8.8.8.8,1.1.1.1',
                 bandwidth_tier: bandwidthTierElement ? bandwidthTierElement.value : 'free',
+                awg_version: this.getElement('awgVersion')?.value || '3',
                 obfuscation: mode === 'edge_linked' ? true : (obfuscationElement ? obfuscationElement.checked : true),
                 auto_start: autoStartElement ? autoStartElement.checked : true,
                 mode: mode
@@ -975,10 +977,12 @@ class AmneziaApp {
                 Jmax: parseInt(this.getElement('paramJmax')?.value || '80'),
                 S1: parseInt(this.getElement('paramS1')?.value || '50'),
                 S2: parseInt(this.getElement('paramS2')?.value || '60'),
-                H1: parseInt(this.getElement('paramH1')?.value || '1000'),
-                H2: parseInt(this.getElement('paramH2')?.value || '2000'),
-                H3: parseInt(this.getElement('paramH3')?.value || '3000'),
-                H4: parseInt(this.getElement('paramH4')?.value || '4000'),
+                S3: Number(this.getElement('paramS3')?.value ?? '12'),
+                S4: Number(this.getElement('paramS4')?.value ?? '12'),
+                H1: this.getElement('paramH1')?.value.trim() || '1000',
+                H2: this.getElement('paramH2')?.value.trim() || '2000',
+                H3: this.getElement('paramH3')?.value.trim() || '3000',
+                H4: this.getElement('paramH4')?.value.trim() || '4000',
             };
 
             const obfErrors = this.validateObfuscationParamsJS(formData.obfuscation_params, formData.mtu);
@@ -1143,7 +1147,7 @@ class AmneziaApp {
                         <p class="text-sm text-gray-600">
                             ${server.protocol === 'vless'
                                 ? `ID: ${server.id} | VLESS+${this.getVlessSecurityLabel(server)}+${this.getVlessTransportLabel(server)} | client TCP port: ${server.port}`
-                                : `ID: ${server.id} | Port: ${server.port} | Subnet: ${server.subnet} | Mode: ${server.mode || 'standalone'} ${server.obfuscation_enabled ? '| 🔒 Obfuscated' : ''}`
+                                : `ID: ${server.id} | Port: ${server.port} | Subnet: ${server.subnet} | Mode: ${server.mode || 'standalone'} ${server.obfuscation_enabled ? `| 🔒 AWG ${this.getAwgVersion(server)}` : ''}`
                             }
                         </p>
                         <p class="text-sm text-gray-500">Public IP: ${server.public_ip}</p>
@@ -1188,6 +1192,9 @@ class AmneziaApp {
                         Stop
                     </button>
                     `}
+                    ${server.protocol !== 'vless' && server.obfuscation_enabled && server.status === 'stopped' && this.getAwgVersion(server) !== '3.0' ? `
+                    <button onclick="amneziaApp.upgradeAwg3('${server.id}')" class="bg-purple-600 text-white px-3 py-1 rounded hover:bg-purple-700">Upgrade to AWG 3.0</button>
+                    ` : ''}
                     <button onclick="amneziaApp.addClient('${server.id}')" class="bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600">
                         Add Client
                     </button>
@@ -1464,6 +1471,26 @@ class AmneziaApp {
                     console.error('Error deleting client:', error);
                     alert('Error deleting client: ' + error.message);
                 });
+        }
+    }
+
+    getAwgVersion(server) {
+        const params = server.obfuscation_params || {};
+        if (params.HeaderProtectionKey) return '3.0';
+        if ('S3' in params || 'S4' in params || ['H1', 'H2', 'H3', 'H4'].some(k => String(params[k]).includes('-'))) return '2.0';
+        return '1.x';
+    }
+
+    async upgradeAwg3(serverId) {
+        if (!confirm('Upgrade this stopped server to AWG 3.0? A backup will be saved. All clients must support AWG 3 and download/import their updated configs before reconnecting. Existing keys, addresses and clients will be retained.')) return;
+        try {
+            const response = await fetch(`/api/servers/${serverId}/upgrade-awg3`, { method: 'POST' });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || 'Upgrade failed');
+            await this.loadServers();
+            alert(`AWG 3.0 is configured. Download and reimport updated client configs, then start the server. Backup: ${result.awg3_backup_path || 'already upgraded'}`);
+        } catch (error) {
+            alert(`AWG upgrade failed: ${error.message}`);
         }
     }
 
