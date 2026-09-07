@@ -1655,6 +1655,38 @@ class AmneziaManager:
                 })
         return {sni: refs for sni, refs in by_sni.items() if len(refs) > 1}
 
+    def _find_vless_reality_sni_owners(self, server_names, exclude_id=None):
+        """Return existing stream-routed REALITY servers that already own these SNI names."""
+        wanted = {
+            str(sn or "").strip().lower()
+            for sn in (server_names or [])
+            if str(sn or "").strip()
+        }
+        if not wanted:
+            return []
+        owners = []
+        for server in self.config.get("servers", []):
+            if server.get("protocol") != "vless":
+                continue
+            if exclude_id and server.get("id") == exclude_id:
+                continue
+            vless = server.get("vless") or {}
+            if not self._vless_is_reality(vless) or not vless.get("use_stream"):
+                continue
+            existing = {
+                str(sn or "").strip().lower()
+                for sn in (vless.get("reality_server_names") or [])
+                if str(sn or "").strip()
+            }
+            overlap = sorted(wanted & existing)
+            if overlap:
+                owners.append({
+                    "server_id": server.get("id"),
+                    "server_name": server.get("name"),
+                    "sni": overlap,
+                })
+        return owners
+
     def vless_server_warnings(self, server, sni_conflicts=None):
         warnings = []
         if not server or server.get("protocol") != "vless":
@@ -2009,6 +2041,17 @@ class AmneziaManager:
             # Non-empty shortId only: the empty string allows unauthenticated connections.
             short_ids = [short_id]
             reality_spiderx = str(server_data.get("reality_spiderx") or self._generate_reality_spiderx()).strip()
+            sni_owners = self._find_vless_reality_sni_owners(server_names)
+            if sni_owners:
+                details = "; ".join(
+                    f"{', '.join(owner['sni'])} -> {owner.get('server_name') or owner.get('server_id')}"
+                    for owner in sni_owners
+                )
+                raise ValueError(
+                    "REALITY SNI is already used by another VLESS server on this VPS. "
+                    "nginx stream can route one SNI to only one Xray inbound; add clients to the existing server "
+                    f"or use a different domain/mask. Conflicts: {details}"
+                )
         else:
             reality_profile = ""
             reality_dest = ""
