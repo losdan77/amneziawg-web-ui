@@ -27,7 +27,9 @@ from datetime import datetime, timezone
 from awg_protocol import (OBFUSCATION_KEYS, V3_KEYS, generate_params, normalize_params,
                           import_params, normalize_keepalive, protocol_version,
                           upgrade_params, render_params, replace_interface_params)
-from routing_policy import AI_TIKTOK_DOMAINS, SelectiveRouting, normalize_routing_policy
+from routing_policy import (AI_TIKTOK_DOMAINS, BUILTIN_SERVICE_CIDRS, SelectiveRouting,
+                            normalize_routing_policy, normalize_service_cidrs,
+                            resolve_service_hosts)
 
 # Get the absolute path to the current directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -317,6 +319,7 @@ class AmneziaManager:
 
         self.start_client_expiration_worker()
         self.start_link_health_worker()
+        self.start_destination_cache_worker()
 
     # ── Flexible client expiration ──────────────────────────────────────
     # The web UI / bot can pass any of the following as the ``duration`` field:
@@ -1088,6 +1091,233 @@ class AmneziaManager:
     def start_link_health_worker(self):
         worker = threading.Thread(target=self.link_health_worker, daemon=True)
         worker.start()
+
+    def destination_cache_tick(self, last_refresh):
+        """Snapshot learned addresses and refresh popular destinations off-lock.
+
+        DNS lookups never hold config_lock. Recheck interface/table identity
+        under the lock before applying results so detach/replacement cannot
+        resurrect an old routing policy while a lookup is in flight.
+        """
+        now = time.monotonic()
+        pending = []
+        with self.config_lock:
+            for server in self.config.get('servers', []):
+                if (server.get('protocol') == 'vless' or not self._server_has_linked_upstream(server)
+                        or normalize_routing_policy(server['upstream']) != 'ai_tiktok'
+                        or not self.is_interface_running(server.get('interface'))):
+                    continue
+                identity = (server['id'], server['interface'], int(server['upstream']['table_id']))
+                try:
+                    self._selective_routing().save_addresses(server)
+                    if now - last_refresh.get(identity, -600) >= 600:
+                        pending.append(identity)
+                except Exception as error:
+                    print(f"Destination cache snapshot failed for {server['id']}: {type(error).__name__}")
+        if not pending or self.stop_expiration_worker.is_set():
+            return
+        result = resolve_service_hosts()
+        with self.config_lock:
+            for identity in pending:
+                server = next((item for item in self.config.get('servers', []) if item.get('id') == identity[0]), None)
+                if (not server or server.get('protocol') == 'vless' or not self._server_has_linked_upstream(server)
+                        or normalize_routing_policy(server['upstream']) != 'ai_tiktok'
+                        or server['interface'] != identity[1]
+                        or int(server['upstream']['table_id']) != identity[2]
+                        or not self.is_interface_running(server['interface'])):
+                    continue
+                try:
+                    self._selective_routing().apply_seed_addresses(server, result)
+                    # Keep the ordinary ten-minute cadence, but retry partial
+                    # or empty DNS results after one minute. Backdate only the
+                    # scheduling timestamp; cached-address expiry is unchanged.
+                    retry_soon = bool(result.get('errors')) or not result.get('addresses')
+                    last_refresh[identity] = time.monotonic() - (540 if retry_soon else 0)
+                except Exception as error:
+                    print(f"Destination IP refresh failed for {server['id']}: {type(error).__name__}")
+
+    def destination_cache_worker(self):
+        last_refresh = {}
+        while not self.stop_expiration_worker.is_set():
+            try:
+                self.destination_cache_tick(last_refresh)
+            except Exception as error:
+                print(f"Destination cache worker failed: {type(error).__name__}")
+            self.stop_expiration_worker.wait(30)
+
+    def start_destination_cache_worker(self):
+        threading.Thread(target=self.destination_cache_worker, daemon=True).start()
+
+    def get_upstream_diagnostics(self, server_id, destination='chatgpt.com'):
+        """Read the classifier and Linux route for a destination, without changing either.
+
+        A route lookup models a new client connection; it does not contact the
+        service or inspect the client's existing conntrack state or DNS cache.
+        Never return the server/upstream config, which contains private keys.
+        """
+        with self.config_lock:
+            server = next((s for s in self.config.get('servers', []) if s.get('id') == server_id), None)
+            if server is None:
+                return None
+            if not self._server_has_linked_upstream(server):
+                raise ValueError('This server has no upstream tunnel')
+        if not isinstance(destination, str) or not destination or len(destination) > 253:
+            raise ValueError('Enter a public IPv4 address or domain name')
+        destination = destination.lower().rstrip('.')
+        hostname = None
+        try:
+            address = ipaddress.IPv4Address(destination)
+        except ValueError:
+            # Reject IP-like invalid input instead of treating it as a hostname.
+            if (re.fullmatch(r'[0-9.]+', destination) or '.' not in destination
+                    or not all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label)
+                               for label in destination.split('.'))):
+                raise ValueError('Enter a public IPv4 address or domain name')
+            hostname = destination
+            addresses = resolve_service_hosts(hosts=(hostname,))['addresses'][:16]
+        else:
+            if not address.is_global or address.is_multicast or address.is_reserved:
+                raise ValueError('Enter a public IPv4 address')
+            addresses = [str(address)]
+
+        # DNS is outside the lock; obtain the current policy after it completes.
+        with self.config_lock:
+            current = next((s for s in self.config.get('servers', []) if s.get('id') == server_id), None)
+            if current is None:
+                return None
+            if not self._server_has_linked_upstream(current):
+                raise ValueError('This server has no upstream tunnel')
+            server = copy.deepcopy(current)
+            upstream = server['upstream']
+            table = int(upstream['table_id'])
+            fwmark = int(upstream.get('fwmark') or table)
+            is_vless = server.get('protocol') == 'vless'
+            interface, upstream_interface = server.get('interface'), upstream['interface']
+            if any(not re.fullmatch(r'[a-zA-Z0-9_-]{1,15}', name)
+                   for name in ([upstream_interface] if is_vless else [interface or '', upstream_interface])):
+                raise ValueError('Invalid tunnel interface name')
+            policy = normalize_routing_policy(upstream)
+            healthy, handshake_age = self.is_upstream_healthy(server)
+            classifier = {'dns_running': None, 'dns_entries': 0, 'pool_entries': 0,
+                          'matched_packets': 0, 'rules_attached': None}
+            classification_rules = {'jump': False, 'dns': False, 'pool': False}
+            warnings = [
+                'Проверка моделирует новое соединение клиента. Она не проверяет его DNS-кэш, '
+                'существующие соединения и трафик, созданный самой VPS.',
+            ]
+            if policy == 'ai_tiktok':
+                warnings.insert(0, 'В режиме AI + TikTok обычный сайт «мой IP» должен показывать IP первой VPS.')
+            if hostname:
+                warnings.append('Домен разрешён на сервере; у клиента может быть другой IP. '
+                                'Для точной проверки укажите IPv4 фактического соединения клиента.')
+            if not addresses:
+                warnings.append('Не удалось получить публичный IPv4 для этого домена.')
+            if server.get('routing_state') == 'local':
+                warnings.append('Сейчас активен локальный выход: проверьте туннель и режим fail_open.')
+            if not healthy:
+                warnings.append('Нет свежего подтверждённого handshake с выходной VPS.')
+            if policy == 'ai_tiktok' and not is_vless:
+                routing = self._selective_routing()
+                classifier['dns_running'] = bool(routing._dns_pid(table))
+                subnet = str(ipaddress.IPv4Network(server['subnet'], strict=False))
+                rules = {
+                    'jump': f'PREROUTING -i {interface} -s {subnet} -j AWGSEL_{table}',
+                    'dns': f'AWGSEL_{table} -m set --match-set awgsel_{table} dst -j MARK --set-mark {fwmark}',
+                    'pool': f'AWGSEL_{table} -m set --match-set awgpool_{table} dst -j MARK --set-mark {fwmark}',
+                }
+                for kind, rule in rules.items():
+                    output = self.execute_command(
+                        f'iptables -t mangle -C {rule} >/dev/null 2>&1 && printf attached || true')
+                    classification_rules[kind] = bool(output and output.strip() == 'attached')
+                classifier['rules_attached'] = all(classification_rules.values())
+                for key, name in (('dns_entries', f'awgsel_{table}'), ('pool_entries', f'awgpool_{table}')):
+                    output = self.execute_command(f'ipset list {name} -terse 2>/dev/null') or ''
+                    count = re.search(r'^Number of entries:\s*(\d+)', output, re.MULTILINE)
+                    classifier[key] = int(count.group(1)) if count else 0
+                counters = self.execute_command(f'iptables -t mangle -L AWGSEL_{table} -n -v -x 2>/dev/null') or ''
+                # One SAVE rule per chain counts the union of the DNS/pool matches.
+                for line in counters.splitlines():
+                    parts = line.split()
+                    if len(parts) > 2 and parts[0].isdigit() and parts[2] == 'CONNMARK' and 'save' in line:
+                        classifier['matched_packets'] += int(parts[0])
+                status = routing.seed_status(server)
+                status['errors'] = len(status['errors']) if isinstance(status.get('errors'), list) else 0
+                classifier['seed_status'] = {key: status[key] for key in
+                                             ('last_attempt', 'last_success', 'addresses', 'resolved_hosts', 'queried_hosts', 'errors')
+                                             if isinstance(status.get(key), (int, float))}
+                if not classifier['rules_attached']:
+                    warnings.append('Правила маркировки трафика отсутствуют или неполны. '
+                                    'Само наличие адреса в списке IP не направляет его в туннель.')
+                if not classifier['dns_running']:
+                    warnings.append('DNS-классификатор не работает; новые домены клиента не пополняют список IP.')
+                if not classifier['dns_entries'] and not classifier['pool_entries']:
+                    warnings.append('Оба списка IP пусты: выборочная маршрутизация не распознаёт адреса.')
+                warnings.append('Классификация AWG работает по IPv4. Защищённый DNS и неизвестные '
+                                'адреса CDN могут обходить список; существующее соединение нужно переподключить.')
+
+            def in_set(name, address):
+                output = self.execute_command(f'ipset test {name} {address} >/dev/null 2>&1 && printf matched || true')
+                return bool(output and output.strip() == 'matched')
+
+            networks = [ipaddress.IPv4Network(value) for value in
+                        list(BUILTIN_SERVICE_CIDRS) + normalize_service_cidrs(upstream.get('service_cidrs'))]
+            source = None
+            if not is_vless:
+                network = ipaddress.IPv4Network(server['subnet'], strict=False)
+                server_address = ipaddress.IPv4Address(server['server_ip'])
+                source = next((str(ip) for ip in network.hosts() if ip != server_address), None)
+            destinations = []
+            for address in addresses:
+                # Canonicalize even resolver output before constructing a command.
+                address = str(ipaddress.IPv4Address(address))
+                dns_match = pool_match = False
+                if policy == 'ai_tiktok':
+                    if is_vless:
+                        dns_match = bool(hostname and any(hostname == suffix or hostname.endswith('.' + suffix)
+                                                         for suffix in AI_TIKTOK_DOMAINS))
+                        pool_match = any(ipaddress.IPv4Address(address) in network for network in networks)
+                    else:
+                        dns_match = in_set(f'awgsel_{table}', address)
+                        pool_match = in_set(f'awgpool_{table}', address)
+                    matched = dns_match or pool_match
+                else:
+                    # All/RU policies are determined by the installed route table.
+                    matched = True
+                mark = fwmark if matched else 0
+                if policy == 'ai_tiktok' and not is_vless:
+                    applies_mark = classification_rules['jump'] and (
+                        (dns_match and classification_rules['dns']) or
+                        (pool_match and classification_rules['pool']))
+                    mark = fwmark if applies_mark else 0
+                if is_vless and server.get('routing_state') == 'local':
+                    mark = 0
+                query = f'ip -j -4 route get {address}'
+                if not is_vless and source:
+                    query += f' from {source} iif {interface}'
+                query += f' mark {mark} 2>/dev/null'
+                output = self.execute_command(query)
+                route, egress = 'unknown', ''
+                try:
+                    details = json.loads(output or '[]')
+                    details = details[0] if isinstance(details, list) and details else {}
+                    egress = details.get('dev', '')
+                    if details.get('type') in ('blackhole', 'unreachable', 'prohibit'):
+                        route = 'blocked'
+                    elif egress:
+                        route = 'upstream' if egress == upstream_interface else 'local'
+                except (TypeError, ValueError, AttributeError):
+                    pass
+                destinations.append({'address': address, 'matched': matched, 'dns_match': dns_match,
+                                     'pool_match': pool_match, 'route': route, 'egress': egress})
+            if any(item['route'] == 'unknown' for item in destinations):
+                warnings.append('Ядро не вернуло маршрут для части адресов: возможна блокировка fail_close '
+                                'или остановленный интерфейс. Это не подтверждает локальный выход.')
+            return {'protocol': server.get('protocol', 'amneziawg'), 'routing_mode': policy,
+                    'routing_state': server.get('routing_state'),
+                    'failover_mode': server.get('linked_failover_mode', 'fail_close'),
+                    'upstream': {'interface': upstream_interface, 'healthy': healthy,
+                                 'handshake_age_seconds': handshake_age},
+                    'classifier': classifier, 'destinations': destinations, 'warnings': warnings}
 
     def ensure_directories(self):
         os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -2023,6 +2253,12 @@ class AmneziaManager:
                         "domain": ['domain:' + domain for domain in AI_TIKTOK_DOMAINS],
                         "outboundTag": outbound_tag,
                     })
+                    routing_rules.append({
+                        "type": "field",
+                        "inboundTag": [inbound_tag],
+                        "ip": list(BUILTIN_SERVICE_CIDRS) + normalize_service_cidrs(upstream.get('service_cidrs')),
+                        "outboundTag": outbound_tag,
+                    })
                     outbound_tag = 'direct'
                 routing_rules.append({
                     "type": "field",
@@ -2049,7 +2285,9 @@ class AmneziaManager:
         }
         if routing_rules:
             config["routing"] = {
-                "domainStrategy": "IPIfNonMatch",
+                # Resolve at the IP rule: the per-inbound direct fallback would
+                # otherwise match before IPIfNonMatch ever attempted DNS.
+                "domainStrategy": "IPOnDemand" if any('ip' in rule for rule in routing_rules) else "IPIfNonMatch",
                 "rules": routing_rules,
             }
 
@@ -3680,6 +3918,7 @@ class AmneziaManager:
             raise ValueError("Linked Edge mode requires imported EU client config")
 
         routing_mode = normalize_routing_policy(upstream_data)
+        service_cidrs = normalize_service_cidrs(upstream_data.get('service_cidrs'))
         imported_obfuscation = {}
         interface_cfg, peer_cfg = self.parse_amnezia_config_text(import_config_text)
         endpoint_value = peer_cfg.get("Endpoint", "")
@@ -3751,6 +3990,7 @@ class AmneziaManager:
             "obfuscation_params": imported_obfuscation,
             "table_id": self._allocate_upstream_table_id(base=table_base),
             "routing_mode": routing_mode,
+            "service_cidrs": service_cidrs,
             "split_ru_local": routing_mode == 'ru_split',
             "mtu": mtu,
             "awg_version": protocol_version(imported_obfuscation),
@@ -4121,6 +4361,7 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
             raise ValueError('Import the destination server client configuration first')
         policy_data = upstream_data if any(k in upstream_data for k in ('routing_mode', 'split_ru_local')) else previous
         routing_mode = normalize_routing_policy(policy_data)
+        service_cidrs = normalize_service_cidrs(upstream_data.get('service_cidrs', previous.get('service_cidrs')))
         failover_mode = str(upstream_data.get('failover_mode', server.get('linked_failover_mode') or 'fail_close')).strip().lower()
         if failover_mode not in ('fail_close', 'fail_open'):
             raise ValueError('upstream.failover_mode must be fail_close or fail_open')
@@ -4158,6 +4399,7 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
             upstream['table_id'] = self._allocate_upstream_table_id()
             upstream['fwmark'] = self._allocate_upstream_fwmark()
         upstream['routing_mode'] = routing_mode
+        upstream['service_cidrs'] = service_cidrs
         upstream['split_ru_local'] = routing_mode == 'ru_split'
         upstream_network = ipaddress.ip_interface(upstream['local_address']).network
         for other in self.config['servers']:
@@ -5448,6 +5690,19 @@ def manage_server_upstream(server_id):
     if server is None:
         return jsonify({'error': 'Server not found'}), 404
     return jsonify(server)
+
+@app.route('/api/servers/<server_id>/upstream/diagnostics', methods=['GET'])
+def upstream_diagnostics(server_id):
+    try:
+        result = amnezia_manager.get_upstream_diagnostics(server_id, request.args.get('destination', 'chatgpt.com'))
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+    except (OSError, RuntimeError) as error:
+        print(f'Upstream diagnostics failed for {server_id}: {type(error).__name__}')
+        return jsonify({'error': 'Could not read routing state; check server logs'}), 500
+    if result is None:
+        return jsonify({'error': 'Server not found'}), 404
+    return jsonify(result)
 
 @app.route('/api/servers/<server_id>/metadata', methods=['PATCH'])
 def update_server_metadata(server_id):

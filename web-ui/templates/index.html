@@ -339,7 +339,7 @@
                             <option value="ai_tiktok">AI services + TikTok only (all other traffic stays local)</option>
                         </select>
                         <p class="text-gray-500 text-xs mt-1">AI services include ChatGPT, Codex, Claude and other supported services. Local traffic uses this server's ordinary network adapter.</p>
-                        <p id="upstreamSelectiveDnsHint" class="text-amber-800 text-xs mt-2 hidden">For AWG selective routing, disable encrypted / Private DNS and browser Secure DNS on clients. Routing uses DNS lookups; services sharing the same IP may also use the tunnel. Reconnect clients after changing this mode to refresh DNS.</p>
+                        <p id="upstreamSelectiveDnsHint" class="text-amber-800 text-xs mt-2 hidden">AWG learns IPv4 addresses from DNS, pre-resolves known service hosts and includes documented API networks. Disable encrypted / Private DNS and browser Secure DNS for reliable learning. Shared IPs may send unrelated services through the tunnel; IPv6 outside the VPN is not covered. Reconnect clients and refresh their DNS after changing this mode. Use the server's tunnel settings to add verified service addresses or check routing.</p>
                     </div>
                     <div id="upstreamPreview" class="mb-4 border rounded-md p-3 bg-white hidden">
                         <h4 class="text-sm font-semibold text-gray-700 mb-2">Parsed preview</h4>

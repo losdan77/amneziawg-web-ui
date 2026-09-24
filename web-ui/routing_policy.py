@@ -1,25 +1,31 @@
-"""Shared destination policy and DNS-assisted IPv4 routing for AWG clients.
+"""Shared destination policy and hybrid IPv4 routing for AWG clients.
 
 AWG carries IP packets, not domain names. dnsmasq learns addresses from ordinary
 DNS and populates a private ipset before returning the answer to the client.
-Encrypted DNS and shared CDN addresses are inherent limitations of this mode.
+A separate IP/network pool covers pre-resolved hosts and explicit public CIDRs.
+Unknown encrypted-DNS answers and shared CDN IPs remain limitations of this mode.
 """
 import ipaddress
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
 import re
 import shlex
 import signal
+import tempfile
 import time
+
+import requests
 
 
 # Domain suffixes, deliberately avoiding entire shared CDNs/google.com.
 # Keep this single list shared by dnsmasq and Xray.
 AI_TIKTOK_DOMAINS = (
     'openai.com', 'chatgpt.com', 'oaistatic.com', 'oaiusercontent.com',
-    'chat.com', 'sora.com',
+    'chat.com', 'sora.com', 'oaistatsig.com', 'cdn.openaimerge.com',
     'anthropic.com', 'claude.ai', 'claude.com', 'claudeusercontent.com',
+    'claudemcpclient.com', 'claudemcpcontent.com',
     'gemini.google.com', 'aistudio.google.com', 'generativelanguage.googleapis.com',
     'aiplatform.googleapis.com', 'alkalimakersuite-pa.clients6.google.com',
     'makersuite.google.com', 'notebooklm.google.com', 'notebooklm.google',
@@ -36,7 +42,110 @@ AI_TIKTOK_DOMAINS = (
     'tiktokrow-cdn.com', 'tiktokshop.com', 'musical.ly',
     'muscdn.com', 'byteoversea.com', 'ibytedtos.com', 'ibyteimg.com',
     'ipstatp.com', 'isnssdk.com', 'sgpstatp.com',
+    'tik-tokapi.com', 'tiktok-row.net', 'tiktokd.org', 'tiktokeu-cdn.com',
+    'tiktokv.eu', 'tiktokw.eu', 'tiktokw.us', 'ttcdn-us.com', 'ttlivecdn.com',
+    'ttoverseaus.net', 'ttwstatic.com', 'tiktokcdn.com.akamaized.net',
+    'tiktokv.com.edgekey.net',
 )
+
+# Anthropic's published API range. This is not a complete range for Claude's
+# website, and shared CDN ranges must never be inferred from an ASN owner.
+SERVICE_IP_NETWORKS = ('160.79.104.0/23',)
+BUILTIN_SERVICE_CIDRS = SERVICE_IP_NETWORKS
+SERVICE_SEED_HOSTS = (
+    'chatgpt.com', 'www.chatgpt.com', 'auth.openai.com', 'auth0.openai.com',
+    'api.openai.com', 'platform.openai.com', 'ab.chatgpt.com',
+    'ws.chatgpt.com', 'chat.openai.com', 'cdn.oaistatic.com',
+    'files.oaiusercontent.com', 'claude.ai', 'www.claude.ai',
+    'api.anthropic.com', 'console.anthropic.com',
+    'www.tiktok.com', 'm.tiktok.com', 'tiktok.com', 'www.tiktokv.com',
+    'api16-normal-c-useast1a.tiktokv.com', 'api16-normal-c-useast2a.tiktokv.com',
+    'api16-normal-c-alisg.tiktokv.com',
+)
+SEED_TTL = 3600
+MAX_SERVICE_CIDRS = 256
+_NON_PUBLIC_NETWORKS = tuple(ipaddress.IPv4Network(value) for value in (
+    '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8',
+    '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24', '192.0.2.0/24',
+    '192.88.99.0/24', '192.168.0.0/16', '198.18.0.0/15',
+    '198.51.100.0/24', '203.0.113.0/24', '224.0.0.0/4', '240.0.0.0/4',
+))
+
+
+def normalize_service_cidrs(value):
+    """Validate optional public IPv4 networks without broad or private routes."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_SERVICE_CIDRS:
+        raise ValueError('service_cidrs must be a list of at most 256 IPv4 addresses or networks')
+    networks = set()
+    for item in value:
+        if not isinstance(item, str) or not item or item != item.strip() or re.search(r'\s', item):
+            raise ValueError('Each service_cidrs entry must be one IPv4 address or network')
+        try:
+            network = ipaddress.IPv4Network(item, strict=False)
+        except ValueError as error:
+            raise ValueError('service_cidrs only supports IPv4 addresses or networks') from error
+        if network.prefixlen < 8 or any(network.overlaps(other) for other in _NON_PUBLIC_NETWORKS):
+            raise ValueError('service_cidrs must contain public IPv4 networks with prefix /8 or narrower')
+        networks.add(network)
+    return [str(network) for network in sorted(networks)]
+
+
+def _public_ipv4(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        address = ipaddress.IPv4Address(value)
+    except (ValueError, TypeError):
+        return None
+    if not address.is_global or address.is_multicast or address.is_reserved:
+        return None
+    return str(address)
+
+
+def _resolve_host_doh(host):
+    response = requests.get('https://dns.google/resolve', params={'name': host, 'type': 'A'},
+                            timeout=(3, 5))
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get('Status') != 0:
+        raise ValueError('DNS query failed')
+    return [answer.get('data') for answer in payload.get('Answer', [])
+            if isinstance(answer, dict) and answer.get('type') == 1]
+
+
+def resolve_service_hosts(hosts=SERVICE_SEED_HOSTS, resolver=None):
+    """Resolve known exact hosts without requiring a client DNS lookup.
+
+    The resolver callback accepts one host and returns IPv4 address strings.
+    A failed host is reported without discarding other or previously cached
+    destinations. This function performs no configuration or routing writes.
+    """
+    hosts = tuple(dict.fromkeys(hosts))
+    if len(hosts) > 256 or any(not isinstance(host, str) or
+                             not re.fullmatch(r'[a-z0-9]+(?:[.-][a-z0-9]+)+', host)
+                             for host in hosts):
+        raise ValueError('Invalid service seed hosts')
+    resolver = resolver or _resolve_host_doh
+    addresses, errors = set(), []
+    resolved = 0
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        pending = {executor.submit(resolver, host): host for host in hosts}
+        for future in as_completed(pending):
+            try:
+                values = future.result()
+                if isinstance(values, str):
+                    values = [values]
+                valid = {address for value in values if (address := _public_ipv4(value))}
+                if not valid:
+                    raise ValueError('No public IPv4 DNS answers')
+                addresses.update(valid)
+                resolved += 1
+            except Exception:
+                errors.append(pending[future])
+    return {'addresses': sorted(addresses, key=ipaddress.IPv4Address),
+            'errors': sorted(errors), 'resolved_hosts': resolved, 'queried_hosts': len(hosts)}
 
 
 def normalize_routing_policy(data):
@@ -83,9 +192,121 @@ class SelectiveRouting:
         _, _, interface, _, _ = self._context(server)
         return self.directory / f'addresses-{interface}.json'
 
+    def _seed_path(self, server):
+        _, _, interface, _, _ = self._context(server)
+        return self.directory / f'seed-addresses-{interface}.json'
+
+    def _seed_status_path(self, server):
+        _, _, interface, _, _ = self._context(server)
+        return self.directory / f'seed-status-{interface}.json'
+
+    def _write_json(self, path, content):
+        self.directory.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                             dir=self.directory, prefix=path.name + '.',
+                                             suffix='.tmp', delete=False) as stream:
+                temporary = stream.name
+                os.chmod(temporary, 0o600)
+                json.dump(content, stream, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary:
+                Path(temporary).unlink(missing_ok=True)
+
+    def seed_status(self, server):
+        try:
+            result = json.loads(self._seed_status_path(server).read_text(encoding='utf-8'))
+            return result if isinstance(result, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _seed_addresses(self, server):
+        now = time.time()
+        try:
+            values = json.loads(self._seed_path(server).read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(values, dict):
+            return {}
+        result = {}
+        for address, expiry in values.items():
+            validated = _public_ipv4(address)
+            try:
+                ttl = int(float(expiry) - now)
+            except (ValueError, TypeError, OverflowError):
+                continue
+            if validated and ttl > 0:
+                result[validated] = now + min(SEED_TTL, ttl)
+        return result
+
+    def _static_networks(self, server):
+        return list(BUILTIN_SERVICE_CIDRS) + normalize_service_cidrs(server['upstream'].get('service_cidrs'))
+
+    def _add_seed_pool(self, server, values):
+        table, _, _, _, _ = self._context(server)
+        static = tuple(ipaddress.IPv4Network(network) for network in self._static_networks(server))
+        for address, expiry in values.items():
+            ttl = min(SEED_TTL, int(expiry - time.time()))
+            # Do not turn a permanent administrator /32 into an expiring entry.
+            if ttl > 0 and not any(ipaddress.IPv4Address(address) in network for network in static):
+                self._checked(f'ipset add awgpool_{table} {address}/32 timeout {ttl} -exist')
+
+    def apply_seed_addresses(self, server, result):
+        """Apply a completed refresh under the manager's configuration lock."""
+        self._context(server)
+        if not isinstance(result, dict) or not isinstance(result.get('addresses'), list):
+            raise ValueError('Invalid service resolution result')
+        values = self._seed_addresses(server)
+        now = time.time()
+        for address in result['addresses']:
+            validated = _public_ipv4(address)
+            if validated is None:
+                raise ValueError('Service resolution returned a non-public IPv4 address')
+            values[validated] = now + SEED_TTL
+        self._add_seed_pool(server, values)
+        self._write_json(self._seed_path(server), values)
+        previous = self.seed_status(server)
+        status = {'last_attempt': now,
+                  'last_success': now if result['addresses'] else previous.get('last_success'),
+                  'addresses': len(values),
+                  'errors': [host for host in result.get('errors', []) if isinstance(host, str)],
+                  'resolved_hosts': result.get('resolved_hosts', 0),
+                  'queried_hosts': result.get('queried_hosts', 0)}
+        self._write_json(self._seed_status_path(server), status)
+        return status
+
+    def _configure_pool(self, server):
+        table, _, _, _, _ = self._context(server)
+        pool = f'awgpool_{table}'
+        desired = set(self._static_networks(server))
+        self._checked(f'ipset create {pool} hash:net family inet timeout {SEED_TTL} -exist')
+        # Keep dynamically resolved destinations but remove obsolete permanent
+        # custom ranges when a policy is reapplied in a running namespace.
+        existing = self.run(f'ipset save {pool}') or ''
+        for line in existing.splitlines():
+            fields = line.split()
+            if len(fields) < 5 or fields[:2] != ['add', pool] or fields[3:5] != ['timeout', '0']:
+                continue
+            try:
+                network = str(ipaddress.IPv4Network(fields[2], strict=False))
+            except ValueError:
+                continue
+            if network not in desired:
+                self._checked(f'ipset del {pool} {network} -exist')
+        for network in sorted(desired):
+            self._checked(f'ipset add {pool} {network} timeout 0 -exist')
+        self._add_seed_pool(server, self._seed_addresses(server))
+
     def _save_addresses(self, server):
         table, _, _, _, _ = self._context(server)
-        output = self.run(f'ipset save awgsel_{table} 2>/dev/null') or ''
+        output = self.run(f'ipset save awgsel_{table} 2>/dev/null')
+        if output is None:
+            # A transient command failure must not replace a useful snapshot.
+            return
         addresses = {}
         now = time.time()
         for line in output.splitlines():
@@ -98,9 +319,11 @@ class SelectiveRouting:
                         addresses[address] = now + ttl
                 except ValueError:
                     continue
-        if addresses:
-            self.directory.mkdir(parents=True, exist_ok=True)
-            self._cache_path(server).write_text(json.dumps(addresses), encoding='utf-8')
+        self._write_json(self._cache_path(server), addresses)
+
+    def save_addresses(self, server):
+        """Periodically persist learned DNS targets even without a clean stop."""
+        self._save_addresses(server)
 
     def _restore_addresses(self, server):
         table, _, _, _, _ = self._context(server)
@@ -149,7 +372,7 @@ class SelectiveRouting:
             'filter-AAAA', 'cache-size=1000', 'max-cache-ttl=300', 'max-ttl=300',
             f'pid-file={pidfile}', f'log-facility={self.directory / ("dns-" + str(table) + ".log")}',
             *[f'server={value}' for value in resolvers],
-            f"ipset=/{'/'.join(AI_TIKTOK_DOMAINS)}/awgsel_{table}", '',
+            *[f'ipset=/{domain}/awgsel_{table}' for domain in AI_TIKTOK_DOMAINS], '',
         ])
         config.write_text(text, encoding='utf-8')
         os.chmod(config, 0o600)
@@ -164,6 +387,7 @@ class SelectiveRouting:
         self._checked(f'ipset create {ipset} hash:ip family inet timeout 86400 -exist')
         if ipset not in existing_sets:
             self._restore_addresses(server)
+        self._configure_pool(server)
         self.ensure_dns(server)
         self._checked(f'iptables -t mangle -N {chain} 2>/dev/null || iptables -t mangle -S {chain} >/dev/null')
         rules = [
@@ -173,6 +397,10 @@ class SelectiveRouting:
         ]
         for rule in rules:
             self._checked(f'iptables -t mangle -C {chain} {rule} 2>/dev/null || iptables -t mangle -A {chain} {rule}')
+        # Older live chains already have SAVE as their last rule. Insert the
+        # new classifier after RESTORE, so its mark is saved for later packets.
+        pool_rule = f'-m set --match-set awgpool_{table} dst -j MARK --set-mark {mark}'
+        self._checked(f'iptables -t mangle -C {chain} {pool_rule} 2>/dev/null || iptables -t mangle -I {chain} 2 {pool_rule}')
         rule = f'-i {interface} -s {subnet} -j {chain}'
         self._checked(f'iptables -t mangle -C PREROUTING {rule} 2>/dev/null || iptables -t mangle -A PREROUTING {rule}')
         for protocol in ('udp', 'tcp'):
@@ -202,5 +430,6 @@ class SelectiveRouting:
             except ProcessLookupError:
                 pass
         self.run(f'ipset destroy awgsel_{table} 2>/dev/null || true')
+        self.run(f'ipset destroy awgpool_{table} 2>/dev/null || true')
         for path in self._paths(table):
             path.unlink(missing_ok=True)

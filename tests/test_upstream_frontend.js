@@ -25,7 +25,7 @@ const document = {
             const modal = elements.get('upstreamTunnelModal');
             modal.remove = () => dialogIds.forEach(id => elements.delete(id));
             modal.querySelectorAll = selector => dialogIds.map(id => elements.get(id)).filter(element =>
-                ['button', 'select', 'textarea'].includes(element.tag) && (!selector.includes(':disabled') || !element.disabled));
+                ['button', 'input', 'select', 'textarea'].includes(element.tag) && (!selector.includes(':disabled') || !element.disabled));
         }
     }
 };
@@ -48,6 +48,7 @@ function makeElement(id, value = '', tag = 'input') {
         addEventListener(name, callback) { this.listeners.set(name, callback); },
         setAttribute(name, value) { this.attributes[name] = value; },
         focus() { document.activeElement = this; },
+        closest() { return this.hiddenParent || null; },
         remove() { elements.delete(id); }
     };
     elements.set(id, element);
@@ -135,12 +136,13 @@ async function run() {
         elements.get('tunnelRoutingMode').value = 'ai_tiktok';
         elements.get('tunnelRoutingMode').listeners.get('change')();
         assert.equal(elements.get('tunnelSelectiveDnsHint').classList.contains('hidden'), false);
+        assert.equal(elements.get('tunnelServiceCidrsGroup').classList.contains('hidden'), false);
         elements.get('tunnelFailoverMode').value = 'fail_close';
         await app.saveUpstreamTunnel();
         const request = requests.at(-1);
         assert.equal(request.url, `/api/servers/awg-${version}/upstream`);
         assert.equal(request.method, 'PUT');
-        assert.deepEqual(JSON.parse(request.body), { routing_mode: 'ai_tiktok', failover_mode: 'fail_close', import_config: config });
+        assert.deepEqual(JSON.parse(request.body), { routing_mode: 'ai_tiktok', failover_mode: 'fail_close', service_cidrs: [], import_config: config });
         assert.ok(!elements.has('upstreamTunnelModal'));
         assert.equal(document.activeElement, trigger, 'focus returns to trigger');
         assert.ok(!documentListeners.has('keydown'));
@@ -158,6 +160,98 @@ async function run() {
     elements.get('tunnelRoutingMode').value = 'all';
     await app.saveUpstreamTunnel();
     assert.deepEqual(JSON.parse(requests.at(-1).body), { routing_mode: 'all', failover_mode: 'fail_open' }, 'editing routing preserves stored credentials');
+
+    const selective = { ...linked, upstream: { ...linked.upstream, routing_mode: 'ai_tiktok', service_cidrs: ['160.79.104.0/23', '8.8.8.8/32'] } };
+    open(selective);
+    assert.equal(elements.get('tunnelServiceCidrs').value, '160.79.104.0/23\n8.8.8.8/32', 'saved addresses remain visible for editing');
+    elements.get('tunnelRoutingMode').value = 'all';
+    elements.get('tunnelRoutingMode').listeners.get('change')();
+    assert.equal(elements.get('tunnelServiceCidrsGroup').classList.contains('hidden'), true);
+    assert.equal(elements.get('tunnelServiceCidrs').value, '160.79.104.0/23\n8.8.8.8/32', 'temporarily changing mode does not erase addresses');
+    await app.saveUpstreamTunnel();
+    assert.ok(!Object.hasOwn(JSON.parse(requests.at(-1).body), 'service_cidrs'), 'nonselective updates preserve the stored pool on the backend');
+
+    open(selective);
+    elements.get('tunnelServiceCidrs').value = ' 160.79.104.0/23\n8.8.8.8/32, 1.1.1.1  \n160.79.104.0/23 ';
+    await app.saveUpstreamTunnel();
+    assert.deepEqual(JSON.parse(requests.at(-1).body).service_cidrs, ['160.79.104.0/23', '8.8.8.8/32', '1.1.1.1']);
+    open(selective);
+    elements.get('tunnelServiceCidrs').value = '';
+    await app.saveUpstreamTunnel();
+    assert.deepEqual(JSON.parse(requests.at(-1).body).service_cidrs, [], 'clearing the textarea removes custom addresses');
+
+    open(selective);
+    elements.get('tunnelServiceCidrs').value = '0.0.0.0/0';
+    context.fetch = async () => ({ ok: false, status: 400, json: async () => ({ error: 'Only public IPv4 service networks are allowed' }) });
+    await app.saveUpstreamTunnel();
+    assert.equal(elements.get('tunnelServiceCidrs').value, '0.0.0.0/0', 'validation failure preserves the user input');
+    assert.match(elements.get('tunnelFormError').textContent, /Only public IPv4/);
+
+    const diagnostics = {
+        protocol: 'awg2', routing_mode: 'ai_tiktok', routing_state: 'upstream', failover_mode: 'fail_close',
+        upstream: { interface: 'wg-up-test', healthy: true, handshake_age_seconds: 12, private_key: 'must-not-render' },
+        classifier: { dns_running: true, dns_entries: 15, pool_entries: 8, matched_packets: 123,
+            seed_status: { resolved_hosts: 20, queried_hosts: 23, errors: 3, addresses: 42, last_attempt: 1720000000, last_success: 1719999900, private_key: 'must-not-render' } },
+        destinations: [{ address: '160.79.104.1', matched: true, dns_match: false, pool_match: true, route: 'upstream', egress: 'wg-up-test', secret: 'must-not-render' }],
+        warnings: ['<img src=x onerror=alert(1)>', { private_key: 'must-not-render' }],
+        private_key: 'must-not-render'
+    };
+    context.fetch = async (url, options) => {
+        requests.push({ url, ...options });
+        return { ok: true, json: async () => diagnostics };
+    };
+    open(selective);
+    const beforeDiagnostics = requests.length;
+    await app.checkUpstreamDiagnostics();
+    assert.equal(requests.length, beforeDiagnostics + 1);
+    assert.equal(requests.at(-1).url, '/api/servers/existing/upstream/diagnostics?destination=chatgpt.com');
+    assert.equal(requests.at(-1).body, undefined, 'diagnostics do not submit pasted credentials or pending settings');
+    const diagnosticResult = elements.get('tunnelDiagnosticResult');
+    assert.match(diagnosticResult.textContent, /learned addresses: 15/);
+    assert.match(diagnosticResult.textContent, /matched packets: 123/);
+    assert.match(diagnosticResult.textContent, /resolved hosts: 20\/23; errors: 3; cached addresses: 42/);
+    assert.match(diagnosticResult.textContent, /Last seed attempt \(UTC\): 2024-07-03T09:46:40\.000Z/);
+    assert.match(diagnosticResult.textContent, /Last seed address update \(UTC\): 2024-07-03T09:45:00\.000Z/);
+    assert.match(diagnosticResult.textContent, /160\.79\.104\.1 — matched: yes/);
+    assert.match(diagnosticResult.textContent, /egress interface: wg-up-test/);
+    assert.match(diagnosticResult.textContent, /<img src=x onerror=alert\(1\)>/);
+    assert.equal(diagnosticResult.innerHTML, '', 'server messages are displayed as text, never HTML');
+    assert.ok(!diagnosticResult.textContent.includes('must-not-render'), 'unknown response fields are not exposed');
+    assert.equal(elements.get('tunnelDiagnosticDestination').disabled, false);
+    elements.get('tunnelDiagnosticDestination').value = ' 160.79.104.1 ';
+    await app.checkUpstreamDiagnostics();
+    assert.equal(requests.at(-1).url, '/api/servers/existing/upstream/diagnostics?destination=160.79.104.1');
+    elements.get('tunnelDiagnosticDestination').value = 'chatgpt.com&other=value';
+    await app.checkUpstreamDiagnostics();
+    assert.ok(requests.at(-1).url.endsWith('destination=chatgpt.com%26other%3Dvalue'), 'destination cannot inject other query parameters');
+    context.fetch = async () => ({ ok: false, status: 400, json: async () => ({ error: '<script>invalid destination</script>' }) });
+    await app.checkUpstreamDiagnostics();
+    assert.equal(diagnosticResult.textContent, 'Diagnostics failed: <script>invalid destination</script>');
+    assert.equal(diagnosticResult.innerHTML, '');
+    assert.equal(elements.get('checkUpstreamDiagnostics').disabled, false);
+
+    let finishDiagnostics;
+    let diagnosticRequests = 0;
+    context.fetch = () => { diagnosticRequests += 1; return new Promise(resolve => { finishDiagnostics = resolve; }); };
+    const checking = app.checkUpstreamDiagnostics();
+    assert.equal(elements.get('tunnelDiagnosticDestination').disabled, true);
+    assert.equal(elements.get('saveUpstreamTunnel').disabled, true);
+    await app.checkUpstreamDiagnostics();
+    await app.saveUpstreamTunnel();
+    assert.equal(diagnosticRequests, 1, 'diagnostics cannot race with duplicate checks or changing saved settings');
+    finishDiagnostics({ ok: true, json: async () => diagnostics });
+    await checking;
+    assert.equal(elements.get('saveUpstreamTunnel').disabled, false);
+
+    let keyboardCheck = false;
+    let preventedSubmit = false;
+    const checkDiagnostics = app.checkUpstreamDiagnostics;
+    app.checkUpstreamDiagnostics = () => { keyboardCheck = true; };
+    elements.get('tunnelDiagnosticDestination').listeners.get('keydown')({ key: 'Enter', preventDefault() { preventedSubmit = true; } });
+    assert.equal(keyboardCheck, true);
+    assert.equal(preventedSubmit, true, 'Enter in the diagnostics destination must not save tunnel settings');
+    app.checkUpstreamDiagnostics = checkDiagnostics;
+    context.fetch = normalFetch;
 
     open(linked);
     elements.get('tunnelImportConfig').value = config3;
@@ -229,7 +323,7 @@ async function run() {
         assert.ok(!Object.hasOwn(payload.upstream, 'split_ru_local'));
     }
     assert.ok(reloads >= 6);
-    console.log('PASS upstream frontend: AWG2/AWG3 attach, edit, detach, routing modes, credentials, errors, busy state and VLESS creation');
+    console.log('PASS upstream frontend: AWG2/AWG3 tunnels, service address pools, safe diagnostics, errors, busy state and VLESS creation');
 }
 
 run().catch(error => { console.error(error); process.exitCode = 1; });

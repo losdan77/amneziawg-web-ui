@@ -1296,7 +1296,12 @@ class AmneziaApp {
                                 <option value="ai_tiktok">AI services + TikTok only (all other traffic stays local)</option>
                             </select>
                             <p class="text-gray-500 text-xs mt-1">AI services include ChatGPT, Codex, Claude and other supported services. Local traffic uses this server's ordinary network adapter.</p>
-                            <p id="tunnelSelectiveDnsHint" class="text-amber-800 text-xs mt-2 hidden">Disable encrypted / Private DNS and browser Secure DNS on clients. Routing uses DNS lookups; services sharing the same IP may also use the tunnel. Reconnect clients after changing this mode to refresh DNS.</p>
+                            <p id="tunnelSelectiveDnsHint" class="text-amber-800 text-xs mt-2 hidden">The server learns IPv4 addresses from DNS, pre-resolves known service hosts and includes documented API networks. This is not a complete pool of shared CDN addresses. Disable encrypted / Private DNS and browser Secure DNS for reliable learning; cached or different DNS answers can be missed. Shared IPs may also send unrelated services through the tunnel. IPv6 outside the VPN is not covered. Reconnect clients and refresh their DNS after changing this mode.</p>
+                        </div>
+                        <div id="tunnelServiceCidrsGroup" class="hidden">
+                            <label for="tunnelServiceCidrs" class="block text-sm font-medium text-gray-700">Additional service IPv4 addresses / networks (optional)</label>
+                            <textarea id="tunnelServiceCidrs" rows="3" spellcheck="false" autocomplete="off" autocapitalize="off" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2 text-sm font-mono" placeholder="One public IPv4 address or CIDR per line"></textarea>
+                            <p class="text-gray-500 text-xs mt-1">Use verified destination addresses for a service your client still sends locally. One entry per line; commas also work. Every destination in a listed network uses the tunnel, including unrelated services on shared infrastructure. Do not add entire CDN provider networks unless you intend to route all of them.</p>
                         </div>
                         <div>
                             <label for="tunnelFailoverMode" class="block text-sm font-medium text-gray-700">If the tunnel is unavailable</label>
@@ -1307,6 +1312,15 @@ class AmneziaApp {
                             <p class="text-gray-500 text-xs mt-1">Traffic assigned to local egress continues using this server.</p>
                         </div>
                         <p id="tunnelFormError" role="alert" class="text-red-600 text-sm hidden"></p>
+                        ${linked ? `<div class="rounded border border-gray-200 p-3 space-y-2">
+                            <label for="tunnelDiagnosticDestination" class="block text-sm font-medium text-gray-700">Check a destination</label>
+                            <div class="flex flex-wrap gap-2">
+                                <input id="tunnelDiagnosticDestination" type="text" maxlength="253" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="chatgpt.com or the IPv4 used by your client" class="flex-1 min-w-0 border border-gray-300 rounded-md px-3 py-2 text-sm">
+                                <button id="checkUpstreamDiagnostics" type="button" class="border border-indigo-300 text-indigo-700 px-3 py-2 rounded text-sm hover:bg-indigo-50">Diagnostics</button>
+                            </div>
+                            <p class="text-gray-500 text-xs">Checks the saved server settings and routing rules, not your client's actual connection or exit IP. Leave blank for chatgpt.com. For cached or encrypted DNS, enter the exact IPv4 your client uses. An ordinary “my IP” website should still show this server's local exit in selective mode.</p>
+                            <pre id="tunnelDiagnosticResult" role="status" aria-live="polite" class="hidden whitespace-pre-wrap break-words text-xs bg-gray-50 rounded p-3"></pre>
+                        </div>` : ''}
                         ${linked ? `<div id="tunnelRemoveConfirmation" class="hidden rounded border border-red-200 bg-red-50 p-3 text-sm text-red-800">
                             <p>Remove this tunnel and send all client traffic through this server's local network adapter? Existing clients and their configs will be preserved.</p>
                             <div class="flex flex-wrap gap-2 mt-3">
@@ -1326,7 +1340,12 @@ class AmneziaApp {
         const modeSelect = document.getElementById('tunnelRoutingMode');
         modeSelect.value = linked ? this.getUpstreamRoutingMode(upstream) : 'ru_split';
         document.getElementById('tunnelFailoverMode').value = upstream.failover_mode || server.linked_failover_mode || 'fail_close';
-        const updateHint = () => document.getElementById('tunnelSelectiveDnsHint')?.classList.toggle('hidden', modeSelect.value !== 'ai_tiktok');
+        document.getElementById('tunnelServiceCidrs').value = Array.isArray(upstream.service_cidrs) ? upstream.service_cidrs.join('\n') : '';
+        const updateHint = () => {
+            const hidden = modeSelect.value !== 'ai_tiktok';
+            document.getElementById('tunnelSelectiveDnsHint')?.classList.toggle('hidden', hidden);
+            document.getElementById('tunnelServiceCidrsGroup')?.classList.toggle('hidden', hidden);
+        };
         modeSelect.addEventListener('change', updateHint);
         updateHint();
         const configInput = document.getElementById('tunnelImportConfig');
@@ -1354,10 +1373,18 @@ class AmneziaApp {
             document.getElementById('removeUpstreamTunnel').focus();
         });
         document.getElementById('confirmRemoveUpstreamTunnel')?.addEventListener('click', () => this.confirmRemoveUpstreamTunnel());
+        document.getElementById('checkUpstreamDiagnostics')?.addEventListener('click', () => this.checkUpstreamDiagnostics());
+        document.getElementById('tunnelDiagnosticDestination')?.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                this.checkUpstreamDiagnostics();
+            }
+        });
         this.upstreamDialogKeyHandler = (event) => {
             if (event.key === 'Escape') this.closeUpstreamDialog();
             if (event.key === 'Tab') {
-                const controls = document.getElementById('upstreamTunnelModal')?.querySelectorAll('button:not(:disabled), textarea:not(:disabled), select:not(:disabled)');
+                const controls = Array.from(document.getElementById('upstreamTunnelModal')?.querySelectorAll('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled)') || [])
+                    .filter(control => !control.closest('.hidden'));
                 if (!controls?.length) return;
                 const first = controls[0];
                 const last = controls[controls.length - 1];
@@ -1389,7 +1416,7 @@ class AmneziaApp {
         this.upstreamDialogBusy = busy;
         const modal = document.getElementById('upstreamTunnelModal');
         modal?.setAttribute('aria-busy', String(busy));
-        modal?.querySelectorAll('button, textarea, select').forEach(control => { control.disabled = busy; });
+        modal?.querySelectorAll('button, input, textarea, select').forEach(control => { control.disabled = busy; });
         const saveButton = document.getElementById('saveUpstreamTunnel');
         if (saveButton) saveButton.textContent = busy ? `${action}...` : (this.upstreamDialogHasTunnel ? 'Save changes' : 'Add tunnel');
     }
@@ -1414,8 +1441,72 @@ class AmneziaApp {
             routing_mode: document.getElementById('tunnelRoutingMode').value,
             failover_mode: document.getElementById('tunnelFailoverMode').value
         };
+        if (body.routing_mode === 'ai_tiktok') {
+            body.service_cidrs = [...new Set(document.getElementById('tunnelServiceCidrs').value.trim().split(/[\s,]+/).filter(Boolean))];
+        }
         if (config) body.import_config = config;
         await this.applyUpstreamTunnelChange('PUT', body);
+    }
+
+    async checkUpstreamDiagnostics() {
+        if (this.upstreamDialogBusy || !this.upstreamDialogServerId || !this.upstreamDialogHasTunnel) return;
+        const resultElement = document.getElementById('tunnelDiagnosticResult');
+        const destination = document.getElementById('tunnelDiagnosticDestination').value.trim() || 'chatgpt.com';
+        this.setUpstreamDialogBusy(true, 'Checking');
+        resultElement.classList.remove('hidden');
+        resultElement.textContent = 'Checking saved settings and destination routing...';
+        try {
+            const response = await fetch(`/api/servers/${encodeURIComponent(this.upstreamDialogServerId)}/upstream/diagnostics?destination=${encodeURIComponent(destination)}`);
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(typeof result.error === 'string' ? result.error : `HTTP ${response.status}`);
+            resultElement.textContent = this.formatUpstreamDiagnostics(result);
+        } catch (error) {
+            resultElement.textContent = `Diagnostics failed: ${error.message}`;
+        } finally {
+            this.setUpstreamDialogBusy(false);
+        }
+    }
+
+    formatUpstreamDiagnostics(result) {
+        // Render only documented scalar fields; never display whole backend objects.
+        const scalar = value => ['string', 'number', 'boolean'].includes(typeof value) ? String(value) : 'unknown';
+        const yesNo = value => value === true ? 'yes' : value === false ? 'no' : 'unknown';
+        const timestamp = value => {
+            if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 'not yet';
+            const date = new Date(value * 1000);
+            return Number.isNaN(date.getTime()) ? 'unknown' : date.toISOString();
+        };
+        const upstream = result.upstream || {};
+        const classifier = result.classifier || {};
+        const seedStatus = classifier.seed_status || {};
+        const lines = [
+            `Protocol: ${scalar(result.protocol)}`,
+            `Saved routing mode: ${scalar(result.routing_mode)}`,
+            `Routing state: ${scalar(result.routing_state)}; failover: ${scalar(result.failover_mode)}`,
+            `Tunnel interface: ${scalar(upstream.interface)}; healthy: ${yesNo(upstream.healthy)}`,
+            `Last handshake age (seconds): ${scalar(upstream.handshake_age_seconds)}`,
+            `DNS running: ${yesNo(classifier.dns_running)}; learned addresses: ${scalar(classifier.dns_entries)}`,
+            `AWG classification rules installed: ${yesNo(classifier.rules_attached)}`,
+            `Service pool entries: ${scalar(classifier.pool_entries)}; matched packets: ${scalar(classifier.matched_packets)}`,
+            `Seed refresh: resolved hosts: ${scalar(seedStatus.resolved_hosts)}/${scalar(seedStatus.queried_hosts)}; errors: ${scalar(seedStatus.errors)}; cached addresses: ${scalar(seedStatus.addresses)}`,
+            `Last seed attempt (UTC): ${timestamp(seedStatus.last_attempt)}`,
+            `Last seed address update (UTC): ${timestamp(seedStatus.last_success)}`,
+            '',
+            'Destination routing on this server:'
+        ];
+        const destinations = Array.isArray(result.destinations) ? result.destinations : [];
+        for (const entry of destinations) {
+            if (!entry || typeof entry !== 'object') continue;
+            lines.push(`${scalar(entry.address)} — matched: ${yesNo(entry.matched)} (DNS: ${yesNo(entry.dns_match)}, pool: ${yesNo(entry.pool_match)})`,
+                `  Route: ${scalar(entry.route)}; egress interface: ${scalar(entry.egress)}`);
+        }
+        if (!destinations.length) lines.push('No destination IPv4 addresses returned.');
+        if (Array.isArray(result.warnings)) {
+            for (const warning of result.warnings) {
+                if (typeof warning === 'string') lines.push(`Warning: ${warning}`);
+            }
+        }
+        return lines.join('\n');
     }
 
     removeUpstreamTunnel() {

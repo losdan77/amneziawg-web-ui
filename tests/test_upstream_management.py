@@ -118,6 +118,88 @@ class UpstreamManagementTests(unittest.TestCase):
         self.manager.update_server_upstream(server['id'], {'split_ru_local': True})
         self.assertEqual(server['upstream']['routing_mode'], 'ru_split')
 
+    def test_custom_service_ranges_are_normalized_preserved_and_explicitly_cleared(self):
+        for version in ('2', '3'):
+            with self.subTest(version=version):
+                self.setUp()
+                server = self.provision(version)
+                self.attach(server, routing_mode='ai_tiktok', service_cidrs=[
+                    '104.18.31.77', '8.8.4.7/24', '104.18.31.77/32'])
+                expected = ['8.8.4.0/24', '104.18.31.77/32']
+                self.assertEqual(server['upstream']['service_cidrs'], expected)
+                path = Path(server['upstream']['config_path'])
+                imported_bytes = path.read_bytes()
+                imported_keys = {key: server['upstream'].get(key) for key in
+                                 ('private_key', 'public_key', 'preshared_key')}
+                persisted = json.loads(Path(manager_module.CONFIG_FILE).read_text())
+                self.assertEqual(persisted['servers'][0]['upstream']['service_cidrs'], expected)
+                self.manager.update_server_upstream(server['id'], {'failover_mode': 'fail_open'})
+                self.assertEqual(server['upstream']['service_cidrs'], expected)
+                self.assertEqual(path.read_bytes(), imported_bytes)
+                self.manager.update_server_upstream(server['id'], {'service_cidrs': []})
+                self.assertEqual(server['upstream']['service_cidrs'], [])
+                self.assertEqual(path.read_bytes(), imported_bytes)
+                self.assertEqual({key: server['upstream'].get(key) for key in imported_keys}, imported_keys)
+                persisted = json.loads(Path(manager_module.CONFIG_FILE).read_text())
+                self.assertEqual(persisted['servers'][0]['upstream']['service_cidrs'], [])
+                self.assert_entry_unchanged(server)
+
+    def test_upstream_replacement_without_service_ranges_preserves_custom_selection(self):
+        server = self.provision()
+        self.attach(server, routing_mode='ai_tiktok', service_cidrs=['8.8.4.0/24'])
+        self.manager.update_server_upstream(server['id'], {'import_config': self.imported_config('3')})
+        self.assertEqual(server['upstream']['service_cidrs'], ['8.8.4.0/24'])
+        self.assertEqual(server['upstream']['awg_version'], '3')
+        self.assert_entry_unchanged(server)
+
+    def test_invalid_service_ranges_leave_running_link_and_files_untouched(self):
+        server = self.provision()
+        self.attach(server, routing_mode='ai_tiktok', service_cidrs=['8.8.4.0/24'])
+        before = copy.deepcopy(self.manager.config)
+        paths = [Path(manager_module.CONFIG_FILE), Path(server['config_path']),
+                 Path(server['upstream']['config_path'])]
+        files = {path: path.read_bytes() for path in paths}
+        before_live = self.live.copy()
+        self.commands.clear()
+        self.manager.configure_upstream_routing.reset_mock()
+        self.manager.cleanup_upstream_routing.reset_mock()
+        invalid = (['0.0.0.0/0'], ['10.0.0.0/8'], ['127.0.0.1'], ['100.64.0.0/10'],
+                   ['2001:4860::/32'], ['8.8.4.4;id'], ['8.8.4.4\n'], '8.8.4.4', [True])
+        for ranges in invalid:
+            with self.subTest(ranges=ranges), self.assertRaises(ValueError):
+                self.manager.update_server_upstream(server['id'], {'service_cidrs': ranges})
+        self.assertEqual(self.manager.config, before)
+        self.assertEqual(self.live, before_live)
+        self.assertEqual(self.commands, [])
+        for path, content in files.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.manager.configure_upstream_routing.assert_not_called()
+        self.manager.cleanup_upstream_routing.assert_not_called()
+        self.assert_entry_unchanged(server)
+
+    def test_failed_service_range_update_restores_previous_pool_selection_and_files(self):
+        server = self.provision()
+        self.attach(server, routing_mode='ai_tiktok', service_cidrs=['8.8.4.0/24'])
+        before = copy.deepcopy(self.manager.config)
+        paths = [Path(manager_module.CONFIG_FILE), Path(server['config_path']),
+                 Path(server['upstream']['config_path'])]
+        files = {path: path.read_bytes() for path in paths}
+        attempted_ranges = []
+
+        def apply_then_fail_once(current):
+            attempted_ranges.append(copy.deepcopy(current['upstream']['service_cidrs']))
+            return len(attempted_ranges) > 1
+
+        self.manager.configure_upstream_routing.side_effect = apply_then_fail_once
+        with self.assertRaisesRegex(RuntimeError, 'previous configuration was restored'):
+            self.manager.update_server_upstream(server['id'], {'service_cidrs': ['104.18.31.77/32']})
+        self.assertEqual(attempted_ranges, [['104.18.31.77/32'], ['8.8.4.0/24']])
+        self.assertEqual(self.manager.config, before)
+        for path, content in files.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertIn(server['upstream']['interface'], self.live)
+        self.assert_entry_unchanged(server)
+
     def test_replacing_import_retains_routing_identifiers_and_selected_policy(self):
         server = self.provision()
         self.attach(server, routing_mode='ai_tiktok')

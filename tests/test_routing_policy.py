@@ -53,7 +53,8 @@ class SelectiveRoutingTests(unittest.TestCase):
         for directive in ('port=5353', 'listen-address=10.1.0.1', 'bind-interfaces', 'no-resolv',
                           'filter-AAAA', 'server=1.1.1.1', 'server=8.8.8.8'):
             self.assertIn(directive + '\n', config)
-        self.assertIn('ipset=/' + '/'.join(AI_TIKTOK_DOMAINS) + '/awgsel_201\n', config)
+        for domain in AI_TIKTOK_DOMAINS:
+            self.assertIn(f'ipset=/{domain}/awgsel_201\n', config)
         self.assertEqual(sum(command.startswith('dnsmasq --conf-file=') for command in self.commands), 1)
         self.assertNotIn('server=10.1.0.1', config)
 
@@ -154,7 +155,7 @@ class SelectiveRoutingTests(unittest.TestCase):
         self.run.side_effect = lambda command: self.commands.append(command) or ('awgsel_201' if command == 'ipset list -n' else '')
         with patch('routing_policy.time.time', return_value=1000):
             self.routing.configure(self.server)
-        self.assertFalse(any(command.startswith('ipset add ') for command in self.commands))
+        self.assertFalse(any(command.startswith('ipset add awgsel_') for command in self.commands))
 
 
 if __name__ == '__main__':

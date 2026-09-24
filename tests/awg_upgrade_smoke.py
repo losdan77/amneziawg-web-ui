@@ -50,6 +50,10 @@ def create():
                   upstream={'import_config': upstream(1, '2'), 'split_ru_local': False}),
              dict(name='Linked RU', awg_version='3', mode='edge_linked',
                   upstream={'import_config': upstream(2, '3'), 'split_ru_local': True})]
+    if os.environ.get('UPGRADE_INCLUDE_SELECTIVE') == 'true':
+        cases.extend(dict(name=f'Existing selective AWG{version}', awg_version=version, mode='edge_linked',
+                          upstream={'import_config': upstream(3 + index, version), 'routing_mode': 'ai_tiktok'})
+                     for index, version in enumerate(('2', '3')))
     for index, data in enumerate(cases):
         server = manager.create_wireguard_server(dict(data, auto_start=False,
                  subnet=f'10.{100 + index}.0.0/24', port=54100 + index))
@@ -72,7 +76,7 @@ def verify():
     for server in expected['servers']:
         link = server.get('upstream')
         if link:
-            link['routing_mode'] = 'ru_split' if link.get('split_ru_local', True) else 'all'
+            link.setdefault('routing_mode', 'ru_split' if link.get('split_ru_local', True) else 'all')
     assert manager.config == expected, 'Upgrade unexpectedly changed persisted server/client fields'
     assert exports() == snapshot['exports'], 'Existing client exports changed'
     for name, content in snapshot['files'].items():

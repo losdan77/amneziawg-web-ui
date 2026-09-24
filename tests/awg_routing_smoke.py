@@ -29,6 +29,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'web-ui'))
 
+# These public addresses exist only as loopback aliases in disposable network
+# namespaces. They cannot send packets to real third-party destinations.
+SEED_ADDRESS = '104.18.31.77'
+BUILTIN_POOL_ADDRESS = '160.79.104.10'
+CUSTOM_POOL_ADDRESS = '45.67.89.10'
+
 
 def command(*args, check=True, input=None, timeout=20):
     result = subprocess.run(args, input=input, text=True, capture_output=True,
@@ -106,22 +112,15 @@ class Lab:
     def setup(self):
         for name in ('router', 'client-a', 'client-b', 'direct', 'remote'):
             self.add_namespace(name)
-        self.link('router', 'awg-in-a', '10.230.1.1/24',
-                  'client-a', 'eth0', '10.230.1.2/24', 1)
-        self.link('router', 'awg-in-b', '10.230.2.1/24',
-                  'client-b', 'eth0', '10.230.2.2/24', 2)
-        self.link('router', 'eth-test', '198.18.0.2/30',
-                  'direct', 'eth0', '198.18.0.1/30', 3)
+        self.setup_router()
         self.link('direct', 'transport', '198.18.0.5/30',
                   'remote', 'eth0', '198.18.0.6/30', 4)
-        self.ns('router', 'sysctl', '-qw', 'net.ipv4.ip_forward=1')
         self.ns('direct', 'sysctl', '-qw', 'net.ipv4.ip_forward=1')
-        self.ns('router', 'ip', 'route', 'add', 'default', 'via', '198.18.0.1')
         self.ns('remote', 'ip', 'route', 'add', 'default', 'via', '198.18.0.5')
-        for name, gateway in (('client-a', '10.230.1.1'), ('client-b', '10.230.2.1')):
-            self.ns(name, 'ip', 'route', 'add', 'default', 'via', gateway)
         for name in ('direct', 'remote'):
-            for address in ('203.0.113.10/32', '203.0.113.11/32', '203.0.113.20/32'):
+            for address in ('203.0.113.10/32', '203.0.113.11/32', '203.0.113.20/32',
+                            SEED_ADDRESS + '/32', BUILTIN_POOL_ADDRESS + '/32',
+                            CUSTOM_POOL_ADDRESS + '/32'):
                 self.ns(name, 'ip', 'addr', 'add', address, 'dev', 'lo')
             self.start(name, sys.executable, str(Path(__file__).resolve()), '--serve-http', name)
         self.start('direct', 'dnsmasq', '--keep-in-foreground', '--conf-file=/dev/null',
@@ -133,8 +132,42 @@ class Lab:
                    '--address=/ordinary.example/203.0.113.20',
                    '--local=/chatgpt.com/tiktok.com/ordinary.example/',
                    '--pid-file=' + str(self.directory / 'fixture-dns.pid'))
+
+    def setup_router(self):
+        self.link('router', 'awg-in-a', '10.230.1.1/24',
+                  'client-a', 'eth0', '10.230.1.2/24', 1)
+        self.link('router', 'awg-in-b', '10.230.2.1/24',
+                  'client-b', 'eth0', '10.230.2.2/24', 2)
+        self.link('router', 'eth-test', '198.18.0.2/30',
+                  'direct', 'eth0', '198.18.0.1/30', 3)
+        self.ns('router', 'sysctl', '-qw', 'net.ipv4.ip_forward=1')
+        self.ns('router', 'ip', 'route', 'add', 'default', 'via', '198.18.0.1')
+        for name, gateway in (('client-a', '10.230.1.1'), ('client-b', '10.230.2.1')):
+            self.ns(name, 'ip', 'route', 'add', 'default', 'via', gateway)
         for iface, subnet in (('awg-in-a', '10.230.1.0/24'), ('awg-in-b', '10.230.2.0/24')):
             self.ns('router', 'sh', str(ROOT / 'scripts/setup_iptables.sh'), iface, subnet)
+
+    def recreate_router(self):
+        """Drop kernel state without the application's graceful cleanup hook."""
+        namespace = self.names['router']
+        for pid in command('ip', 'netns', 'pids', namespace).stdout.split():
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 3
+        while command('ip', 'netns', 'pids', namespace).stdout.strip():
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Router namespace processes failed to stop')
+            time.sleep(0.025)
+        command('ip', 'netns', 'del', namespace)
+        self.names.pop('router')
+        # ip-netns may defer the final network-device release while a daemon's
+        # socket is closing. Remove only this fixture's surviving peer ends.
+        for name in ('client-a', 'client-b', 'direct'):
+            self.ns(name, 'ip', 'link', 'del', 'eth0', check=False)
+        self.add_namespace('router')
+        self.setup_router()
 
     def upstream(self, version):
         from awg_protocol import generate_params, render_params
@@ -243,11 +276,13 @@ def run_smoke():
 
         manager.execute_command = execute
         server = {'id': 'smoke-a', 'name': 'Smoke A', 'protocol': 'wireguard',
+                  'mode': 'edge_linked',
                   'interface': 'awg-in-a', 'subnet': '10.230.1.0/24',
                   'server_ip': '10.230.1.1', 'dns': ['198.18.0.1'],
                   'linked_failover_mode': 'fail_close', 'routing_state': 'upstream',
                   'upstream': {'interface': 'awg-out', 'endpoint': '198.18.0.6:53011',
                                'table_id': 210, 'fwmark': 210,
+                               'service_cidrs': [CUSTOM_POOL_ADDRESS + '/32'],
                                'routing_mode': 'ai_tiktok', 'split_ru_local': False}}
         manager.config['servers'] = [server]
         try:
@@ -258,6 +293,26 @@ def run_smoke():
                 lab.ns('router', 'sh', str(ROOT / 'scripts/setup_iptables.sh'),
                        server['interface'], server['subnet'], 'awg-out')
                 assert manager.configure_upstream_routing(server) is not False
+                # Seeded destinations and explicit pools must work even when a
+                # client has cached its DNS answer or uses encrypted DNS.
+                classifier = manager._selective_routing()
+                classifier.apply_seed_addresses(server, {'addresses': [SEED_ADDRESS],
+                    'errors': [], 'resolved_hosts': 1, 'queried_hosts': 1})
+                for target in (SEED_ADDRESS, BUILTIN_POOL_ADDRESS, CUSTOM_POOL_ADDRESS):
+                    lab.http('client-a', target, 'remote')
+                    lab.http('client-b', target, 'direct')
+                lab.http('client-a', '203.0.113.20', 'direct')
+                # Removing an explicit range must update the existing kernel
+                # pool while preserving dynamically seeded destinations.
+                server['upstream']['service_cidrs'] = []
+                assert manager.configure_upstream_routing(server) is not False
+                assert lab.ns('router', 'ipset', 'test', 'awgpool_210',
+                              CUSTOM_POOL_ADDRESS, check=False).returncode != 0
+                lab.http('client-a', CUSTOM_POOL_ADDRESS, 'direct')
+                lab.http('client-a', SEED_ADDRESS, 'remote')
+                server['upstream']['service_cidrs'] = [CUSTOM_POOL_ADDRESS + '/32']
+                assert manager.configure_upstream_routing(server) is not False
+                lab.http('client-a', CUSTOM_POOL_ADDRESS, 'remote')
                 # Actual DNS query/response populates ipset; do not seed target IPs by hand.
                 assert lab.dns('client-a', 'chatgpt.com')['answers'] > 0
                 assert lab.dns('client-a', 'tiktok.com', tcp=True)['answers'] > 0
@@ -268,6 +323,31 @@ def run_smoke():
                     lab.http('client-a', target, 'remote')
                     lab.http('client-b', target, 'direct')
                 lab.http('client-a', '203.0.113.20', 'direct')
+                # The read-only diagnostics must agree with actual HTTP egress
+                # for both a seeded destination and an ordinary destination.
+                diagnostic = manager.get_upstream_diagnostics(server['id'], SEED_ADDRESS)
+                assert diagnostic['classifier']['dns_running']
+                assert diagnostic['classifier']['rules_attached']
+                assert diagnostic['classifier']['dns_entries'] >= 2
+                assert diagnostic['classifier']['pool_entries'] >= 3
+                assert diagnostic['destinations'][0]['route'] == 'upstream', diagnostic
+                assert diagnostic['destinations'][0]['pool_match'], diagnostic
+                ordinary = manager.get_upstream_diagnostics(server['id'], '8.8.4.4')
+                assert ordinary['destinations'][0]['route'] == 'local', ordinary
+                # A populated set and an upstream route are insufficient if
+                # the actual incoming classifier jump has been removed.
+                lab.ns('router', 'iptables', '-t', 'mangle', '-D', 'PREROUTING',
+                       '-i', server['interface'], '-s', server['subnet'], '-j', 'AWGSEL_210')
+                diagnostic = manager.get_upstream_diagnostics(server['id'], SEED_ADDRESS)
+                assert diagnostic['destinations'][0]['pool_match'], diagnostic
+                assert not diagnostic['classifier']['rules_attached'], diagnostic
+                assert diagnostic['destinations'][0]['route'] == 'local', diagnostic
+                lab.http('client-a', SEED_ADDRESS, 'direct')
+                assert manager.configure_upstream_routing(server) is not False
+                diagnostic = manager.get_upstream_diagnostics(server['id'], SEED_ADDRESS)
+                assert diagnostic['classifier']['rules_attached'], diagnostic
+                assert diagnostic['destinations'][0]['route'] == 'upstream', diagnostic
+                lab.http('client-a', SEED_ADDRESS, 'remote')
                 # Fail-open keeps DNS alive and preserves learned destinations,
                 # allowing recovery even while applications cache their answers.
                 assert manager.configure_wireguard_local_routing(server) is not False
@@ -286,6 +366,20 @@ def run_smoke():
                          if not line.startswith('#')]
                 assert after == before
                 lab.http('client-a', '203.0.113.10', 'remote')
+                # Periodic snapshots, not graceful teardown, must preserve
+                # destinations across a container/namespace restart.
+                classifier.save_addresses(server)
+                lab.stop_upstream()
+                lab.recreate_router()
+                lab.upstream(version)
+                lab.ns('router', 'sh', str(ROOT / 'scripts/setup_iptables.sh'),
+                       server['interface'], server['subnet'], 'awg-out')
+                assert manager.configure_upstream_routing(server) is not False
+                for target in (SEED_ADDRESS, BUILTIN_POOL_ADDRESS, CUSTOM_POOL_ADDRESS,
+                               '203.0.113.10', '203.0.113.11'):
+                    lab.http('client-a', target, 'remote')
+                    lab.http('client-b', target, 'direct')
+                lab.http('client-a', '203.0.113.20', 'direct')
                 # Both selectors must bind DNS independently; removing A must leave B working.
                 other = copy.deepcopy(server)
                 other.update(id='smoke-b', name='Smoke B', interface='awg-in-b',
@@ -321,11 +415,13 @@ def run_smoke():
                 rules = lab.ns('router', 'ip', 'rule', 'show').stdout
                 assert 'lookup 210' not in rules, rules
                 assert lab.ns('router', 'ipset', 'list', 'awgsel_210', check=False).returncode != 0
+                assert lab.ns('router', 'ipset', 'list', 'awgpool_210', check=False).returncode != 0
                 assert 'AWGSEL_210' not in lab.ns('router', 'iptables-save').stdout
                 lab.stop_upstream()
                 print(f'PASS AWG {version}: DNS UDP/TCP, target egress, ordinary direct, '
                       'other server isolation, fail-open/recovery, fail-close, '
-                      'cached destination restore, idempotence, cleanup', flush=True)
+                      'pre-DNS seeded/static destinations, live pool replacement, abrupt namespace restart, '
+                      'cached destination restore, real route diagnostics, idempotence, cleanup', flush=True)
         finally:
             try:
                 if 'router' in lab.names:

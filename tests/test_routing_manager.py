@@ -424,20 +424,32 @@ class XrayRoutingConfigTests(unittest.TestCase):
     def test_selective_domain_rule_precedes_direct_fallback_and_uses_force_ipv4(self):
         config = self.output()
         rules = config['routing']['rules']
-        self.assertEqual(len(rules), 2)
+        self.assertEqual(len(rules), 3)
         self.assertEqual(rules[0]['domain'], ['domain:' + domain for domain in AI_TIKTOK_DOMAINS])
         self.assertEqual(rules[0]['outboundTag'], 'vless-v1-awg')
-        self.assertEqual(rules[1], {'type': 'field', 'inboundTag': ['vless-v1'], 'outboundTag': 'direct'})
+        self.assertEqual(rules[1], {'type': 'field', 'inboundTag': ['vless-v1'],
+                                   'ip': ['160.79.104.0/23'], 'outboundTag': 'vless-v1-awg'})
+        self.assertEqual(rules[2], {'type': 'field', 'inboundTag': ['vless-v1'], 'outboundTag': 'direct'})
         upstream = next(outbound for outbound in config['outbounds'] if outbound['tag'] == 'vless-v1-awg')
         self.assertEqual(upstream['settings']['domainStrategy'], 'ForceIPv4')
         self.assertEqual(upstream['streamSettings']['sockopt']['mark'], 41001)
         self.assertTrue(config['inbounds'][0]['sniffing']['routeOnly'])
+        self.assertEqual(config['routing']['domainStrategy'], 'IPOnDemand')
 
     def test_failopen_local_state_routes_every_destination_direct(self):
         self.server['routing_state'] = 'local'
         config = self.output()
         self.assertEqual(config['routing']['rules'], [{'type': 'field', 'inboundTag': ['vless-v1'], 'outboundTag': 'direct'}])
         self.assertEqual([item['tag'] for item in config['outbounds']], ['direct'])
+        self.assertEqual(config['routing']['domainStrategy'], 'IPIfNonMatch')
+
+    def test_custom_ipv4_pools_apply_only_to_the_selected_inbound(self):
+        self.server['upstream']['service_cidrs'] = ['8.8.8.8', '9.9.9.0/24']
+        config = self.output()
+        rule = config['routing']['rules'][1]
+        self.assertEqual(rule['ip'], ['160.79.104.0/23', '8.8.8.8/32', '9.9.9.0/24'])
+        self.assertEqual(rule['inboundTag'], ['vless-v1'])
+        self.assertEqual(rule['outboundTag'], 'vless-v1-awg')
 
     def test_all_mode_and_ru_mode_send_whole_inbound_to_marked_outbound(self):
         for mode in ('all', 'ru_split'):
@@ -454,7 +466,7 @@ class XrayRoutingConfigTests(unittest.TestCase):
         self.manager.config['servers'].append(second)
         config = self.output()
         rules = config['routing']['rules']
-        self.assertEqual([rule['inboundTag'] for rule in rules], [['vless-v1'], ['vless-v1'], ['vless-v2'], ['vless-v2']])
+        self.assertEqual([rule['inboundTag'] for rule in rules], [['vless-v1']] * 3 + [['vless-v2']] * 3)
         self.assertEqual([outbound['streamSettings']['sockopt']['mark'] for outbound in config['outbounds'][1:]], [41001, 41002])
 
 
