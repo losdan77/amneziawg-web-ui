@@ -17,6 +17,8 @@ import tempfile
 import time
 
 import requests
+from service_networks import (normalize_service_ip_profile, load_expanded_networks,
+                              refresh_expanded_networks, expanded_network_status)
 
 
 # Domain suffixes, deliberately avoiding entire shared CDNs/google.com.
@@ -55,6 +57,7 @@ BUILTIN_SERVICE_CIDRS = SERVICE_IP_NETWORKS
 SERVICE_SEED_HOSTS = (
     'chatgpt.com', 'www.chatgpt.com', 'auth.openai.com', 'auth0.openai.com',
     'api.openai.com', 'platform.openai.com', 'ab.chatgpt.com',
+    'android.chat.openai.com', 'ios.chat.openai.com',
     'ws.chatgpt.com', 'chat.openai.com', 'cdn.oaistatic.com',
     'files.oaiusercontent.com', 'claude.ai', 'www.claude.ai',
     'api.anthropic.com', 'console.anthropic.com',
@@ -163,6 +166,13 @@ def normalize_routing_policy(data):
     return mode
 
 
+def service_destination_networks(upstream, state_dir=None):
+    networks = list(BUILTIN_SERVICE_CIDRS) + normalize_service_cidrs(upstream.get('service_cidrs'))
+    if normalize_service_ip_profile(upstream.get('service_ip_profile')) == 'expanded':
+        networks += load_expanded_networks(state_dir)
+    return networks
+
+
 class SelectiveRouting:
     """Own only rules/processes belonging to one AWG server at a time."""
 
@@ -246,14 +256,52 @@ class SelectiveRouting:
     def _static_networks(self, server):
         return list(BUILTIN_SERVICE_CIDRS) + normalize_service_cidrs(server['upstream'].get('service_cidrs'))
 
+    def refresh_provider_pool(self, server):
+        """Replace the broad provider set atomically, without a traffic gap."""
+        table, _, _, _, _ = self._context(server)
+        if normalize_service_ip_profile(server['upstream'].get('service_ip_profile')) != 'expanded':
+            return
+        networks = load_expanded_networks(self.directory)
+        if not networks:
+            raise RuntimeError('Expanded service networks are unavailable')
+        live, staging = f'awgwide_{table}', f'awgwtmp_{table}'
+        self._checked(f'ipset create {live} hash:net family inet maxelem 262144 -exist')
+        # The old set remains referenced by iptables until the complete new set
+        # is populated. An interrupted restore never replaces the live set.
+        self.run(f'ipset destroy {staging} 2>/dev/null || true')
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='ascii', dir=self.directory,
+                                             prefix='provider-', suffix='.restore', delete=False) as stream:
+                path = stream.name
+                os.chmod(path, 0o600)
+                stream.write(f'create {staging} hash:net family inet maxelem 262144\n')
+                for network in networks:
+                    # Validate again at the command boundary; source files are data.
+                    network = str(ipaddress.IPv4Network(network))
+                    stream.write(f'add {staging} {network}\n')
+            self._checked(f'ipset restore < {shlex.quote(path)}')
+            self._checked(f'ipset swap {staging} {live}')
+        finally:
+            self.run(f'ipset destroy {staging} 2>/dev/null || true')
+            if path:
+                Path(path).unlink(missing_ok=True)
+
     def _add_seed_pool(self, server, values):
         table, _, _, _, _ = self._context(server)
         static = tuple(ipaddress.IPv4Network(network) for network in self._static_networks(server))
+        expanded = normalize_service_ip_profile(server['upstream'].get('service_ip_profile')) == 'expanded'
+        entries = {}
         for address, expiry in values.items():
             ttl = min(SEED_TTL, int(expiry - time.time()))
-            # Do not turn a permanent administrator /32 into an expiring entry.
-            if ttl > 0 and not any(ipaddress.IPv4Address(address) in network for network in static):
-                self._checked(f'ipset add awgpool_{table} {address}/32 timeout {ttl} -exist')
+            target = ipaddress.IPv4Network(f'{address}/{24 if expanded else 32}', strict=False)
+            # In the explicit broad profile, also cover adjacent addresses for
+            # hosts outside the provider feeds. Never weaken a permanent range.
+            if ttl > 0 and not any(target.subnet_of(network) for network in static):
+                entries[str(target)] = max(ttl, entries.get(str(target), 0))
+        for network, ttl in entries.items():
+            self._checked(f'ipset add awgpool_{table} {network} timeout {ttl} -exist')
 
     def apply_seed_addresses(self, server, result):
         """Apply a completed refresh under the manager's configuration lock."""
@@ -284,18 +332,21 @@ class SelectiveRouting:
         pool = f'awgpool_{table}'
         desired = set(self._static_networks(server))
         self._checked(f'ipset create {pool} hash:net family inet timeout {SEED_TTL} -exist')
-        # Keep dynamically resolved destinations but remove obsolete permanent
-        # custom ranges when a policy is reapplied in a running namespace.
+        # Keep current dynamic targets, but drop broad seed /24 entries when
+        # returning to standard coverage, as well as obsolete custom ranges.
         existing = self.run(f'ipset save {pool}') or ''
+        expanded = normalize_service_ip_profile(server['upstream'].get('service_ip_profile')) == 'expanded'
         for line in existing.splitlines():
             fields = line.split()
-            if len(fields) < 5 or fields[:2] != ['add', pool] or fields[3:5] != ['timeout', '0']:
+            if len(fields) < 5 or fields[:2] != ['add', pool] or fields[3] != 'timeout':
                 continue
             try:
                 network = str(ipaddress.IPv4Network(fields[2], strict=False))
             except ValueError:
                 continue
-            if network not in desired:
+            permanent = fields[4] == '0'
+            obsolete = (permanent and network not in desired) or (not permanent and not expanded and '/' in network and not network.endswith('/32'))
+            if obsolete:
                 self._checked(f'ipset del {pool} {network} -exist')
         for network in sorted(desired):
             self._checked(f'ipset add {pool} {network} timeout 0 -exist')
@@ -388,6 +439,7 @@ class SelectiveRouting:
         if ipset not in existing_sets:
             self._restore_addresses(server)
         self._configure_pool(server)
+        self.refresh_provider_pool(server)
         self.ensure_dns(server)
         self._checked(f'iptables -t mangle -N {chain} 2>/dev/null || iptables -t mangle -S {chain} >/dev/null')
         rules = [
@@ -401,6 +453,13 @@ class SelectiveRouting:
         # new classifier after RESTORE, so its mark is saved for later packets.
         pool_rule = f'-m set --match-set awgpool_{table} dst -j MARK --set-mark {mark}'
         self._checked(f'iptables -t mangle -C {chain} {pool_rule} 2>/dev/null || iptables -t mangle -I {chain} 2 {pool_rule}')
+        provider_rule = f'-m set --match-set awgwide_{table} dst -j MARK --set-mark {mark}'
+        if normalize_service_ip_profile(server['upstream'].get('service_ip_profile')) == 'expanded':
+            self._checked(f'iptables -t mangle -C {chain} {provider_rule} 2>/dev/null || iptables -t mangle -I {chain} 2 {provider_rule}')
+        elif f'awgwide_{table}' in existing_sets:
+            # Also handle an in-place downgrade without keeping a broad rule.
+            self._checked(f'if iptables -t mangle -C {chain} {provider_rule} 2>/dev/null; then iptables -t mangle -D {chain} {provider_rule}; fi')
+            self.run(f'ipset destroy awgwide_{table} 2>/dev/null || true')
         rule = f'-i {interface} -s {subnet} -j {chain}'
         self._checked(f'iptables -t mangle -C PREROUTING {rule} 2>/dev/null || iptables -t mangle -A PREROUTING {rule}')
         for protocol in ('udp', 'tcp'):
@@ -431,5 +490,7 @@ class SelectiveRouting:
                 pass
         self.run(f'ipset destroy awgsel_{table} 2>/dev/null || true')
         self.run(f'ipset destroy awgpool_{table} 2>/dev/null || true')
+        self.run(f'ipset destroy awgwide_{table} 2>/dev/null || true')
+        self.run(f'ipset destroy awgwtmp_{table} 2>/dev/null || true')
         for path in self._paths(table):
             path.unlink(missing_ok=True)

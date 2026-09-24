@@ -29,7 +29,9 @@ from awg_protocol import (OBFUSCATION_KEYS, V3_KEYS, generate_params, normalize_
                           upgrade_params, render_params, replace_interface_params)
 from routing_policy import (AI_TIKTOK_DOMAINS, BUILTIN_SERVICE_CIDRS, SelectiveRouting,
                             normalize_routing_policy, normalize_service_cidrs,
-                            resolve_service_hosts)
+                            resolve_service_hosts, normalize_service_ip_profile,
+                            service_destination_networks, load_expanded_networks, refresh_expanded_networks,
+                            expanded_network_status)
 
 # Get the absolute path to the current directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -320,6 +322,7 @@ class AmneziaManager:
         self.start_client_expiration_worker()
         self.start_link_health_worker()
         self.start_destination_cache_worker()
+        self.start_service_network_worker()
 
     # ── Flexible client expiration ──────────────────────────────────────
     # The web UI / bot can pass any of the following as the ``duration`` field:
@@ -1148,6 +1151,72 @@ class AmneziaManager:
     def start_destination_cache_worker(self):
         threading.Thread(target=self.destination_cache_worker, daemon=True).start()
 
+    def service_network_tick(self):
+        """Refresh public provider feeds off-lock; apply only to current opt-ins."""
+        def active_expanded(server):
+            return (self._server_has_linked_upstream(server)
+                    and normalize_routing_policy(server['upstream']) == 'ai_tiktok'
+                    and normalize_service_ip_profile(server['upstream'].get('service_ip_profile')) == 'expanded'
+                    and (server.get('protocol') == 'vless' or self.is_interface_running(server.get('interface'))))
+
+        with self.config_lock:
+            if not any(active_expanded(server) for server in self.config.get('servers', [])):
+                self._provider_applied = {}
+                return
+        state_dir = os.path.join(CONFIG_DIR, 'routing')
+        status = expanded_network_status(state_dir)
+        retry_interval = 3600 if status.get('errors') else 86400
+        if self.stop_expiration_worker.is_set():
+            return
+        if not status.get('last_attempt') or time.time() - status['last_attempt'] >= retry_interval:
+            refresh_expanded_networks(state_dir)
+        if self.stop_expiration_worker.is_set():
+            return
+        revision = hash(tuple(load_expanded_networks(state_dir)))
+        with self.config_lock:
+            # Resolve current membership again after network IO. Removed servers
+            # and servers switched back to standard must never be reconfigured.
+            applied = getattr(self, '_provider_applied', {})
+            current_keys, xray_pending = set(), []
+            for server in self.config.get('servers', []):
+                if not active_expanded(server):
+                    continue
+                identity = (server['id'], server.get('protocol'), server.get('interface'),
+                            int(server['upstream']['table_id']))
+                current_keys.add(identity)
+                if applied.get(identity) == revision:
+                    continue
+                try:
+                    if server.get('protocol') == 'vless':
+                        xray_pending.append(identity)
+                    else:
+                        self._selective_routing().refresh_provider_pool(server)
+                        applied[identity] = revision
+                except Exception as error:
+                    print(f"Provider networks apply failed for {server['id']}: {type(error).__name__}")
+            if xray_pending:
+                try:
+                    if self._write_xray_config() is False:
+                        raise RuntimeError('Could not persist the Xray provider rules')
+                    for identity in xray_pending:
+                        applied[identity] = revision
+                except Exception as error:
+                    print(f'Provider networks Xray update failed: {type(error).__name__}')
+            # A transient kernel/file error retries next tick without waiting
+            # for the daily download or forgetting still-working old networks.
+            self._provider_applied = {key: value for key, value in applied.items() if key in current_keys}
+
+    def service_network_worker(self):
+        while not self.stop_expiration_worker.is_set():
+            try:
+                self.service_network_tick()
+            except Exception as error:
+                print(f'Provider networks refresh failed: {type(error).__name__}')
+            self.stop_expiration_worker.wait(60)
+
+    def start_service_network_worker(self):
+        threading.Thread(target=self.service_network_worker, daemon=True).start()
+
     def get_upstream_diagnostics(self, server_id, destination='chatgpt.com'):
         """Read the classifier and Linux route for a destination, without changing either.
 
@@ -1197,6 +1266,7 @@ class AmneziaManager:
                    for name in ([upstream_interface] if is_vless else [interface or '', upstream_interface])):
                 raise ValueError('Invalid tunnel interface name')
             policy = normalize_routing_policy(upstream)
+            service_ip_profile = normalize_service_ip_profile(upstream.get('service_ip_profile'))
             healthy, handshake_age = self.is_upstream_healthy(server)
             classifier = {'dns_running': None, 'dns_entries': 0, 'pool_entries': 0,
                           'matched_packets': 0, 'rules_attached': None}
@@ -1205,8 +1275,15 @@ class AmneziaManager:
                 'Проверка моделирует новое соединение клиента. Она не проверяет его DNS-кэш, '
                 'существующие соединения и трафик, созданный самой VPS.',
             ]
-            if policy == 'ai_tiktok':
+            if policy == 'ai_tiktok' and service_ip_profile == 'standard':
                 warnings.insert(0, 'В режиме AI + TikTok обычный сайт «мой IP» должен показывать IP первой VPS.')
+            if policy == 'ai_tiktok' and service_ip_profile == 'expanded':
+                status = expanded_network_status(os.path.join(CONFIG_DIR, 'routing'))
+                classifier['provider_status'] = {key: status.get(key) for key in
+                                                 ('networks', 'last_attempt', 'last_success', 'errors')
+                                                 if status.get(key) is None or isinstance(status.get(key), (int, float))}
+                warnings.append('Максимальное покрытие включает общие сети CDN и облаков. '
+                                'Посторонние сайты и проверки «мой IP» на этих сетях тоже могут идти через туннель.')
             if hostname:
                 warnings.append('Домен разрешён на сервере; у клиента может быть другой IP. '
                                 'Для точной проверки укажите IPv4 фактического соединения клиента.')
@@ -1225,6 +1302,8 @@ class AmneziaManager:
                     'dns': f'AWGSEL_{table} -m set --match-set awgsel_{table} dst -j MARK --set-mark {fwmark}',
                     'pool': f'AWGSEL_{table} -m set --match-set awgpool_{table} dst -j MARK --set-mark {fwmark}',
                 }
+                if service_ip_profile == 'expanded':
+                    rules['provider'] = f'AWGSEL_{table} -m set --match-set awgwide_{table} dst -j MARK --set-mark {fwmark}'
                 for kind, rule in rules.items():
                     output = self.execute_command(
                         f'iptables -t mangle -C {rule} >/dev/null 2>&1 && printf attached || true')
@@ -1261,6 +1340,9 @@ class AmneziaManager:
 
             networks = [ipaddress.IPv4Network(value) for value in
                         list(BUILTIN_SERVICE_CIDRS) + normalize_service_cidrs(upstream.get('service_cidrs'))]
+            provider_networks = [ipaddress.IPv4Network(value) for value in
+                                 load_expanded_networks(os.path.join(CONFIG_DIR, 'routing'))] if (
+                                 is_vless and service_ip_profile == 'expanded') else []
             source = None
             if not is_vless:
                 network = ipaddress.IPv4Network(server['subnet'], strict=False)
@@ -1270,15 +1352,19 @@ class AmneziaManager:
             for address in addresses:
                 # Canonicalize even resolver output before constructing a command.
                 address = str(ipaddress.IPv4Address(address))
-                dns_match = pool_match = False
+                dns_match = pool_match = provider_match = explicit_pool_match = False
                 if policy == 'ai_tiktok':
                     if is_vless:
                         dns_match = bool(hostname and any(hostname == suffix or hostname.endswith('.' + suffix)
                                                          for suffix in AI_TIKTOK_DOMAINS))
-                        pool_match = any(ipaddress.IPv4Address(address) in network for network in networks)
+                        provider_match = any(ipaddress.IPv4Address(address) in network for network in provider_networks)
+                        pool_match = provider_match or any(ipaddress.IPv4Address(address) in network for network in networks)
                     else:
                         dns_match = in_set(f'awgsel_{table}', address)
-                        pool_match = in_set(f'awgpool_{table}', address)
+                        explicit_pool_match = in_set(f'awgpool_{table}', address)
+                        if service_ip_profile == 'expanded':
+                            provider_match = in_set(f'awgwide_{table}', address)
+                        pool_match = explicit_pool_match or provider_match
                     matched = dns_match or pool_match
                 else:
                     # All/RU policies are determined by the installed route table.
@@ -1287,7 +1373,8 @@ class AmneziaManager:
                 if policy == 'ai_tiktok' and not is_vless:
                     applies_mark = classification_rules['jump'] and (
                         (dns_match and classification_rules['dns']) or
-                        (pool_match and classification_rules['pool']))
+                        (explicit_pool_match and classification_rules['pool']) or
+                        (provider_match and classification_rules.get('provider')))
                     mark = fwmark if applies_mark else 0
                 if is_vless and server.get('routing_state') == 'local':
                     mark = 0
@@ -1308,11 +1395,13 @@ class AmneziaManager:
                 except (TypeError, ValueError, AttributeError):
                     pass
                 destinations.append({'address': address, 'matched': matched, 'dns_match': dns_match,
-                                     'pool_match': pool_match, 'route': route, 'egress': egress})
+                                     'pool_match': pool_match, 'provider_match': provider_match,
+                                     'route': route, 'egress': egress})
             if any(item['route'] == 'unknown' for item in destinations):
                 warnings.append('Ядро не вернуло маршрут для части адресов: возможна блокировка fail_close '
                                 'или остановленный интерфейс. Это не подтверждает локальный выход.')
             return {'protocol': server.get('protocol', 'amneziawg'), 'routing_mode': policy,
+                    'service_ip_profile': service_ip_profile,
                     'routing_state': server.get('routing_state'),
                     'failover_mode': server.get('linked_failover_mode', 'fail_close'),
                     'upstream': {'interface': upstream_interface, 'healthy': healthy,
@@ -2256,7 +2345,7 @@ class AmneziaManager:
                     routing_rules.append({
                         "type": "field",
                         "inboundTag": [inbound_tag],
-                        "ip": list(BUILTIN_SERVICE_CIDRS) + normalize_service_cidrs(upstream.get('service_cidrs')),
+                        "ip": service_destination_networks(upstream, os.path.join(CONFIG_DIR, 'routing')),
                         "outboundTag": outbound_tag,
                     })
                     outbound_tag = 'direct'
@@ -2293,10 +2382,11 @@ class AmneziaManager:
 
         try:
             os.makedirs(XRAY_CONFIG_DIR, exist_ok=True)
-            with open(XRAY_CONFIG_FILE, "w") as f:
-                json.dump(config, f, indent=2)
+            self._atomic_config_write(XRAY_CONFIG_FILE, json.dumps(config, indent=2))
+            return True
         except Exception as e:
             print(f"Failed writing xray config: {e}")
+            return False
 
     def create_vless_server(self, server_data):
         server_name = server_data.get("name", "New VLESS Server")
@@ -3919,6 +4009,7 @@ class AmneziaManager:
 
         routing_mode = normalize_routing_policy(upstream_data)
         service_cidrs = normalize_service_cidrs(upstream_data.get('service_cidrs'))
+        service_ip_profile = normalize_service_ip_profile(upstream_data.get('service_ip_profile'))
         imported_obfuscation = {}
         interface_cfg, peer_cfg = self.parse_amnezia_config_text(import_config_text)
         endpoint_value = peer_cfg.get("Endpoint", "")
@@ -3991,6 +4082,7 @@ class AmneziaManager:
             "table_id": self._allocate_upstream_table_id(base=table_base),
             "routing_mode": routing_mode,
             "service_cidrs": service_cidrs,
+            "service_ip_profile": service_ip_profile,
             "split_ru_local": routing_mode == 'ru_split',
             "mtu": mtu,
             "awg_version": protocol_version(imported_obfuscation),
@@ -4362,6 +4454,7 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         policy_data = upstream_data if any(k in upstream_data for k in ('routing_mode', 'split_ru_local')) else previous
         routing_mode = normalize_routing_policy(policy_data)
         service_cidrs = normalize_service_cidrs(upstream_data.get('service_cidrs', previous.get('service_cidrs')))
+        service_ip_profile = normalize_service_ip_profile(upstream_data.get('service_ip_profile', previous.get('service_ip_profile')))
         failover_mode = str(upstream_data.get('failover_mode', server.get('linked_failover_mode') or 'fail_close')).strip().lower()
         if failover_mode not in ('fail_close', 'fail_open'):
             raise ValueError('upstream.failover_mode must be fail_close or fail_open')
@@ -4400,6 +4493,7 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
             upstream['fwmark'] = self._allocate_upstream_fwmark()
         upstream['routing_mode'] = routing_mode
         upstream['service_cidrs'] = service_cidrs
+        upstream['service_ip_profile'] = service_ip_profile
         upstream['split_ru_local'] = routing_mode == 'ru_split'
         upstream_network = ipaddress.ip_interface(upstream['local_address']).network
         for other in self.config['servers']:

@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT / 'web-ui'))
 SEED_ADDRESS = '104.18.31.77'
 BUILTIN_POOL_ADDRESS = '160.79.104.10'
 CUSTOM_POOL_ADDRESS = '45.67.89.10'
+PROVIDER_ADDRESSES = ('172.64.155.209', '95.100.248.88')
 
 
 def command(*args, check=True, input=None, timeout=20):
@@ -120,7 +121,8 @@ class Lab:
         for name in ('direct', 'remote'):
             for address in ('203.0.113.10/32', '203.0.113.11/32', '203.0.113.20/32',
                             SEED_ADDRESS + '/32', BUILTIN_POOL_ADDRESS + '/32',
-                            CUSTOM_POOL_ADDRESS + '/32'):
+                            CUSTOM_POOL_ADDRESS + '/32',
+                            *(address + '/32' for address in PROVIDER_ADDRESSES)):
                 self.ns(name, 'ip', 'addr', 'add', address, 'dev', 'lo')
             self.start(name, sys.executable, str(Path(__file__).resolve()), '--serve-http', name)
         self.start('direct', 'dnsmasq', '--keep-in-foreground', '--conf-file=/dev/null',
@@ -288,6 +290,7 @@ def run_smoke():
         try:
             lab.setup()
             for version in ('2', '3'):
+                server['upstream']['service_ip_profile'] = 'standard'
                 lab.upstream(version)
                 # Use the actual project firewall helper, including both egress NAT rules.
                 lab.ns('router', 'sh', str(ROOT / 'scripts/setup_iptables.sh'),
@@ -390,11 +393,35 @@ def run_smoke():
                 assert manager.configure_upstream_routing(other) is not False
                 assert lab.dns('client-b', 'chatgpt.com')['answers'] > 0
                 lab.http('client-b', '203.0.113.10', 'remote')
+                # Broad coverage comes from the bundled provider snapshot;
+                # these destinations have never appeared in client DNS or
+                # seed inputs. B stays on the standard policy, despite sharing
+                # the same physical exit interface.
+                server['upstream']['service_ip_profile'] = 'expanded'
+                assert manager.configure_upstream_routing(server) is not False
+                for target in PROVIDER_ADDRESSES:
+                    lab.http('client-a', target, 'remote')
+                    lab.http('client-b', target, 'direct')
+                    diagnostic = manager.get_upstream_diagnostics(server['id'], target)
+                    assert diagnostic['destinations'][0]['provider_match'], diagnostic
+                    assert diagnostic['destinations'][0]['route'] == 'upstream', diagnostic
+                for client in ('client-a', 'client-b'):
+                    lab.http(client, '203.0.113.20', 'direct')
+                # A live downgrade must remove both broad rules and the
+                # temporary /24 seed entries without disturbing standard B.
+                server['upstream']['service_ip_profile'] = 'standard'
+                assert manager.configure_upstream_routing(server) is not False
+                for target in PROVIDER_ADDRESSES:
+                    lab.http('client-a', target, 'direct')
+                    lab.http('client-b', target, 'direct')
+                assert lab.ns('router', 'ipset', 'list', 'awgwide_210', check=False).returncode != 0
+                lab.http('client-b', '203.0.113.10', 'remote')
                 assert manager.cleanup_upstream_routing(server) is not False
                 lab.http('client-a', '203.0.113.10', 'direct')
                 lab.http('client-b', '203.0.113.10', 'remote')
                 assert manager.cleanup_upstream_routing(other) is not False
                 lab.http('client-b', '203.0.113.10', 'direct')
+                server['upstream']['service_ip_profile'] = 'expanded'
                 assert manager.configure_upstream_routing(server) is not False
                 # A replacement/restart also restores the recorded set; no new
                 # client DNS query should be necessary for its cached address.
@@ -405,6 +432,9 @@ def run_smoke():
                 # Removing the device tests immediate fail-close before health polling runs.
                 lab.ns('router', 'ip', 'link', 'del', 'awg-out')
                 lab.http('client-a', '203.0.113.10', None)
+                for target in PROVIDER_ADDRESSES:
+                    lab.http('client-a', target, None)
+                    lab.http('client-b', target, 'direct')
                 lab.http('client-a', '203.0.113.20', 'direct')
                 assert manager.configure_wireguard_fail_closed_routing(server) is not False
                 lab.http('client-a', '203.0.113.11', None)
@@ -416,12 +446,14 @@ def run_smoke():
                 assert 'lookup 210' not in rules, rules
                 assert lab.ns('router', 'ipset', 'list', 'awgsel_210', check=False).returncode != 0
                 assert lab.ns('router', 'ipset', 'list', 'awgpool_210', check=False).returncode != 0
+                assert lab.ns('router', 'ipset', 'list', 'awgwide_210', check=False).returncode != 0
                 assert 'AWGSEL_210' not in lab.ns('router', 'iptables-save').stdout
                 lab.stop_upstream()
                 print(f'PASS AWG {version}: DNS UDP/TCP, target egress, ordinary direct, '
                       'other server isolation, fail-open/recovery, fail-close, '
                       'pre-DNS seeded/static destinations, live pool replacement, abrupt namespace restart, '
-                      'cached destination restore, real route diagnostics, idempotence, cleanup', flush=True)
+                      'cached destination restore, broad provider subnets without DNS, standard downgrade, '
+                      'real route diagnostics, idempotence, cleanup', flush=True)
         finally:
             try:
                 if 'router' in lab.names:

@@ -1,5 +1,6 @@
 """Exercise actual policy generation, imports and Xray output with external IO mocked."""
 import copy
+import ipaddress
 import errno
 import json
 import os
@@ -451,12 +452,37 @@ class XrayRoutingConfigTests(unittest.TestCase):
         self.assertEqual(rule['inboundTag'], ['vless-v1'])
         self.assertEqual(rule['outboundTag'], 'vless-v1-awg')
 
+    def test_failed_atomic_xray_write_preserves_previous_configuration(self):
+        self.output()
+        before = Path(manager_module.XRAY_CONFIG_FILE).read_bytes()
+        self.server['upstream']['service_ip_profile'] = 'expanded'
+        with patch.object(manager_module.os, 'replace', side_effect=OSError('disk error')):
+            self.assertFalse(self.manager._write_xray_config())
+        self.assertEqual(Path(manager_module.XRAY_CONFIG_FILE).read_bytes(), before)
+        self.assertFalse(list(Path(self.directory.name).glob('.awg-*')))
+        self.assertTrue(self.manager._write_xray_config())
+
     def test_all_mode_and_ru_mode_send_whole_inbound_to_marked_outbound(self):
         for mode in ('all', 'ru_split'):
             with self.subTest(mode=mode):
                 self.server['upstream']['routing_mode'] = mode
                 rules = self.output()['routing']['rules']
                 self.assertEqual(rules, [{'type': 'field', 'inboundTag': ['vless-v1'], 'outboundTag': 'vless-v1-awg'}])
+
+    def test_expanded_provider_networks_are_scoped_and_keep_standard_and_all_modes(self):
+        self.server['upstream']['service_ip_profile'] = 'expanded'
+        config = self.output()
+        networks = [ipaddress.IPv4Network(value) for value in config['routing']['rules'][1]['ip']]
+        for value in ('104.18.32.42', '160.79.104.10', '95.100.248.88'):
+            self.assertTrue(any(ipaddress.IPv4Address(value) in network for network in networks), value)
+        self.assertEqual(config['routing']['rules'][1]['inboundTag'], ['vless-v1'])
+        self.assertFalse(any(ipaddress.IPv4Address('10.0.0.1') in network for network in networks))
+        self.server['upstream']['service_ip_profile'] = 'standard'
+        self.assertEqual(self.output()['routing']['rules'][1]['ip'], ['160.79.104.0/23'])
+        self.server['upstream'].update(service_ip_profile='expanded', routing_mode='all')
+        rules = self.output()['routing']['rules']
+        self.assertEqual(len(rules), 1)
+        self.assertNotIn('ip', rules[0])
 
     def test_multiple_inbounds_never_share_selective_rules_or_marks(self):
         second = copy.deepcopy(self.server)

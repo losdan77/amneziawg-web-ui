@@ -85,6 +85,8 @@ async function run() {
     assert.equal(app.getUpstreamRoutingMode({}), 'all');
     assert.equal(app.getUpstreamRoutingMode({ routing_mode: 'ai_tiktok', split_ru_local: true }), 'ai_tiktok');
     assert.match(app.getUpstreamRoutingLabel({ routing_mode: 'ai_tiktok' }), /all other traffic locally/);
+    assert.match(app.getUpstreamRoutingLabel({ routing_mode: 'ai_tiktok', service_ip_profile: 'expanded' }), /shared CDN \/ cloud networks/);
+    assert.equal(app.getUpstreamRoutingLabel({ routing_mode: 'all', service_ip_profile: 'expanded' }), 'All traffic through the tunnel');
 
     const serversList = makeElement('serversList');
     app.updateClientFilterSummary = () => {};
@@ -106,11 +108,25 @@ async function run() {
     makeElement('serverProtocol', 'wireguard');
     makeElement('upstreamRoutingMode', 'ai_tiktok');
     const hint = makeElement('upstreamSelectiveDnsHint');
+    const coverageGroup = makeElement('upstreamServiceIpProfileGroup');
+    const coverage = makeElement('upstreamServiceIpProfile', 'standard');
+    const expandedHint = makeElement('upstreamExpandedCoverageHint');
     app.updateUpstreamRoutingHint();
     assert.equal(hint.classList.contains('hidden'), false);
+    assert.equal(coverageGroup.classList.contains('hidden'), false);
+    assert.equal(expandedHint.classList.contains('hidden'), true);
+    coverage.value = 'expanded';
+    app.updateUpstreamRoutingHint();
+    assert.equal(expandedHint.classList.contains('hidden'), false);
     elements.get('serverProtocol').value = 'vless';
     app.updateUpstreamRoutingHint();
     assert.equal(hint.classList.contains('hidden'), true);
+    assert.equal(coverageGroup.classList.contains('hidden'), false, 'VLESS creation supports maximum coverage');
+    elements.get('upstreamRoutingMode').value = 'all';
+    app.updateUpstreamRoutingHint();
+    assert.equal(coverageGroup.classList.contains('hidden'), true);
+    assert.equal(expandedHint.classList.contains('hidden'), true);
+    coverage.value = 'standard';
 
     for (const [version, config] of [['2', config2], ['3', config3]]) {
         const trigger = makeElement('trigger');
@@ -119,6 +135,8 @@ async function run() {
         assert.ok(elements.get('upstreamTunnelModal'));
         assert.equal(elements.get('tunnelImportConfig').required, true);
         assert.equal(elements.get('tunnelRoutingMode').value, 'ru_split');
+        assert.equal(elements.get('tunnelServiceIpProfile').value, 'standard', 'existing behavior is the default');
+        assert.equal(elements.get('tunnelServiceIpProfileGroup').classList.contains('hidden'), true);
         assert.ok(!elements.has('removeUpstreamTunnel'));
         assert.match(insertedHtml, /&lt;img src=x onerror=alert\(1\)&gt;/);
         const before = requests.length;
@@ -137,12 +155,13 @@ async function run() {
         elements.get('tunnelRoutingMode').listeners.get('change')();
         assert.equal(elements.get('tunnelSelectiveDnsHint').classList.contains('hidden'), false);
         assert.equal(elements.get('tunnelServiceCidrsGroup').classList.contains('hidden'), false);
+        assert.equal(elements.get('tunnelServiceIpProfileGroup').classList.contains('hidden'), false);
         elements.get('tunnelFailoverMode').value = 'fail_close';
         await app.saveUpstreamTunnel();
         const request = requests.at(-1);
         assert.equal(request.url, `/api/servers/awg-${version}/upstream`);
         assert.equal(request.method, 'PUT');
-        assert.deepEqual(JSON.parse(request.body), { routing_mode: 'ai_tiktok', failover_mode: 'fail_close', service_cidrs: [], import_config: config });
+        assert.deepEqual(JSON.parse(request.body), { routing_mode: 'ai_tiktok', failover_mode: 'fail_close', service_cidrs: [], service_ip_profile: 'standard', import_config: config });
         assert.ok(!elements.has('upstreamTunnelModal'));
         assert.equal(document.activeElement, trigger, 'focus returns to trigger');
         assert.ok(!documentListeners.has('keydown'));
@@ -161,38 +180,51 @@ async function run() {
     await app.saveUpstreamTunnel();
     assert.deepEqual(JSON.parse(requests.at(-1).body), { routing_mode: 'all', failover_mode: 'fail_open' }, 'editing routing preserves stored credentials');
 
-    const selective = { ...linked, upstream: { ...linked.upstream, routing_mode: 'ai_tiktok', service_cidrs: ['160.79.104.0/23', '8.8.8.8/32'] } };
+    const selective = { ...linked, upstream: { ...linked.upstream, routing_mode: 'ai_tiktok', service_ip_profile: 'expanded', service_cidrs: ['160.79.104.0/23', '8.8.8.8/32'] } };
     open(selective);
+    assert.equal(elements.get('tunnelServiceIpProfile').value, 'expanded', 'saved coverage remains selected');
+    assert.equal(elements.get('tunnelExpandedCoverageHint').classList.contains('hidden'), false);
     assert.equal(elements.get('tunnelServiceCidrs').value, '160.79.104.0/23\n8.8.8.8/32', 'saved addresses remain visible for editing');
     elements.get('tunnelRoutingMode').value = 'all';
     elements.get('tunnelRoutingMode').listeners.get('change')();
     assert.equal(elements.get('tunnelServiceCidrsGroup').classList.contains('hidden'), true);
+    assert.equal(elements.get('tunnelServiceIpProfileGroup').classList.contains('hidden'), true);
+    assert.equal(elements.get('tunnelExpandedCoverageHint').classList.contains('hidden'), true);
+    assert.equal(elements.get('tunnelServiceIpProfile').value, 'expanded', 'temporarily changing mode does not erase coverage');
     assert.equal(elements.get('tunnelServiceCidrs').value, '160.79.104.0/23\n8.8.8.8/32', 'temporarily changing mode does not erase addresses');
     await app.saveUpstreamTunnel();
     assert.ok(!Object.hasOwn(JSON.parse(requests.at(-1).body), 'service_cidrs'), 'nonselective updates preserve the stored pool on the backend');
+    assert.ok(!Object.hasOwn(JSON.parse(requests.at(-1).body), 'service_ip_profile'), 'nonselective updates preserve the stored coverage on the backend');
 
     open(selective);
     elements.get('tunnelServiceCidrs').value = ' 160.79.104.0/23\n8.8.8.8/32, 1.1.1.1  \n160.79.104.0/23 ';
     await app.saveUpstreamTunnel();
     assert.deepEqual(JSON.parse(requests.at(-1).body).service_cidrs, ['160.79.104.0/23', '8.8.8.8/32', '1.1.1.1']);
+    assert.equal(JSON.parse(requests.at(-1).body).service_ip_profile, 'expanded');
     open(selective);
+    elements.get('tunnelServiceIpProfile').value = 'standard';
+    elements.get('tunnelServiceIpProfile').listeners.get('change')();
+    assert.equal(elements.get('tunnelExpandedCoverageHint').classList.contains('hidden'), true);
     elements.get('tunnelServiceCidrs').value = '';
     await app.saveUpstreamTunnel();
     assert.deepEqual(JSON.parse(requests.at(-1).body).service_cidrs, [], 'clearing the textarea removes custom addresses');
+    assert.equal(JSON.parse(requests.at(-1).body).service_ip_profile, 'standard', 'maximum coverage can be disabled without replacing credentials');
 
     open(selective);
     elements.get('tunnelServiceCidrs').value = '0.0.0.0/0';
     context.fetch = async () => ({ ok: false, status: 400, json: async () => ({ error: 'Only public IPv4 service networks are allowed' }) });
     await app.saveUpstreamTunnel();
     assert.equal(elements.get('tunnelServiceCidrs').value, '0.0.0.0/0', 'validation failure preserves the user input');
+    assert.equal(elements.get('tunnelServiceIpProfile').value, 'expanded', 'validation failure preserves coverage');
     assert.match(elements.get('tunnelFormError').textContent, /Only public IPv4/);
 
     const diagnostics = {
-        protocol: 'awg2', routing_mode: 'ai_tiktok', routing_state: 'upstream', failover_mode: 'fail_close',
+        protocol: 'awg2', routing_mode: 'ai_tiktok', service_ip_profile: 'expanded', routing_state: 'upstream', failover_mode: 'fail_close',
         upstream: { interface: 'wg-up-test', healthy: true, handshake_age_seconds: 12, private_key: 'must-not-render' },
         classifier: { dns_running: true, dns_entries: 15, pool_entries: 8, matched_packets: 123,
-            seed_status: { resolved_hosts: 20, queried_hosts: 23, errors: 3, addresses: 42, last_attempt: 1720000000, last_success: 1719999900, private_key: 'must-not-render' } },
-        destinations: [{ address: '160.79.104.1', matched: true, dns_match: false, pool_match: true, route: 'upstream', egress: 'wg-up-test', secret: 'must-not-render' }],
+            seed_status: { resolved_hosts: 20, queried_hosts: 23, errors: 3, addresses: 42, last_attempt: 1720000000, last_success: 1719999900, private_key: 'must-not-render' },
+            provider_status: { networks: 4321, errors: 1, last_attempt: 1720000000, last_success: 1719999900, private_key: 'must-not-render' } },
+        destinations: [{ address: '160.79.104.1', matched: true, dns_match: false, pool_match: true, provider_match: true, route: 'upstream', egress: 'wg-up-test', secret: 'must-not-render' }],
         warnings: ['<img src=x onerror=alert(1)>', { private_key: 'must-not-render' }],
         private_key: 'must-not-render'
     };
@@ -212,8 +244,13 @@ async function run() {
     assert.match(diagnosticResult.textContent, /resolved hosts: 20\/23; errors: 3; cached addresses: 42/);
     assert.match(diagnosticResult.textContent, /Last seed attempt \(UTC\): 2024-07-03T09:46:40\.000Z/);
     assert.match(diagnosticResult.textContent, /Last seed address update \(UTC\): 2024-07-03T09:45:00\.000Z/);
+    assert.match(diagnosticResult.textContent, /Saved service IP coverage: expanded/);
+    assert.match(diagnosticResult.textContent, /Provider networks: 4321; refresh errors: 1/);
+    assert.match(diagnosticResult.textContent, /Last provider attempt \(UTC\): 2024-07-03T09:46:40\.000Z/);
+    assert.match(diagnosticResult.textContent, /Last provider network update \(UTC\): 2024-07-03T09:45:00\.000Z/);
     assert.match(diagnosticResult.textContent, /160\.79\.104\.1 — matched: yes/);
     assert.match(diagnosticResult.textContent, /egress interface: wg-up-test/);
+    assert.match(diagnosticResult.textContent, /provider network: yes/);
     assert.match(diagnosticResult.textContent, /<img src=x onerror=alert\(1\)>/);
     assert.equal(diagnosticResult.innerHTML, '', 'server messages are displayed as text, never HTML');
     assert.ok(!diagnosticResult.textContent.includes('must-not-render'), 'unknown response fields are not exposed');
@@ -310,6 +347,7 @@ async function run() {
     makeElement('upstreamImportConfig', config3);
     makeElement('upstreamFailoverMode', 'fail_close');
     makeElement('upstreamRoutingMode', 'ai_tiktok');
+    makeElement('upstreamServiceIpProfile', 'expanded');
     makeElement('vlessUseUpstream').checked = true;
     for (const protocol of ['wireguard', 'vless']) {
         makeElement('serverProtocol', protocol);
@@ -319,11 +357,16 @@ async function run() {
         const payload = JSON.parse(requests.at(-1).body);
         assert.equal(payload.protocol, protocol);
         assert.equal(payload.upstream.routing_mode, 'ai_tiktok');
+        assert.equal(payload.upstream.service_ip_profile, 'expanded');
         assert.equal(payload.upstream.import_config, config3);
         assert.ok(!Object.hasOwn(payload.upstream, 'split_ru_local'));
     }
+    elements.get('upstreamRoutingMode').value = 'all';
+    app.createServer();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(!Object.hasOwn(JSON.parse(requests.at(-1).body).upstream, 'service_ip_profile'), 'creation only sends coverage for the selective mode');
     assert.ok(reloads >= 6);
-    console.log('PASS upstream frontend: AWG2/AWG3 tunnels, service address pools, safe diagnostics, errors, busy state and VLESS creation');
+    console.log('PASS upstream frontend: AWG2/AWG3 tunnels, opt-in maximum coverage, service address pools, safe diagnostics, errors, busy state and VLESS creation');
 }
 
 run().catch(error => { console.error(error); process.exitCode = 1; });

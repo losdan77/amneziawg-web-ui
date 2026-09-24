@@ -157,6 +157,7 @@ class AmneziaApp {
             this.updateUpstreamConfigPreview(upstreamImportConfig.value || '');
         }
         const upstreamRoutingMode = this.getElement('upstreamRoutingMode');
+        this.getElement('upstreamServiceIpProfile')?.addEventListener('change', () => this.updateUpstreamRoutingHint());
         if (upstreamRoutingMode) {
             upstreamRoutingMode.addEventListener('change', () => this.updateUpstreamRoutingHint());
             this.updateUpstreamRoutingHint();
@@ -472,6 +473,9 @@ class AmneziaApp {
     }
 
     getUpstreamRoutingLabel(upstream) {
+        if (this.getUpstreamRoutingMode(upstream) === 'ai_tiktok' && upstream?.service_ip_profile === 'expanded') {
+            return 'AI services + TikTok and shared CDN / cloud networks through the tunnel; other traffic locally';
+        }
         return {
             all: 'All traffic through the tunnel',
             ru_split: 'Russian destination IP ranges locally; all other traffic through the tunnel',
@@ -484,6 +488,8 @@ class AmneziaApp {
         const mode = this.getElement('upstreamRoutingMode')?.value;
         const protocol = this.getElement('serverProtocol')?.value;
         if (hint) hint.classList.toggle('hidden', mode !== 'ai_tiktok' || protocol === 'vless');
+        this.getElement('upstreamServiceIpProfileGroup')?.classList.toggle('hidden', mode !== 'ai_tiktok');
+        this.getElement('upstreamExpandedCoverageHint')?.classList.toggle('hidden', mode !== 'ai_tiktok' || this.getElement('upstreamServiceIpProfile')?.value !== 'expanded');
     }
 
     parseAmneziaConfigPreview(configText) {
@@ -995,6 +1001,10 @@ class AmneziaApp {
             };
         }
 
+        if (formData.upstream?.routing_mode === 'ai_tiktok') {
+            formData.upstream.service_ip_profile = this.getElement('upstreamServiceIpProfile')?.value || 'standard';
+        }
+
         // Add manual obfuscation parameters only for standalone mode
         if (protocol !== 'vless' && mode !== 'edge_linked' && formData.obfuscation) {
             formData.obfuscation_params = {
@@ -1293,10 +1303,19 @@ class AmneziaApp {
                             <select id="tunnelRoutingMode" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
                                 <option value="all">All traffic</option>
                                 <option value="ru_split">All except Russian destination IP ranges (Russian traffic stays local)</option>
-                                <option value="ai_tiktok">AI services + TikTok only (all other traffic stays local)</option>
+                                <option value="ai_tiktok">AI services + TikTok (coverage settings below)</option>
                             </select>
                             <p class="text-gray-500 text-xs mt-1">AI services include ChatGPT, Codex, Claude and other supported services. Local traffic uses this server's ordinary network adapter.</p>
-                            <p id="tunnelSelectiveDnsHint" class="text-amber-800 text-xs mt-2 hidden">The server learns IPv4 addresses from DNS, pre-resolves known service hosts and includes documented API networks. This is not a complete pool of shared CDN addresses. Disable encrypted / Private DNS and browser Secure DNS for reliable learning; cached or different DNS answers can be missed. Shared IPs may also send unrelated services through the tunnel. IPv6 outside the VPN is not covered. Reconnect clients and refresh their DNS after changing this mode.</p>
+                            <p id="tunnelSelectiveDnsHint" class="text-amber-800 text-xs mt-2 hidden">The server learns IPv4 addresses from DNS, pre-resolves known service hosts and includes documented API networks. For broader coverage choose Maximum coverage below. Disable encrypted / Private DNS and browser Secure DNS for reliable learning of addresses outside known networks. Shared IPs may also send unrelated services through the tunnel. IPv6 outside the VPN is not covered. Reconnect clients and restart apps after changing this mode.</p>
+                        </div>
+                        <div id="tunnelServiceIpProfileGroup" class="hidden">
+                            <label for="tunnelServiceIpProfile" class="block text-sm font-medium text-gray-700">Service IP coverage</label>
+                            <select id="tunnelServiceIpProfile" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+                                <option value="standard">Standard (service domains and known API networks)</option>
+                                <option value="expanded">Maximum coverage (shared CDN / cloud networks)</option>
+                            </select>
+                            <p class="text-gray-500 text-xs mt-1">Maximum coverage adds broad provider networks to help mobile apps and clients using cached or encrypted DNS. Additional addresses below work with either option.</p>
+                            <p id="tunnelExpandedCoverageHint" class="text-amber-800 text-xs mt-2 hidden">Other sites and apps on these shared CDN / cloud networks also use the tunnel and may substantially increase traffic through the second server. Coverage is IPv4 only; IPv6 outside the VPN is not covered. Routing cannot guarantee that a service accepts the second server's IP or your account's region.</p>
                         </div>
                         <div id="tunnelServiceCidrsGroup" class="hidden">
                             <label for="tunnelServiceCidrs" class="block text-sm font-medium text-gray-700">Additional service IPv4 addresses / networks (optional)</label>
@@ -1318,7 +1337,7 @@ class AmneziaApp {
                                 <input id="tunnelDiagnosticDestination" type="text" maxlength="253" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="chatgpt.com or the IPv4 used by your client" class="flex-1 min-w-0 border border-gray-300 rounded-md px-3 py-2 text-sm">
                                 <button id="checkUpstreamDiagnostics" type="button" class="border border-indigo-300 text-indigo-700 px-3 py-2 rounded text-sm hover:bg-indigo-50">Diagnostics</button>
                             </div>
-                            <p class="text-gray-500 text-xs">Checks the saved server settings and routing rules, not your client's actual connection or exit IP. Leave blank for chatgpt.com. For cached or encrypted DNS, enter the exact IPv4 your client uses. An ordinary “my IP” website should still show this server's local exit in selective mode.</p>
+                            <p class="text-gray-500 text-xs">Checks the saved server settings and routing rules, not your client's actual connection or exit IP. Leave blank for chatgpt.com. For cached or encrypted DNS, enter the exact IPv4 your client uses. With maximum coverage, a “my IP” website on a shared provider network can also use the tunnel.</p>
                             <pre id="tunnelDiagnosticResult" role="status" aria-live="polite" class="hidden whitespace-pre-wrap break-words text-xs bg-gray-50 rounded p-3"></pre>
                         </div>` : ''}
                         ${linked ? `<div id="tunnelRemoveConfirmation" class="hidden rounded border border-red-200 bg-red-50 p-3 text-sm text-red-800">
@@ -1341,12 +1360,17 @@ class AmneziaApp {
         modeSelect.value = linked ? this.getUpstreamRoutingMode(upstream) : 'ru_split';
         document.getElementById('tunnelFailoverMode').value = upstream.failover_mode || server.linked_failover_mode || 'fail_close';
         document.getElementById('tunnelServiceCidrs').value = Array.isArray(upstream.service_cidrs) ? upstream.service_cidrs.join('\n') : '';
+        const profileSelect = document.getElementById('tunnelServiceIpProfile');
+        profileSelect.value = upstream.service_ip_profile === 'expanded' ? 'expanded' : 'standard';
         const updateHint = () => {
             const hidden = modeSelect.value !== 'ai_tiktok';
             document.getElementById('tunnelSelectiveDnsHint')?.classList.toggle('hidden', hidden);
             document.getElementById('tunnelServiceCidrsGroup')?.classList.toggle('hidden', hidden);
+            document.getElementById('tunnelServiceIpProfileGroup')?.classList.toggle('hidden', hidden);
+            document.getElementById('tunnelExpandedCoverageHint')?.classList.toggle('hidden', hidden || profileSelect.value !== 'expanded');
         };
         modeSelect.addEventListener('change', updateHint);
+        profileSelect.addEventListener('change', updateHint);
         updateHint();
         const configInput = document.getElementById('tunnelImportConfig');
         configInput.required = !linked;
@@ -1443,6 +1467,7 @@ class AmneziaApp {
         };
         if (body.routing_mode === 'ai_tiktok') {
             body.service_cidrs = [...new Set(document.getElementById('tunnelServiceCidrs').value.trim().split(/[\s,]+/).filter(Boolean))];
+            body.service_ip_profile = document.getElementById('tunnelServiceIpProfile').value;
         }
         if (config) body.import_config = config;
         await this.applyUpstreamTunnelChange('PUT', body);
@@ -1479,9 +1504,11 @@ class AmneziaApp {
         const upstream = result.upstream || {};
         const classifier = result.classifier || {};
         const seedStatus = classifier.seed_status || {};
+        const providerStatus = classifier.provider_status || {};
         const lines = [
             `Protocol: ${scalar(result.protocol)}`,
             `Saved routing mode: ${scalar(result.routing_mode)}`,
+            `Saved service IP coverage: ${scalar(result.service_ip_profile)}`,
             `Routing state: ${scalar(result.routing_state)}; failover: ${scalar(result.failover_mode)}`,
             `Tunnel interface: ${scalar(upstream.interface)}; healthy: ${yesNo(upstream.healthy)}`,
             `Last handshake age (seconds): ${scalar(upstream.handshake_age_seconds)}`,
@@ -1491,13 +1518,16 @@ class AmneziaApp {
             `Seed refresh: resolved hosts: ${scalar(seedStatus.resolved_hosts)}/${scalar(seedStatus.queried_hosts)}; errors: ${scalar(seedStatus.errors)}; cached addresses: ${scalar(seedStatus.addresses)}`,
             `Last seed attempt (UTC): ${timestamp(seedStatus.last_attempt)}`,
             `Last seed address update (UTC): ${timestamp(seedStatus.last_success)}`,
+            `Provider networks: ${scalar(providerStatus.networks)}; refresh errors: ${scalar(providerStatus.errors)}`,
+            `Last provider attempt (UTC): ${timestamp(providerStatus.last_attempt)}`,
+            `Last provider network update (UTC): ${timestamp(providerStatus.last_success)}`,
             '',
             'Destination routing on this server:'
         ];
         const destinations = Array.isArray(result.destinations) ? result.destinations : [];
         for (const entry of destinations) {
             if (!entry || typeof entry !== 'object') continue;
-            lines.push(`${scalar(entry.address)} — matched: ${yesNo(entry.matched)} (DNS: ${yesNo(entry.dns_match)}, pool: ${yesNo(entry.pool_match)})`,
+            lines.push(`${scalar(entry.address)} — matched: ${yesNo(entry.matched)} (DNS: ${yesNo(entry.dns_match)}, pool: ${yesNo(entry.pool_match)}, provider network: ${yesNo(entry.provider_match)})`,
                 `  Route: ${scalar(entry.route)}; egress interface: ${scalar(entry.egress)}`);
         }
         if (!destinations.length) lines.push('No destination IPv4 addresses returned.');
