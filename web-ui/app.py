@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import uuid
 import base64
+import errno
 import random
 import secrets
 import requests
@@ -16,6 +17,7 @@ import ssl
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 import re
+import shlex
 from urllib.parse import quote
 from flask import Flask, render_template, request, jsonify, send_file, send_from_directory, Response
 from flask_socketio import SocketIO
@@ -25,6 +27,7 @@ from datetime import datetime, timezone
 from awg_protocol import (OBFUSCATION_KEYS, V3_KEYS, generate_params, normalize_params,
                           import_params, normalize_keepalive, protocol_version,
                           upgrade_params, render_params, replace_interface_params)
+from routing_policy import AI_TIKTOK_DOMAINS, SelectiveRouting, normalize_routing_policy
 
 # Get the absolute path to the current directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -754,8 +757,9 @@ class AmneziaManager:
                 if server.get("routing_state") not in ("upstream", "local"):
                     server["routing_state"] = "upstream"
                     updated = True
-                if "split_ru_local" not in upstream:
-                    upstream["split_ru_local"] = True
+                if "routing_mode" not in upstream:
+                    upstream["routing_mode"] = normalize_routing_policy(upstream)
+                    upstream["split_ru_local"] = upstream["routing_mode"] == "ru_split"
                     updated = True
                 expected_egress = "eth+" if server.get("routing_state") == "local" else upstream["interface"]
             else:
@@ -794,7 +798,7 @@ class AmneziaManager:
         for candidate in range(int(base), int(base) + int(span)):
             if candidate not in used:
                 return candidate
-        return int(base) + random.randint(1, int(span) - 1)
+        raise ValueError('No free upstream routing tables are available')
 
     def _allocate_upstream_fwmark(self, base=0xA000, span=0x0FFF):
         used = set()
@@ -809,7 +813,7 @@ class AmneziaManager:
         for candidate in range(int(base), int(base) + int(span)):
             if candidate not in used:
                 return candidate
-        return int(base) + random.randint(1, int(span) - 1)
+        raise ValueError('No free upstream packet marks are available')
 
     def _server_has_linked_upstream(self, server):
         return (
@@ -989,7 +993,7 @@ class AmneziaManager:
                 return False
         else:
             new_egress = "eth+"
-            self.cleanup_upstream_routing(server)
+            self.configure_wireguard_local_routing(server)
 
         if current_egress != new_egress:
             self.cleanup_iptables(interface, subnet, current_egress)
@@ -1035,32 +1039,48 @@ class AmneziaManager:
         """Monitor linked servers and apply failover policy."""
         while not self.stop_expiration_worker.is_set():
             try:
-                for server in self.config.get("servers", []):
-                    if not self._server_has_linked_upstream(server):
-                        continue
-                    if server.get("protocol") != "vless" and not self.is_interface_running(server.get("interface")):
-                        continue
+                with self.config_lock:
+                    for server in self.config.get("servers", []):
+                        try:
+                            if not self._server_has_linked_upstream(server):
+                                continue
+                            if server.get("protocol") != "vless" and not self.is_interface_running(server.get("interface")):
+                                continue
 
-                    failover_mode = server.get("linked_failover_mode", "fail_close")
-                    healthy, handshake_age = self.is_upstream_healthy(server)
-                    if healthy:
-                        if server.get("routing_state") != "upstream":
-                            self.switch_server_egress(server, "upstream")
-                        if handshake_age is not None:
-                            print(f"Linked health OK for {server.get('name')}, handshake age={handshake_age}s")
-                    else:
-                        if failover_mode == "fail_open" and server.get("routing_state") != "local":
-                            self.switch_server_egress(server, "local")
-                            print(f"Linked health degraded for {server.get('name')}, switched to local egress")
-                        elif failover_mode == "fail_close":
-                            if server.get("protocol") == "vless":
-                                self.configure_vless_fail_closed_routing(server)
-                                if server.get("routing_state") != "upstream":
-                                    server["routing_state"] = "upstream"
-                                    server["egress_interface"] = (server.get("upstream") or {}).get("interface")
-                                    self.save_config()
-                                    self._write_xray_config()
-                            print(f"Linked health degraded for {server.get('name')} (fail_close active)")
+                            failover_mode = server.get("linked_failover_mode", "fail_close")
+                            if server.get('protocol') != 'vless' and normalize_routing_policy(server['upstream']) == 'ai_tiktok':
+                                self._selective_routing().ensure_dns(server)
+                            healthy, handshake_age = self.is_upstream_healthy(server)
+                            if healthy:
+                                # Restore the live route after fail-close blackholing.
+                                if (server.get("routing_state") != "upstream" or server.get('_upstream_unhealthy')
+                                        or not self._upstream_route_is_active(server)):
+                                    if self.switch_server_egress(server, "upstream"):
+                                        server.pop('_upstream_unhealthy', None)
+                                if handshake_age is not None:
+                                    print(f"Linked health OK for {server.get('name')}, handshake age={handshake_age}s")
+                            else:
+                                if failover_mode == "fail_open" and server.get("routing_state") != "local":
+                                    self.switch_server_egress(server, "local")
+                                    print(f"Linked health degraded for {server.get('name')}, switched to local egress")
+                                elif failover_mode == "fail_close":
+                                    server['_upstream_unhealthy'] = True
+                                    if server.get("protocol") != "vless":
+                                        self.configure_wireguard_fail_closed_routing(server)
+                                    else:
+                                        self.configure_vless_fail_closed_routing(server)
+                                        if server.get("routing_state") != "upstream":
+                                            server["routing_state"] = "upstream"
+                                            server["egress_interface"] = (server.get("upstream") or {}).get("interface")
+                                            self.save_config()
+                                            self._write_xray_config()
+                                    print(f"Linked health degraded for {server.get('name')} (fail_close active)")
+                                # Recover a vanished interface without moving traffic
+                                # off local fallback before a new handshake succeeds.
+                                if not self.is_interface_running(server['upstream'].get('interface')):
+                                    self.ensure_upstream_interface(server)
+                        except Exception as error:
+                            print(f"Linked health check failed for {server.get('id')}: {type(error).__name__}")
             except Exception as e:
                 print(f"Failed linked health check: {e}")
             self.stop_expiration_worker.wait(LINK_HEALTH_CHECK_INTERVAL)
@@ -1971,11 +1991,13 @@ class AmneziaManager:
                 "sniffing": {
                     "enabled": True,
                     "destOverride": ["http", "tls", "quic"],
+                    "routeOnly": True,
                 },
                 "streamSettings": stream_settings,
             })
 
             if self._server_has_linked_upstream(server):
+                selective = normalize_routing_policy(server['upstream']) == 'ai_tiktok'
                 outbound_tag = "direct"
                 if server.get("routing_state", "upstream") == "upstream":
                     upstream = server.get("upstream") or {}
@@ -1984,7 +2006,7 @@ class AmneziaManager:
                         outbound_tag = f"{inbound_tag}-awg"
                         outbounds.append({
                             "protocol": "freedom",
-                            "settings": {"domainStrategy": XRAY_DOMAIN_STRATEGY},
+                            "settings": {"domainStrategy": "ForceIPv4"},
                             "tag": outbound_tag,
                             "streamSettings": {
                                 "sockopt": {
@@ -1994,6 +2016,14 @@ class AmneziaManager:
                                 }
                             },
                         })
+                if selective and outbound_tag != 'direct':
+                    routing_rules.append({
+                        "type": "field",
+                        "inboundTag": [inbound_tag],
+                        "domain": ['domain:' + domain for domain in AI_TIKTOK_DOMAINS],
+                        "outboundTag": outbound_tag,
+                    })
+                    outbound_tag = 'direct'
                 routing_rules.append({
                     "type": "field",
                     "inboundTag": [inbound_tag],
@@ -3649,7 +3679,7 @@ class AmneziaManager:
         if not import_config_text:
             raise ValueError("Linked Edge mode requires imported EU client config")
 
-        split_ru_local = self._to_bool(upstream_data.get("split_ru_local"), True)
+        routing_mode = normalize_routing_policy(upstream_data)
         imported_obfuscation = {}
         interface_cfg, peer_cfg = self.parse_amnezia_config_text(import_config_text)
         endpoint_value = peer_cfg.get("Endpoint", "")
@@ -3669,16 +3699,29 @@ class AmneziaManager:
         imported_obfuscation = import_params(interface_cfg, mtu)
 
         endpoint_host, endpoint_port = self.parse_endpoint(endpoint_value, DEFAULT_PORT)
-        if not endpoint_host or not endpoint_port:
+        if not endpoint_host or not endpoint_port or not re.fullmatch(r'[A-Za-z0-9.-]+', endpoint_host):
             raise ValueError("For edge_linked mode, upstream endpoint must be in host:port format")
         if endpoint_port < 1 or endpoint_port > 65535:
             raise ValueError("Upstream endpoint port must be between 1 and 65535")
-        if not public_key_value:
-            raise ValueError("For edge_linked mode, upstream public key is required")
+        for label, value in (("PublicKey", public_key_value), ("PrivateKey", interface_cfg['PrivateKey']),
+                             ("PresharedKey", peer_cfg.get('PresharedKey', ''))):
+            if label == 'PresharedKey' and not value:
+                continue
+            try:
+                decoded = base64.b64decode(value, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f'Invalid upstream {label}: expected a base64 32-byte key') from exc
+            if len(decoded) != 32:
+                raise ValueError(f'Invalid upstream {label}: expected a base64 32-byte key')
         try:
-            ipaddress.ip_interface(local_address_value)
+            ipaddress.IPv4Interface(local_address_value)
+            allowed_networks = [ipaddress.ip_network(part.strip(), strict=False)
+                                for part in allowed_ips_value.split(',')]
         except ValueError as exc:
-            raise ValueError(f"Invalid upstream local_address: {local_address_value}") from exc
+            raise ValueError('Upstream requires one IPv4 Address and valid AllowedIPs') from exc
+        if ipaddress.IPv4Network('0.0.0.0/0') not in allowed_networks:
+            raise ValueError('Upstream AllowedIPs must include 0.0.0.0/0 to route internet traffic')
+        allowed_ips_value = ', '.join(str(network) for network in allowed_networks)
 
         upstream_keys = self.generate_wireguard_keys()
         upstream_private_key = (
@@ -3689,7 +3732,7 @@ class AmneziaManager:
         upstream_client_public_key = str(upstream_data.get("client_public_key", "")).strip()
         if not upstream_client_public_key:
             if upstream_private_key:
-                upstream_client_public_key = self.execute_command(f"echo '{upstream_private_key}' | wg pubkey") or ""
+                upstream_client_public_key = self.execute_command(f"printf '%s' {shlex.quote(upstream_private_key)} | wg pubkey") or ""
             else:
                 upstream_client_public_key = upstream_keys["public_key"]
 
@@ -3707,7 +3750,10 @@ class AmneziaManager:
             "obfuscation_enabled": True,
             "obfuscation_params": imported_obfuscation,
             "table_id": self._allocate_upstream_table_id(base=table_base),
-            "split_ru_local": split_ru_local,
+            "routing_mode": routing_mode,
+            "split_ru_local": routing_mode == 'ru_split',
+            "mtu": mtu,
+            "awg_version": protocol_version(imported_obfuscation),
         }
         if include_fwmark:
             upstream_config["fwmark"] = self._allocate_upstream_fwmark()
@@ -3717,7 +3763,7 @@ class AmneziaManager:
         config = f"""[Interface]
 PrivateKey = {upstream['private_key']}
 Address = {upstream['local_address']}
-MTU = {mtu}
+MTU = {upstream.get('mtu', mtu)}
 Table = off
 """
 
@@ -3736,6 +3782,75 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
             config += f"PresharedKey = {upstream['preshared_key']}\n"
         return config
 
+    def _validate_upstream_address_overlap(self, server, upstream):
+        network = ipaddress.ip_interface(upstream['local_address']).network
+        for other in [server] + self.config.get('servers', []):
+            if other.get('protocol', 'wireguard') == 'wireguard' and other.get('subnet'):
+                if network.overlaps(ipaddress.ip_network(other['subnet'], strict=False)):
+                    raise ValueError('The imported tunnel address overlaps a local VPN network; use a different subnet on the destination server')
+            other_upstream = other.get('upstream') or {}
+            if other.get('id') != server.get('id') and other_upstream.get('local_address'):
+                if network.overlaps(ipaddress.ip_interface(other_upstream['local_address']).network):
+                    raise ValueError('The imported tunnel address overlaps another upstream; use a separate client with a /32 address')
+
+    def _routing_command(self, command):
+        if self.execute_command(command) is None:
+            raise RuntimeError('Failed applying tunnel routing; check server logs')
+
+    def _selective_routing(self):
+        return SelectiveRouting(self.execute_command, os.path.join(CONFIG_DIR, 'routing'))
+
+    def _other_upstream_table_owners(self, server):
+        table = (server.get('upstream') or {}).get('table_id')
+        return [other for other in self.config.get('servers', [])
+                if other.get('id') != server.get('id') and table is not None
+                and str((other.get('upstream') or {}).get('table_id')) == str(table)]
+
+    def _upstream_route_is_active(self, server):
+        upstream = server['upstream']
+        table = int(upstream['table_id'])
+        output = self.execute_command(f'ip -4 route show table {table} default') or ''
+        return any(f"dev {upstream['interface']}" in line and 'blackhole' not in line
+                   for line in output.splitlines())
+
+    def configure_wireguard_local_routing(self, server):
+        selective = normalize_routing_policy(server['upstream']) == 'ai_tiktok'
+        self.cleanup_upstream_routing(server, preserve_classifier=selective)
+        if selective:
+            # Continue learning DNS answers during fail-open, so recovery can
+            # route cached destinations without requiring client reconnection.
+            self._selective_routing().configure(server)
+        return True
+
+    def _install_awg_policy_rule(self, server):
+        upstream = server['upstream']
+        table = int(upstream['table_id'])
+        priority = 10000 + table
+        if normalize_routing_policy(upstream) == 'ai_tiktok':
+            mark = int(upstream.get('fwmark') or table)
+            match = f'fwmark {mark}'
+            pattern = f'fwmark {hex(mark)} .*lookup {table}( |$)'
+        else:
+            subnet = str(ipaddress.IPv4Network(server['subnet'], strict=False))
+            match = f'from {subnet}'
+            pattern = f'from {re.escape(subnet)} .*lookup {table}( |$)'
+        self._routing_command(f"ip -4 rule show | grep -qE {shlex.quote(pattern)} || ip -4 rule add {match} table {table} priority {priority}")
+
+    def configure_wireguard_fail_closed_routing(self, server):
+        upstream = server['upstream']
+        table = int(upstream['table_id'])
+        subnet = str(ipaddress.IPv4Network(server['subnet'], strict=False))
+        self._routing_command(f'ip -4 route replace blackhole default metric 32767 table {table}')
+        self._routing_command(f"ip -4 route replace {subnet} dev {server['interface']} table {table}")
+        self.execute_command(f'ip -4 route del default metric 10 table {table} 2>/dev/null || true')
+        self._install_awg_policy_rule(server)
+        if normalize_routing_policy(upstream) == 'ai_tiktok':
+            self._selective_routing().configure(server)
+        else:
+            gateway, device = self.get_default_route_info()
+            self._install_vless_ru_split_routes(table, gateway, device, normalize_routing_policy(upstream) == 'ru_split')
+        return True
+
     def configure_upstream_routing(self, server):
         """Route server subnet traffic through upstream interface."""
         if server.get("protocol") == "vless":
@@ -3743,7 +3858,7 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
 
         upstream = server.get("upstream") or {}
         table_id = int(upstream.get("table_id", 200))
-        server_subnet = server["subnet"]
+        server_subnet = str(ipaddress.IPv4Network(server['subnet'], strict=False))
         upstream_interface = upstream.get("interface")
         if not upstream_interface:
             return False
@@ -3755,8 +3870,17 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         endpoint_ip = self.resolve_ipv4(endpoint_host) or endpoint_host
         gateway, default_device = self.get_default_route_info()
 
-        self.execute_command(f"ip rule add from {server_subnet} table {table_id} priority {10000 + table_id} 2>/dev/null || true")
-        self.execute_command(f"ip route replace default dev {upstream_interface} table {table_id}")
+        # A terminal fallback prevents route lookup falling through to WAN if
+        # the kernel removes the interface route after the upstream disappears.
+        self._routing_command(f"ip -4 route replace blackhole default metric 32767 table {table_id}")
+        self._routing_command(f"ip -4 route replace {server_subnet} dev {server['interface']} table {table_id}")
+        self._routing_command(f"ip -4 route replace default dev {upstream_interface} metric 10 table {table_id}")
+        self._install_awg_policy_rule(server)
+        self._routing_command(f"sysctl -w net.ipv4.conf.{upstream_interface}.rp_filter=2")
+        self._routing_command(f"sysctl -w net.ipv4.conf.{server['interface']}.rp_filter=2")
+
+        if normalize_routing_policy(upstream) == 'ai_tiktok':
+            self._selective_routing().configure(server)
 
         if default_device:
             if gateway:
@@ -3766,7 +3890,7 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         elif gateway:
             self.execute_command(f"ip route replace {endpoint_ip}/32 via {gateway}")
 
-        split_ru_local = self._to_bool(upstream.get("split_ru_local"), True)
+        split_ru_local = normalize_routing_policy(upstream) == 'ru_split'
         ru_route_count = 0
         if split_ru_local and default_device and self.ru_split_cidrs:
             for cidr in self.ru_split_cidrs:
@@ -3796,9 +3920,24 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
 
     def _install_vless_mark_rule(self, fwmark, table_id):
         priority = 10000 + int(table_id)
-        self.execute_command(
-            f"ip rule add fwmark {int(fwmark)} table {int(table_id)} priority {priority} 2>/dev/null || true"
-        )
+        pattern = f'fwmark {hex(int(fwmark))} .*lookup {int(table_id)}( |$)'
+        self._routing_command(f"ip -4 rule show | grep -qE {shlex.quote(pattern)} || ip -4 rule add fwmark {int(fwmark)} table {int(table_id)} priority {priority}")
+        # Hosts booted with ipv6.disable=1 cannot create IPv6 rules and cannot
+        # emit IPv6 packets. A socket probe also loads IPv6 when it is available
+        # as a module. Per-interface disable_ipv6 still permits this probe, so
+        # protection remains installed if an adapter is enabled later.
+        try:
+            ipv6_probe = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        except OSError as error:
+            if error.errno in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT):
+                return
+            raise
+        else:
+            ipv6_probe.close()
+        # Imported upstreams currently use IPv4. Explicitly block marked IPv6
+        # instead of allowing Xray to bypass the tunnel on an AAAA destination.
+        self._routing_command(f'ip -6 route replace blackhole default table {int(table_id)}')
+        self._routing_command(f"ip -6 rule show | grep -qE {shlex.quote(pattern)} || ip -6 rule add fwmark {int(fwmark)} table {int(table_id)} priority {priority}")
 
     def _install_vless_endpoint_route(self, endpoint_ip, gateway, default_device):
         if not endpoint_ip:
@@ -3832,10 +3971,12 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
             return False
 
         self._install_vless_mark_rule(fwmark, table_id)
-        self.execute_command(f"ip route replace default dev {upstream_interface} table {table_id}")
+        self._routing_command(f"ip -4 route replace blackhole default metric 32767 table {table_id}")
+        self._routing_command(f"ip -4 route replace default dev {upstream_interface} metric 10 table {table_id}")
+        self._routing_command(f"sysctl -w net.ipv4.conf.{upstream_interface}.rp_filter=2")
         self._install_vless_endpoint_route(endpoint_ip, gateway, default_device)
 
-        split_ru_local = self._to_bool(upstream.get("split_ru_local"), True)
+        split_ru_local = normalize_routing_policy(upstream) == 'ru_split'
         ru_route_count = self._install_vless_ru_split_routes(
             table_id, gateway, default_device, split_ru_local
         )
@@ -3865,9 +4006,10 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         if not upstream_interface:
             return False
         self._install_vless_mark_rule(fwmark, table_id)
-        self.execute_command(f"ip route replace blackhole default table {table_id}")
+        self._routing_command(f"ip -4 route replace blackhole default metric 32767 table {table_id}")
+        self.execute_command(f"ip -4 route del default metric 10 table {table_id} 2>/dev/null || true")
         self._install_vless_endpoint_route(endpoint_ip, gateway, default_device)
-        split_ru_local = self._to_bool(upstream.get("split_ru_local"), True)
+        split_ru_local = normalize_routing_policy(upstream) == 'ru_split'
         ru_route_count = self._install_vless_ru_split_routes(
             table_id, gateway, default_device, split_ru_local
         )
@@ -3878,16 +4020,35 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         )
         return True
 
-    def cleanup_upstream_routing(self, server):
+    def cleanup_upstream_routing(self, server, preserve_classifier=False):
         if server.get("protocol") == "vless":
             return self.cleanup_vless_upstream_routing(server)
 
         upstream = server.get("upstream") or {}
         table_id = int(upstream.get("table_id", 200))
         server_subnet = server.get("subnet")
+        other_owners = self._other_upstream_table_owners(server)
+        if normalize_routing_policy(upstream) == 'ai_tiktok' and not preserve_classifier and not other_owners:
+            self._selective_routing().cleanup(server)
+        fwmark = int(upstream.get('fwmark') or table_id)
+        self.execute_command(f"ip -4 rule del fwmark {fwmark} table {table_id} priority {10000 + table_id} 2>/dev/null || true")
         if server_subnet:
             self.execute_command(f"ip rule del from {server_subnet} table {table_id} priority {10000 + table_id} 2>/dev/null || true")
-        self.execute_command(f"ip route flush table {table_id} 2>/dev/null || true")
+        if not other_owners:
+            self.execute_command(f"ip route flush table {table_id} 2>/dev/null || true")
+        else:
+            # Older versions randomly reused tables. Detaching one entry must
+            # not flush the remaining entry's table; repair its live default.
+            for other in other_owners:
+                if other.get('routing_state') == 'local':
+                    continue
+                if other.get('_upstream_unhealthy'):
+                    if other.get('protocol') == 'vless':
+                        self.configure_vless_fail_closed_routing(other)
+                    else:
+                        self.configure_wireguard_fail_closed_routing(other)
+                elif self.is_interface_running(other['upstream'].get('interface')):
+                    self.configure_upstream_routing(other)
         return True
 
     def cleanup_vless_upstream_routing(self, server):
@@ -3899,6 +4060,8 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
             f"ip rule del fwmark {fwmark} table {table_id} priority {10000 + table_id} 2>/dev/null || true"
         )
         self.execute_command(f"ip route flush table {table_id} 2>/dev/null || true")
+        self.execute_command(f"ip -6 rule del fwmark {fwmark} table {table_id} priority {10000 + table_id} 2>/dev/null || true")
+        self.execute_command(f"ip -6 route flush table {table_id} 2>/dev/null || true")
         if upstream_interface:
             self.execute_command(
                 "iptables -t nat -D POSTROUTING "
@@ -3907,7 +4070,7 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
             )
         return True
 
-    def start_upstream_link(self, server):
+    def ensure_upstream_interface(self, server):
         upstream = server.get("upstream") or {}
         upstream_interface = upstream.get("interface")
         config_path = upstream.get("config_path")
@@ -3921,16 +4084,224 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
             result = self.execute_command(f"/usr/bin/awg-quick up {upstream_interface}")
             if result is None:
                 return False
+        return True
+
+    def start_upstream_link(self, server):
+        if not self.ensure_upstream_interface(server):
+            return False
         return self.configure_upstream_routing(server)
 
     def stop_upstream_link(self, server):
         upstream = server.get("upstream") or {}
         upstream_interface = upstream.get("interface")
-        self.cleanup_upstream_routing(server)
+        if not self.cleanup_upstream_routing(server):
+            return False
         if not upstream_interface:
             return True
-        self.execute_command(f"/usr/bin/awg-quick down {upstream_interface} 2>/dev/null || true")
-        return True
+        if self.execute_command(f"ip link show {upstream_interface} 2>/dev/null") is None:
+            return True
+        return self.execute_command(f"/usr/bin/awg-quick down {upstream_interface}") is not None
+
+    @synchronized_config
+    def update_server_upstream(self, server_id, upstream_data):
+        """Attach or edit an egress without regenerating the entry or its clients."""
+        server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
+        if server is None:
+            return None
+        if server.get('protocol') == 'vless' or not server.get('obfuscation_enabled'):
+            raise ValueError('Tunnel management is supported for AWG 2 and AWG 3 servers')
+        if not isinstance(upstream_data, dict):
+            raise ValueError('Upstream settings must be a JSON object')
+        previous = server.get('upstream') or {}
+        import_text = upstream_data.get('import_config')
+        if import_text is not None and not isinstance(import_text, str):
+            raise ValueError('import_config must be a string')
+        import_text = (import_text or '').strip()
+        if not previous and not import_text:
+            raise ValueError('Import the destination server client configuration first')
+        policy_data = upstream_data if any(k in upstream_data for k in ('routing_mode', 'split_ru_local')) else previous
+        routing_mode = normalize_routing_policy(policy_data)
+        failover_mode = str(upstream_data.get('failover_mode', server.get('linked_failover_mode') or 'fail_close')).strip().lower()
+        if failover_mode not in ('fail_close', 'fail_open'):
+            raise ValueError('upstream.failover_mode must be fail_close or fail_open')
+
+        interface = previous.get('interface') or f"{server['interface'][:12]}-up"
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{1,15}', interface):
+            raise ValueError('Invalid upstream interface name')
+        if not previous and self.is_interface_running(interface):
+            raise ValueError('An unmanaged network interface already uses this upstream name')
+        for other in self.config['servers']:
+            if interface == other.get('interface') or (other['id'] != server_id and
+                    interface == (other.get('upstream') or {}).get('interface')):
+                raise ValueError('The upstream interface is already used by another server')
+        content = None
+        if import_text:
+            imported_data = dict(upstream_data, import_config=import_text,
+                                 routing_mode=routing_mode, failover_mode=failover_mode)
+            upstream, _, upstream_mtu, _ = self.build_imported_upstream_config(
+                server_id=server_id, upstream_interface=interface,
+                upstream_data=imported_data, mtu=server.get('mtu', DEFAULT_MTU))
+            upstream['mtu'] = upstream_mtu
+            # A replacement uses the same isolated routing resources. Entry keys,
+            # addresses, MTU, AWG version and every client remain untouched.
+            for key in ('table_id', 'fwmark', 'config_path'):
+                if previous.get(key) is not None:
+                    upstream[key] = previous[key]
+            if not previous and os.path.exists(upstream['config_path']):
+                raise ValueError('An unmanaged configuration already uses this upstream interface')
+            content = self.generate_upstream_config_content(upstream, upstream_mtu)
+        else:
+            upstream = copy.deepcopy(previous)
+            if not os.path.isfile(upstream.get('config_path', '')):
+                raise ValueError('Upstream configuration is missing; import it again')
+        if previous and self._other_upstream_table_owners(server):
+            upstream['table_id'] = self._allocate_upstream_table_id()
+            upstream['fwmark'] = self._allocate_upstream_fwmark()
+        upstream['routing_mode'] = routing_mode
+        upstream['split_ru_local'] = routing_mode == 'ru_split'
+        upstream_network = ipaddress.ip_interface(upstream['local_address']).network
+        for other in self.config['servers']:
+            networks = []
+            if other.get('protocol') != 'vless' and other.get('subnet'):
+                networks.append(ipaddress.ip_network(other['subnet'], strict=False))
+            other_upstream = other.get('upstream') or {}
+            if other['id'] != server_id and other_upstream.get('local_address'):
+                networks.append(ipaddress.ip_interface(other_upstream['local_address']).network)
+            if any(upstream_network.overlaps(network) for network in networks):
+                raise ValueError('The imported tunnel address overlaps a local VPN network; use a different subnet on the destination server')
+        candidate = copy.deepcopy(server)
+        candidate.update(mode='edge_linked', upstream=upstream,
+                         linked_failover_mode=failover_mode, routing_state='upstream',
+                         egress_interface=interface)
+        return self._apply_server_upstream_change(server, candidate, content)
+
+    @synchronized_config
+    def remove_server_upstream(self, server_id):
+        """Return an existing AWG entry to local egress without touching clients."""
+        server = next((s for s in self.config['servers'] if s['id'] == server_id), None)
+        if server is None:
+            return None
+        if server.get('protocol') == 'vless' or not server.get('obfuscation_enabled'):
+            raise ValueError('Tunnel management is supported for AWG 2 and AWG 3 servers')
+        if not self._server_has_linked_upstream(server):
+            return server
+        candidate = copy.deepcopy(server)
+        candidate.update(mode='standalone', upstream=None, linked_failover_mode=None,
+                         routing_state=None, egress_interface='eth+')
+        return self._apply_server_upstream_change(server, candidate)
+
+    def _apply_server_upstream_change(self, server, candidate, content=None):
+        """Commit an upstream change, restoring disk and live policy on failure.
+
+        The caller holds config_lock. Only link metadata and the separate
+        upstream file change; the entry interface is never brought down.
+        """
+        old = copy.deepcopy(server)
+        fields = ('mode', 'upstream', 'linked_failover_mode', 'routing_state', 'egress_interface')
+        old_upstream = old.get('upstream') or {}
+        new_upstream = candidate.get('upstream') or {}
+        running = self.is_interface_running(server['interface'])
+        old_upstream_running = bool(old_upstream and self.is_interface_running(old_upstream['interface']))
+        snapshots = {}
+        for path in (CONFIG_FILE, old_upstream.get('config_path'), new_upstream.get('config_path')):
+            if path and path not in snapshots:
+                if os.path.exists(path):
+                    with open(path, encoding='utf-8', newline='') as source:
+                        snapshots[path] = source.read()
+                else:
+                    snapshots[path] = None
+        guard = f"-i {server['interface']} -m comment --comment awg-upstream-change -j DROP"
+        if running and self.execute_command(f"if iptables -C FORWARD {guard} 2>/dev/null; then printf blocked; fi") == 'blocked':
+            raise ValueError('A previous tunnel change needs recovery; stop and start this server before editing its tunnel')
+        guarded = False
+        old_routes_touched = old_nat_touched = new_routes_touched = new_nat_touched = False
+        touched_files = set()
+        try:
+            # Freeze forwarded packets briefly while policy rules are replaced.
+            # Otherwise fail-close traffic could escape via the main route.
+            if running:
+                if self.execute_command(f'iptables -I FORWARD 1 {guard}') is None:
+                    raise RuntimeError('Could not protect traffic during the tunnel change')
+                guarded = True
+            if old_upstream and (running or old_upstream_running):
+                old_routes_touched = True
+                if not self.stop_upstream_link(old):
+                    raise RuntimeError('Could not stop the previous upstream link')
+            if running:
+                old_nat_touched = True
+                if not self.cleanup_iptables(old['interface'], old['subnet'], old.get('egress_interface', 'eth+')):
+                    raise RuntimeError('Could not replace the previous forwarding rules')
+            if content is not None:
+                touched_files.add(new_upstream['config_path'])
+                self._atomic_config_write(new_upstream['config_path'], content)
+            for field in fields:
+                server[field] = candidate[field]
+            if running:
+                if new_upstream:
+                    new_routes_touched = True
+                    if not self.start_upstream_link(server):
+                        raise RuntimeError('Could not activate the upstream tunnel')
+                new_nat_touched = True
+                if not self.setup_iptables(server['interface'], server['subnet'], server['egress_interface']):
+                    raise RuntimeError('Could not apply forwarding rules for the tunnel')
+            if old_upstream and not new_upstream:
+                path = old_upstream.get('config_path')
+                if path and os.path.exists(path):
+                    touched_files.add(path)
+                    os.unlink(path)
+            touched_files.add(CONFIG_FILE)
+            self.save_config()
+            if guarded:
+                if self.execute_command(f'iptables -D FORWARD {guard}') is None:
+                    raise RuntimeError('Could not release the traffic guard')
+                guarded = False
+            return server
+        except Exception as original:
+            print(f"Upstream transaction failed for {server['id']}: {original}")
+            rollback_errors = []
+
+            def attempt(label, action):
+                try:
+                    if action() is False:
+                        rollback_errors.append(label)
+                except Exception as error:
+                    rollback_errors.append(f'{label}: {type(error).__name__}')
+
+            if new_routes_touched:
+                attempt('cleaning new upstream', lambda: self.stop_upstream_link(candidate))
+            if new_nat_touched:
+                attempt('cleaning new forwarding rules', lambda: self.cleanup_iptables(
+                    candidate['interface'], candidate['subnet'], candidate['egress_interface']))
+            for field in fields:
+                if field in old:
+                    server[field] = old[field]
+                else:
+                    server.pop(field, None)
+            for path in touched_files:
+                previous_content = snapshots[path]
+                if previous_content is None:
+                    if os.path.exists(path):
+                        attempt('removing new configuration', lambda p=path: os.unlink(p))
+                else:
+                    attempt('restoring configuration', lambda p=path, c=previous_content: self._atomic_config_write(p, c))
+            if old_routes_touched:
+                if old_upstream_running:
+                    attempt('restoring old upstream', lambda: self.start_upstream_link(server))
+                    if old.get('routing_state') == 'local':
+                        attempt('restoring local fallback', lambda: self.configure_wireguard_local_routing(server))
+                elif running and old.get('routing_state') != 'local':
+                    attempt('restoring fail-close routing', lambda: self.configure_wireguard_fail_closed_routing(server))
+            if old_nat_touched:
+                attempt('restoring old forwarding rules', lambda: self.setup_iptables(
+                    old['interface'], old['subnet'], old.get('egress_interface', 'eth+')))
+            # If restoration itself fails, retain the guard rather than allowing
+            # private traffic onto an unintended path. The API reports this state.
+            if guarded and not rollback_errors:
+                attempt('releasing traffic guard', lambda: self.execute_command(f'iptables -D FORWARD {guard}') is not None)
+            if rollback_errors:
+                print(f"Upstream rollback incomplete for {server['id']}: {', '.join(rollback_errors)}")
+                raise RuntimeError('Tunnel change failed and recovery was incomplete; traffic is blocked until the server is restarted') from original
+            raise RuntimeError('Tunnel change failed; the previous configuration was restored') from original
 
     @synchronized_config
     def create_wireguard_server(self, server_data):
@@ -4014,81 +4385,15 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         server_ip = self.get_server_ip(network)
 
         if mode == "edge_linked":
-            upstream_data = server_data.get("upstream") or {}
-            failover_mode = str(upstream_data.get("failover_mode", "fail_close")).strip().lower()
-            if failover_mode not in ("fail_close", "fail_open"):
-                raise ValueError("upstream.failover_mode must be fail_close or fail_open")
-            import_config_text = str(upstream_data.get("import_config", "")).strip()
-            if not import_config_text:
-                raise ValueError("Linked Edge mode requires imported EU client config")
-            split_ru_local = self._to_bool(upstream_data.get("split_ru_local"), True)
-            imported_obfuscation = {}
-            interface_cfg, peer_cfg = self.parse_amnezia_config_text(import_config_text)
-            endpoint_value = peer_cfg.get("Endpoint", "")
-            public_key_value = peer_cfg.get("PublicKey", "")
-            allowed_ips_value = peer_cfg.get("AllowedIPs", "0.0.0.0/0")
-            local_address_value = interface_cfg.get("Address", "172.31.254.2/30")
-            keepalive_value = normalize_keepalive(peer_cfg.get("PersistentKeepalive", 25))
-            imported_private_key = interface_cfg.get("PrivateKey", "")
-            imported_preshared_key = peer_cfg.get("PresharedKey", "")
-            try:
-                imported_mtu = int(interface_cfg.get("MTU", mtu))
-            except (TypeError, ValueError) as exc:
-                raise ValueError("MTU in imported config must be integer") from exc
-            if imported_mtu < 1280 or imported_mtu > 1440:
-                raise ValueError("MTU in imported config must be between 1280 and 1440")
-            mtu = imported_mtu
-            imported_obfuscation = import_params(interface_cfg, mtu)
-
-            endpoint_host, endpoint_port = self.parse_endpoint(endpoint_value, DEFAULT_PORT)
-
-            if not endpoint_host or not endpoint_port:
-                raise ValueError("For edge_linked mode, upstream endpoint must be in host:port format")
-            if endpoint_port < 1 or endpoint_port > 65535:
-                raise ValueError("Upstream endpoint port must be between 1 and 65535")
-            if not public_key_value:
-                raise ValueError("For edge_linked mode, upstream public key is required")
-            try:
-                ipaddress.ip_interface(local_address_value)
-            except ValueError as exc:
-                raise ValueError(f"Invalid upstream local_address: {local_address_value}") from exc
-
             upstream_interface = f"{interface_name}-up"
-            upstream_config_path = os.path.join(WIREGUARD_CONFIG_DIR, f"{upstream_interface}.conf")
-            upstream_keys = self.generate_wireguard_keys()
-            upstream_private_key = imported_private_key or str(upstream_data.get("private_key", "")).strip() or upstream_keys["private_key"]
-            upstream_client_public_key = str(upstream_data.get("client_public_key", "")).strip()
-            if not upstream_client_public_key:
-                if upstream_private_key:
-                    upstream_client_public_key = self.execute_command(f"echo '{upstream_private_key}' | wg pubkey") or ""
-                else:
-                    upstream_client_public_key = upstream_keys["public_key"]
-            upstream_preshared_key = imported_preshared_key
-
-            # Entry and egress are separate interfaces: retain the selected entry
-            # version while preserving the imported EU protocol independently.
-
-            try:
-                table_offset = int(server_id[:2], 16) % 100
-            except ValueError:
-                table_offset = random.randint(1, 99)
-
-            upstream_config = {
-                "interface": upstream_interface,
-                "config_path": upstream_config_path,
-                "endpoint": f"{endpoint_host}:{endpoint_port}",
-                "public_key": public_key_value,
-                "private_key": upstream_private_key,
-                "client_public_key": upstream_client_public_key,
-                "preshared_key": upstream_preshared_key,
-                "allowed_ips": allowed_ips_value,
-                "local_address": local_address_value,
-                "persistent_keepalive": keepalive_value,
-                "obfuscation_enabled": True,
-                "obfuscation_params": imported_obfuscation,
-                "table_id": 200 + table_offset,
-                "split_ru_local": split_ru_local
-            }
+            upstream_config, failover_mode, _, _ = self.build_imported_upstream_config(
+                server_id=server_id, upstream_interface=upstream_interface,
+                upstream_data=server_data.get("upstream") or {}, mtu=mtu,
+                include_fwmark=True,
+            )
+            self._validate_upstream_address_overlap(
+                {"id": server_id, "subnet": subnet, "protocol": "wireguard"}, upstream_config
+            )
             egress_interface = upstream_interface
         else:
             failover_mode = None
@@ -4300,7 +4605,13 @@ MTU = {mtu}
 
         if server.get("protocol") == "vless":
             if self._server_has_linked_upstream(server):
-                self.stop_upstream_link(server)
+                try:
+                    if not self.stop_upstream_link(server):
+                        print(f"Cannot delete {server_id}: upstream cleanup failed; configuration retained")
+                        return False
+                except Exception as error:
+                    print(f"Cannot delete {server_id}: upstream cleanup failed: {error}; configuration retained")
+                    return False
             upstream_conf_path = ((server.get("upstream") or {}).get("config_path"))
             if upstream_conf_path and os.path.exists(upstream_conf_path):
                 os.remove(upstream_conf_path)
@@ -4317,9 +4628,31 @@ MTU = {mtu}
             self._write_vless_stream_config()
             return True
 
-        # Stop the server if running
-        if server['status'] == 'running':
-            self.stop_server(server_id)
+        # Display status may be stale or report "stopped" when only the uplink
+        # disappeared. Never forget a still-running entry and its client peers.
+        try:
+            if self.is_interface_running(server.get('interface')):
+                if not self.stop_server(server_id):
+                    print(f"Cannot delete {server_id}: entry shutdown failed; configuration retained")
+                    return False
+            if self.is_interface_running(server.get('interface')):
+                print(f"Cannot delete {server_id}: entry is still active; configuration retained")
+                return False
+            # An entry can already be down while its separate tunnel, resolver
+            # and routing resources remain. Cleanup is deliberately idempotent.
+            if server.get('upstream') and not self.stop_upstream_link(server):
+                print(f"Cannot delete {server_id}: upstream cleanup failed; configuration retained")
+                return False
+            if not self.cleanup_iptables(server['interface'], server['subnet'], server.get('egress_interface', 'eth+')):
+                print(f"Cannot delete {server_id}: forwarding cleanup failed; configuration retained")
+                return False
+            self.execute_command(
+                f"iptables -D FORWARD -i {server['interface']} "
+                "-m comment --comment awg-upstream-change -j DROP 2>/dev/null || true"
+            )
+        except Exception as error:
+            print(f"Cannot delete {server_id}: cleanup failed: {error}; configuration retained")
+            return False
 
         # Remove config file
         if os.path.exists(server['config_path']):
@@ -4815,6 +5148,7 @@ PersistentKeepalive = {keepalive}
         if not server:
             return False
 
+        entry_started = False
         try:
             mode = server.get("mode", "standalone")
             egress_interface = server.get("egress_interface", "eth+")
@@ -4823,19 +5157,23 @@ PersistentKeepalive = {keepalive}
             # Use awg-quick to bring up the interface
             result = self.execute_command(f"/usr/bin/awg-quick up {server['interface']}")
             if result is not None:
+                entry_started = True
                 if mode == "edge_linked":
                     upstream_started = self.start_upstream_link(server)
                     if not upstream_started:
                         if failover_mode == "fail_open":
                             print(f"Upstream start failed for {server['name']}, starting in local fallback mode")
-                            self.cleanup_upstream_routing(server)
+                            self.configure_wireguard_local_routing(server)
                             egress_interface = "eth+"
                             server["egress_interface"] = egress_interface
                             server["routing_state"] = "local"
                         else:
-                            print(f"Failed to start upstream link for {server['name']}")
-                            self.execute_command(f"/usr/bin/awg-quick down {server['interface']} 2>/dev/null || true")
-                            return False
+                            print(f"Upstream unavailable for {server['name']}; starting with fail-close routing")
+                            self.configure_wireguard_fail_closed_routing(server)
+                            server['_upstream_unhealthy'] = True
+                            egress_interface = server['upstream']['interface']
+                            server['routing_state'] = 'upstream'
+                            server['egress_interface'] = egress_interface
                     else:
                         egress_interface = ((server.get("upstream") or {}).get("interface")) or egress_interface
                         server["routing_state"] = "upstream"
@@ -4843,6 +5181,8 @@ PersistentKeepalive = {keepalive}
 
                 # Setup iptables rules
                 iptables_success = self.setup_iptables(server['interface'], server['subnet'], egress_interface)
+                if not iptables_success:
+                    raise RuntimeError('Could not install forwarding rules')
 
                 server['status'] = 'running'
                 self.save_config()
@@ -4864,6 +5204,21 @@ PersistentKeepalive = {keepalive}
                 print(f"Failed to start server {server['name']}")
         except Exception as e:
             print(f"Failed to start server {server_id}: {e}")
+            if entry_started:
+                # A failed policy install must not leave a newly started entry
+                # forwarding without its intended tunnel restrictions.
+                self.execute_command(f"iptables -I FORWARD 1 -i {server['interface']} -m comment --comment awg-upstream-change -j DROP")
+                self.execute_command(f"/usr/bin/awg-quick down {server['interface']} 2>/dev/null || true")
+                try:
+                    self.cleanup_iptables(server['interface'], server['subnet'], server.get('egress_interface', 'eth+'))
+                    if self._server_has_linked_upstream(server):
+                        self.stop_upstream_link(server)
+                    if not self.is_interface_running(server['interface']):
+                        self.execute_command(f"iptables -D FORWARD -i {server['interface']} -m comment --comment awg-upstream-change -j DROP 2>/dev/null || true")
+                    server['status'] = 'stopped'
+                    self.save_config()
+                except Exception as cleanup_error:
+                    print(f"Server startup cleanup needs attention: {type(cleanup_error).__name__}")
 
         return False
 
@@ -4886,6 +5241,11 @@ PersistentKeepalive = {keepalive}
             # Use awg-quick to bring down the interface
             result = self.execute_command(f"/usr/bin/awg-quick down {server['interface']}")
             if result is not None:
+                # Clear a retained recovery guard only after the entry is down.
+                self.execute_command(
+                    f"while iptables -D FORWARD -i {server['interface']} "
+                    "-m comment --comment awg-upstream-change -j DROP 2>/dev/null; do :; done"
+                )
                 server['status'] = 'stopped'
                 self.save_config()
 
@@ -4913,14 +5273,8 @@ PersistentKeepalive = {keepalive}
             if not self.is_interface_running(server.get("interface")):
                 return "stopped"
 
-            if server.get("mode") == "edge_linked":
-                upstream_interface = ((server.get("upstream") or {}).get("interface"))
-                if not upstream_interface:
-                    return "stopped"
-                if not self.is_interface_running(upstream_interface):
-                    if server.get("linked_failover_mode") == "fail_open" and server.get("routing_state") == "local":
-                        return "running"
-                    return "stopped"
+            # This is the client-facing interface status. A failed upstream
+            # still allows local destinations (or explicit fail-open fallback).
             return "running"
         except:
             return "stopped"
@@ -5070,6 +5424,27 @@ def upgrade_server_awg3(server_id):
         return jsonify({'error': str(e)}), 400
     except OSError:
         return jsonify({'error': 'Upgrade failed; check server logs and the AWG backup before retrying'}), 500
+    if server is None:
+        return jsonify({'error': 'Server not found'}), 404
+    return jsonify(server)
+
+@app.route('/api/servers/<server_id>/upstream', methods=['PUT', 'DELETE'])
+def manage_server_upstream(server_id):
+    """Manage an existing entry's separate AWG egress connection."""
+    try:
+        if request.method == 'DELETE':
+            server = amnezia_manager.remove_server_upstream(server_id)
+        else:
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                return jsonify({'error': 'Upstream settings must be a JSON object'}), 400
+            server = amnezia_manager.update_server_upstream(server_id, data)
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+    except (OSError, RuntimeError) as error:
+        print(f'Upstream change failed for {server_id}: {error}')
+        message = str(error) if isinstance(error, RuntimeError) else 'Could not read or write the tunnel configuration'
+        return jsonify({'error': message}), 500
     if server is None:
         return jsonify({'error': 'Server not found'}), 404
     return jsonify(server)

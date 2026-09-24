@@ -156,6 +156,11 @@ class AmneziaApp {
             });
             this.updateUpstreamConfigPreview(upstreamImportConfig.value || '');
         }
+        const upstreamRoutingMode = this.getElement('upstreamRoutingMode');
+        if (upstreamRoutingMode) {
+            upstreamRoutingMode.addEventListener('change', () => this.updateUpstreamRoutingHint());
+            this.updateUpstreamRoutingHint();
+        }
 
         // Form validation listeners
         this.setupFormValidation();
@@ -456,6 +461,29 @@ class AmneziaApp {
             const upstreamImportConfig = this.getElement('upstreamImportConfig');
             this.updateUpstreamConfigPreview(upstreamImportConfig ? upstreamImportConfig.value : '');
         }
+        this.updateUpstreamRoutingHint();
+    }
+
+    getUpstreamRoutingMode(upstream = {}) {
+        if (['all', 'ru_split', 'ai_tiktok'].includes(upstream.routing_mode)) {
+            return upstream.routing_mode;
+        }
+        return upstream.split_ru_local === true ? 'ru_split' : 'all';
+    }
+
+    getUpstreamRoutingLabel(upstream) {
+        return {
+            all: 'All traffic through the tunnel',
+            ru_split: 'Russian destination IP ranges locally; all other traffic through the tunnel',
+            ai_tiktok: 'AI services + TikTok through the tunnel; all other traffic locally'
+        }[this.getUpstreamRoutingMode(upstream)];
+    }
+
+    updateUpstreamRoutingHint() {
+        const hint = this.getElement('upstreamSelectiveDnsHint');
+        const mode = this.getElement('upstreamRoutingMode')?.value;
+        const protocol = this.getElement('serverProtocol')?.value;
+        if (hint) hint.classList.toggle('hidden', mode !== 'ai_tiktok' || protocol === 'vless');
     }
 
     parseAmneziaConfigPreview(configText) {
@@ -748,7 +776,7 @@ class AmneziaApp {
             if (this.getElement('vlessUseUpstream')?.checked) {
                 const importedConfig = this.getElement('upstreamImportConfig')?.value?.trim() || '';
                 if (!importedConfig) {
-                    this.showError('upstreamImportError', 'Paste imported EU client config for VLESS Linked Edge mode');
+                    this.showError('upstreamImportError', 'Paste a dedicated client config from the second server for VLESS Linked Edge mode');
                     isValid = false;
                 } else {
                     try {
@@ -804,7 +832,7 @@ class AmneziaApp {
         if (serverMode === 'edge_linked') {
             const importedConfig = this.getElement('upstreamImportConfig')?.value?.trim() || '';
             if (!importedConfig) {
-                this.showError('upstreamImportError', 'Paste imported EU client config for Linked Edge mode');
+                this.showError('upstreamImportError', 'Paste a dedicated client config from the second server for Linked Edge mode');
                 isValid = false;
             } else {
                 try {
@@ -907,7 +935,7 @@ class AmneziaApp {
         const modeElement = this.getElement('serverMode');
         const upstreamImportConfigElement = this.getElement('upstreamImportConfig');
         const upstreamFailoverModeElement = this.getElement('upstreamFailoverMode');
-        const splitRuLocalElement = this.getElement('splitRuLocal');
+        const upstreamRoutingModeElement = this.getElement('upstreamRoutingMode');
 
         const bandwidthTierElement = this.getElement('bandwidthTier');
         const protocol = (this.getElement('serverProtocol')?.value || 'wireguard').toLowerCase();
@@ -940,7 +968,7 @@ class AmneziaApp {
                 formData.upstream = {
                     import_config: upstreamImportConfigElement ? upstreamImportConfigElement.value.trim() : '',
                     failover_mode: upstreamFailoverModeElement ? upstreamFailoverModeElement.value : 'fail_close',
-                    split_ru_local: splitRuLocalElement ? splitRuLocalElement.checked : true
+                    routing_mode: upstreamRoutingModeElement ? upstreamRoutingModeElement.value : 'ru_split'
                 };
             }
         } else {
@@ -963,11 +991,9 @@ class AmneziaApp {
             formData.upstream = {
                 import_config: upstreamImportConfigElement ? upstreamImportConfigElement.value.trim() : '',
                 failover_mode: upstreamFailoverModeElement ? upstreamFailoverModeElement.value : 'fail_close',
-                split_ru_local: splitRuLocalElement ? splitRuLocalElement.checked : true
+                routing_mode: upstreamRoutingModeElement ? upstreamRoutingModeElement.value : 'ru_split'
             };
         }
-
-        console.log("Form data:", formData);
 
         // Add manual obfuscation parameters only for standalone mode
         if (protocol !== 'vless' && mode !== 'edge_linked' && formData.obfuscation) {
@@ -1015,7 +1041,7 @@ class AmneziaApp {
             return response.json();
         })
         .then(server => {
-            console.log("Server created successfully:", server);
+            console.log("Server created successfully:", server.name);
             this.showFormStatus(`Server "${server.name}" created successfully!`, 'success');
 
             // Reset form
@@ -1077,7 +1103,7 @@ class AmneziaApp {
             return response.json();
         })
         .then(server => {
-            console.log("Server created successfully:", server);
+            console.log("Server created successfully:", server.name);
             this.showFormStatus('Test server created successfully!', 'success');
             this.loadServers();
         })
@@ -1117,6 +1143,7 @@ class AmneziaApp {
     }
 
     renderServers(servers) {
+        this.serversById = new Map(servers.map(server => [String(server.id), server]));
         const serversList = this.getElement('serversList');
         if (!serversList) return;
 
@@ -1170,9 +1197,9 @@ class AmneziaApp {
                                 ${(server.vless_warnings || []).map(w => `<div>⚠ ${this.escapeHtml(w)}</div>`).join('')}
                             </div>` : ''}
                         ` : ''}
-                        ${server.mode === 'edge_linked' && server.upstream ? `<p class="text-xs text-gray-500">Upstream: ${server.upstream.endpoint} via ${server.upstream.interface}</p>` : ''}
+                        ${server.mode === 'edge_linked' && server.upstream ? `<p class="text-xs text-gray-500">Upstream: ${this.escapeHtml(server.upstream.endpoint || '')} via ${this.escapeHtml(server.upstream.interface || '')}</p>` : ''}
                         ${server.mode === 'edge_linked' ? `<p class="text-xs text-gray-500">Failover: ${server.linked_failover_mode || 'fail_close'} | Routing: ${server.routing_state || 'upstream'} | Egress: ${server.egress_interface || 'eth+'}</p>` : ''}
-                        ${server.mode === 'edge_linked' ? `<p class="text-xs text-gray-500">Split RU local: ${(server.upstream && server.upstream.split_ru_local !== false) ? 'enabled' : 'disabled'}</p>` : ''}
+                        ${server.mode === 'edge_linked' ? `<p class="text-xs text-gray-500">${this.getUpstreamRoutingLabel(server.upstream || {})}</p>` : ''}
                     </div>
                     <div class="flex items-center space-x-2">
                         <span class="px-3 py-1 rounded-full text-sm ${
@@ -1209,10 +1236,12 @@ class AmneziaApp {
                         Change Tier
                     </button>
                     `}
-                    ${server.mode === 'edge_linked' ? `
-                    <button onclick="amneziaApp.changeFailoverMode('${server.id}', '${server.linked_failover_mode || 'fail_close'}')" class="bg-indigo-500 text-white px-3 py-1 rounded hover:bg-indigo-600">
-                        Change Failover
+                    ${server.protocol !== 'vless' && server.obfuscation_enabled ? `
+                    <button onclick="amneziaApp.openUpstreamDialog('${server.id}')" class="bg-indigo-500 text-white px-3 py-1 rounded hover:bg-indigo-600">
+                        ${server.mode === 'edge_linked' ? 'Manage Tunnel' : 'Add Tunnel'}
                     </button>
+                    ` : server.protocol === 'vless' && server.mode === 'edge_linked' ? `
+                    <button onclick="amneziaApp.changeFailoverMode('${server.id}', '${server.linked_failover_mode || 'fail_close'}')" class="bg-indigo-500 text-white px-3 py-1 rounded hover:bg-indigo-600">Change Failover</button>
                     ` : ''}
                     <button onclick="amneziaApp.showServerConfig('${server.id}')" class="bg-purple-500 text-white px-3 py-1 rounded hover:bg-purple-600">
                         Show Config
@@ -1228,6 +1257,199 @@ class AmneziaApp {
         servers.forEach(server => {
             this.loadServerClients(server.id, server.protocol || 'wireguard');
         });
+    }
+
+    openUpstreamDialog(serverId) {
+        if (this.upstreamDialogBusy) return;
+        const server = this.serversById?.get(String(serverId));
+        if (!server || server.protocol === 'vless' || !server.obfuscation_enabled) {
+            this.showTempMessage('Reload the server list before configuring this AWG tunnel.', 'error');
+            return;
+        }
+        this.closeUpstreamDialog();
+        const linked = server.mode === 'edge_linked' && !!server.upstream;
+        const upstream = server.upstream || {};
+        this.upstreamDialogServerId = String(server.id);
+        this.upstreamDialogHasTunnel = linked;
+        this.upstreamDialogFocus = document.activeElement;
+        const modalHtml = `
+            <div id="upstreamTunnelModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50" role="dialog" aria-modal="true" aria-labelledby="upstreamTunnelTitle">
+                <div class="relative my-10 mx-auto p-5 border w-11/12 md:w-3/4 lg:w-1/2 shadow-lg rounded-md bg-white">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 id="upstreamTunnelTitle" class="text-lg font-medium text-gray-900">${linked ? 'Manage' : 'Add'} tunnel: ${this.escapeHtml(server.name)}</h3>
+                        <button id="closeUpstreamTunnel" type="button" aria-label="Close tunnel settings" class="text-gray-500 hover:text-gray-800 text-xl">×</button>
+                    </div>
+                    <p class="text-sm text-gray-600 mb-3">Connect this existing server to a second AWG server. Its current AWG version, keys and client configs are preserved. Applying changes may briefly interrupt traffic.</p>
+                    ${linked ? `<p class="text-sm text-gray-700 mb-3">Current endpoint: <span class="font-mono">${this.escapeHtml(upstream.endpoint || '')}</span></p>` : ''}
+                    <form id="upstreamTunnelForm" class="space-y-4">
+                        <div>
+                            <label for="tunnelImportConfig" class="block text-sm font-medium text-gray-700">${linked ? 'Replace tunnel client config (optional)' : 'Client config from the second panel'}</label>
+                            <textarea id="tunnelImportConfig" rows="7" spellcheck="false" autocomplete="off" autocapitalize="off" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2 text-sm font-mono" placeholder="[Interface]&#10;PrivateKey = ...&#10;Address = ...&#10;...&#10;[Peer]&#10;PublicKey = ...&#10;Endpoint = ..."></textarea>
+                            <p class="text-gray-500 text-xs mt-1">Create a dedicated client on the second server and paste its config here. Use different VPN subnets on the two servers. AWG 2 / AWG 3 is detected automatically.${linked ? ' Leave blank to keep the current tunnel and only change routing or failover.' : ''}</p>
+                            <p id="tunnelConfigPreview" class="text-gray-600 text-xs mt-2 hidden"></p>
+                        </div>
+                        <div>
+                            <label for="tunnelRoutingMode" class="block text-sm font-medium text-gray-700">Traffic through the tunnel</label>
+                            <select id="tunnelRoutingMode" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+                                <option value="all">All traffic</option>
+                                <option value="ru_split">All except Russian destination IP ranges (Russian traffic stays local)</option>
+                                <option value="ai_tiktok">AI services + TikTok only (all other traffic stays local)</option>
+                            </select>
+                            <p class="text-gray-500 text-xs mt-1">AI services include ChatGPT, Codex, Claude and other supported services. Local traffic uses this server's ordinary network adapter.</p>
+                            <p id="tunnelSelectiveDnsHint" class="text-amber-800 text-xs mt-2 hidden">Disable encrypted / Private DNS and browser Secure DNS on clients. Routing uses DNS lookups; services sharing the same IP may also use the tunnel. Reconnect clients after changing this mode to refresh DNS.</p>
+                        </div>
+                        <div>
+                            <label for="tunnelFailoverMode" class="block text-sm font-medium text-gray-700">If the tunnel is unavailable</label>
+                            <select id="tunnelFailoverMode" class="mt-1 block w-full border border-gray-300 rounded-md px-3 py-2 text-sm">
+                                <option value="fail_close">Block traffic assigned to the tunnel (fail close)</option>
+                                <option value="fail_open">Send traffic assigned to the tunnel locally (fail open)</option>
+                            </select>
+                            <p class="text-gray-500 text-xs mt-1">Traffic assigned to local egress continues using this server.</p>
+                        </div>
+                        <p id="tunnelFormError" role="alert" class="text-red-600 text-sm hidden"></p>
+                        ${linked ? `<div id="tunnelRemoveConfirmation" class="hidden rounded border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                            <p>Remove this tunnel and send all client traffic through this server's local network adapter? Existing clients and their configs will be preserved.</p>
+                            <div class="flex flex-wrap gap-2 mt-3">
+                                <button id="keepUpstreamTunnel" type="button" class="border border-gray-300 bg-white text-gray-700 px-3 py-2 rounded">Keep tunnel</button>
+                                <button id="confirmRemoveUpstreamTunnel" type="button" class="bg-red-600 text-white px-3 py-2 rounded hover:bg-red-700">Remove and use local egress</button>
+                            </div>
+                        </div>` : ''}
+                        <div class="flex flex-wrap justify-end gap-2 pt-4 border-t">
+                            ${linked ? '<button id="removeUpstreamTunnel" type="button" class="border border-red-300 text-red-700 px-4 py-2 rounded text-sm hover:bg-red-50">Remove tunnel</button>' : ''}
+                            <button id="cancelUpstreamTunnel" type="button" class="bg-gray-500 text-white px-4 py-2 rounded text-sm hover:bg-gray-600">Cancel</button>
+                            <button id="saveUpstreamTunnel" type="submit" class="bg-indigo-600 text-white px-4 py-2 rounded text-sm hover:bg-indigo-700">${linked ? 'Save changes' : 'Add tunnel'}</button>
+                        </div>
+                    </form>
+                </div>
+            </div>`;
+        document.body.insertAdjacentHTML('beforeend', modalHtml);
+        const modeSelect = document.getElementById('tunnelRoutingMode');
+        modeSelect.value = linked ? this.getUpstreamRoutingMode(upstream) : 'ru_split';
+        document.getElementById('tunnelFailoverMode').value = upstream.failover_mode || server.linked_failover_mode || 'fail_close';
+        const updateHint = () => document.getElementById('tunnelSelectiveDnsHint')?.classList.toggle('hidden', modeSelect.value !== 'ai_tiktok');
+        modeSelect.addEventListener('change', updateHint);
+        updateHint();
+        const configInput = document.getElementById('tunnelImportConfig');
+        configInput.required = !linked;
+        configInput.addEventListener('input', () => {
+            const preview = document.getElementById('tunnelConfigPreview');
+            preview.classList.toggle('hidden', !configInput.value.trim());
+            this.hideError('tunnelFormError');
+            try {
+                const parsed = this.parseAmneziaConfigPreview(configInput.value);
+                preview.textContent = parsed ? `AWG ${this.getAwgVersion({ obfuscation_params: parsed.interface })} · ${parsed.peer.Endpoint} · ${parsed.interface.Address}` : '';
+            } catch (error) {
+                preview.textContent = `Config parse error: ${error.message}`;
+            }
+        });
+        document.getElementById('upstreamTunnelForm').addEventListener('submit', (event) => {
+            event.preventDefault();
+            this.saveUpstreamTunnel();
+        });
+        document.getElementById('closeUpstreamTunnel').addEventListener('click', () => this.closeUpstreamDialog());
+        document.getElementById('cancelUpstreamTunnel').addEventListener('click', () => this.closeUpstreamDialog());
+        document.getElementById('removeUpstreamTunnel')?.addEventListener('click', () => this.removeUpstreamTunnel());
+        document.getElementById('keepUpstreamTunnel')?.addEventListener('click', () => {
+            document.getElementById('tunnelRemoveConfirmation').classList.add('hidden');
+            document.getElementById('removeUpstreamTunnel').focus();
+        });
+        document.getElementById('confirmRemoveUpstreamTunnel')?.addEventListener('click', () => this.confirmRemoveUpstreamTunnel());
+        this.upstreamDialogKeyHandler = (event) => {
+            if (event.key === 'Escape') this.closeUpstreamDialog();
+            if (event.key === 'Tab') {
+                const controls = document.getElementById('upstreamTunnelModal')?.querySelectorAll('button:not(:disabled), textarea:not(:disabled), select:not(:disabled)');
+                if (!controls?.length) return;
+                const first = controls[0];
+                const last = controls[controls.length - 1];
+                if (event.shiftKey && document.activeElement === first) {
+                    event.preventDefault();
+                    last.focus();
+                } else if (!event.shiftKey && document.activeElement === last) {
+                    event.preventDefault();
+                    first.focus();
+                }
+            }
+        };
+        document.addEventListener('keydown', this.upstreamDialogKeyHandler);
+        (linked ? modeSelect : configInput).focus();
+    }
+
+    closeUpstreamDialog() {
+        if (this.upstreamDialogBusy) return;
+        document.getElementById('upstreamTunnelModal')?.remove();
+        if (this.upstreamDialogKeyHandler) document.removeEventListener('keydown', this.upstreamDialogKeyHandler);
+        this.upstreamDialogKeyHandler = null;
+        this.upstreamDialogServerId = null;
+        this.upstreamDialogHasTunnel = false;
+        this.upstreamDialogFocus?.focus();
+        this.upstreamDialogFocus = null;
+    }
+
+    setUpstreamDialogBusy(busy, action = 'Saving') {
+        this.upstreamDialogBusy = busy;
+        const modal = document.getElementById('upstreamTunnelModal');
+        modal?.setAttribute('aria-busy', String(busy));
+        modal?.querySelectorAll('button, textarea, select').forEach(control => { control.disabled = busy; });
+        const saveButton = document.getElementById('saveUpstreamTunnel');
+        if (saveButton) saveButton.textContent = busy ? `${action}...` : (this.upstreamDialogHasTunnel ? 'Save changes' : 'Add tunnel');
+    }
+
+    async saveUpstreamTunnel() {
+        if (this.upstreamDialogBusy || !this.upstreamDialogServerId) return;
+        this.hideError('tunnelFormError');
+        const config = document.getElementById('tunnelImportConfig').value.trim();
+        if (!config && !this.upstreamDialogHasTunnel) {
+            this.showError('tunnelFormError', 'Paste a dedicated client config from the second server.');
+            return;
+        }
+        if (config) {
+            try {
+                this.parseAmneziaConfigPreview(config);
+            } catch (error) {
+                this.showError('tunnelFormError', `Config parse error: ${error.message}`);
+                return;
+            }
+        }
+        const body = {
+            routing_mode: document.getElementById('tunnelRoutingMode').value,
+            failover_mode: document.getElementById('tunnelFailoverMode').value
+        };
+        if (config) body.import_config = config;
+        await this.applyUpstreamTunnelChange('PUT', body);
+    }
+
+    removeUpstreamTunnel() {
+        if (this.upstreamDialogBusy || !this.upstreamDialogServerId || !this.upstreamDialogHasTunnel) return;
+        document.getElementById('tunnelRemoveConfirmation').classList.remove('hidden');
+        document.getElementById('confirmRemoveUpstreamTunnel').focus();
+    }
+
+    async confirmRemoveUpstreamTunnel() {
+        if (this.upstreamDialogBusy || !this.upstreamDialogServerId || !this.upstreamDialogHasTunnel) return;
+        await this.applyUpstreamTunnelChange('DELETE');
+    }
+
+    async applyUpstreamTunnelChange(method, body) {
+        this.hideError('tunnelFormError');
+        this.setUpstreamDialogBusy(true, method === 'DELETE' ? 'Removing' : 'Saving');
+        try {
+            const options = { method };
+            if (body) {
+                options.headers = { 'Content-Type': 'application/json' };
+                options.body = JSON.stringify(body);
+            }
+            const response = await fetch(`/api/servers/${encodeURIComponent(this.upstreamDialogServerId)}/upstream`, options);
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+            this.setUpstreamDialogBusy(false);
+            this.closeUpstreamDialog();
+            this.showTempMessage(method === 'DELETE' ? 'Tunnel removed. Client traffic now exits locally.' : 'Tunnel settings saved. Existing client configs are unchanged.', 'success');
+            this.loadServers();
+        } catch (error) {
+            this.showError('tunnelFormError', error.message);
+        } finally {
+            this.setUpstreamDialogBusy(false);
+        }
     }
 
     getVlessTransport(server) {

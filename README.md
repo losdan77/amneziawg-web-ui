@@ -6,6 +6,11 @@ AWG 1.x/2.0 configurations. Upgrading an existing server is explicit and require
 updated client apps/configs. See [AWG 3.0 upgrade and compatibility guide](AWG3_UPGRADE.md)
 for deployment, backups, rollback and tests.
 
+Existing AWG 2/3 servers can attach, replace or remove an upstream tunnel without
+reissuing client profiles. Routing supports all traffic, Russian IPs locally, or
+AI services + TikTok through the tunnel with other destinations local. See the
+[tunnel and selective routing guide](AWG_TUNNELS.md).
+
 A comprehensive web-based management interface for AmneziaWG VPN servers. This service provides an easy-to-use web UI to create, manage, and monitor WireGuard VPN servers with AmneziaWG's advanced obfuscation features.
 All server configuration is done via web interface or via API endpoints. Providing env variables at docker startup is supported but doesn't make much sense: all settings can be overridden via web interface except for NGINX_PORT.
 

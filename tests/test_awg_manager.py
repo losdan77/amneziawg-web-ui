@@ -7,11 +7,13 @@ import ast
 import base64
 import calendar
 import copy
+import errno
 import ipaddress
 import json
 import os
 import random
 import re
+import shlex
 import secrets
 import subprocess
 import sys
@@ -27,11 +29,15 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'web-ui'))
 from awg_protocol import *
+from routing_policy import *
 from test_awg_protocol import LEGACY
 
 DEFAULT_MTU, DEFAULT_PORT = 1280, 51820
 DEFAULT_SUBNET, DNS_SERVERS = '10.0.0.0/24', ['1.1.1.1']
 ENABLE_OBFUSCATION, AUTO_START_SERVERS = True, False
+IMPORT_PRIVATE_KEY = base64.b64encode(bytes(range(32))).decode('ascii')
+IMPORT_PUBLIC_KEY = base64.b64encode(bytes(range(32, 64))).decode('ascii')
+IMPORT_PRESHARED_KEY = base64.b64encode(bytes(range(64, 96))).decode('ascii')
 tree = ast.parse((Path(__file__).resolve().parents[1] / 'web-ui/app.py').read_text(encoding='utf-8'))
 tree.body = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef))
              and node.name in ('AmneziaManager', 'synchronized_config')]
@@ -61,8 +67,8 @@ class ManagerTests(unittest.TestCase):
         return self.manager.create_wireguard_server(dict(name='Test', auto_start=False, **kwargs))
 
     def imported_config(self, params):
-        return ('[Interface]\nPrivateKey = private\nAddress = 10.8.0.2/32\nMTU = 1280\n'
-                + render_params(params) + '[Peer]\nPublicKey = public\nEndpoint = 192.0.2.5:51820\n'
+        return (f'[Interface]\nPrivateKey = {IMPORT_PRIVATE_KEY}\nAddress = 10.8.0.2/32\nMTU = 1280\n'
+                + render_params(params) + f'[Peer]\nPublicKey = {IMPORT_PUBLIC_KEY}\nEndpoint = 192.0.2.5:51820\n'
                 'AllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 15-30\n')
 
     def client(self, server):

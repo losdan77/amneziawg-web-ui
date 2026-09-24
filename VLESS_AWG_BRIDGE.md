@@ -16,7 +16,9 @@ HAPP / VLESS client
 3. На RU VPS откройте **Servers** и создайте **VLESS** server.
 4. Включите **Route this VLESS server through upstream AmneziaWG**.
 5. Вставьте EU AmneziaWG client config в **Import EU client config**.
-6. Оставьте **Route Russian destination IP ranges via local RU egress** включенным, если российские IP должны выходить напрямую с RU VPS.
+6. В **Traffic routing** выберите российские IP напрямую, весь трафик через туннель или **AI services + TikTok through tunnel; everything else local**. В последнем режиме Xray направляет выбранные домены через AWG, остальные соединения — напрямую.
+
+Подробности режимов и подключения туннеля к существующим AWG 2/3 серверам: [руководство по туннелям](AWG_TUNNELS.md).
 
 ## Что делает панель
 

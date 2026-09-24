@@ -38,6 +38,8 @@ RUN apk update && apk add \
     iproute2 \
     iproute2-tc \
     iptables \
+    ipset \
+    dnsmasq \
     openresolv \
     python3 \
     py3-pip \
@@ -73,6 +75,7 @@ RUN chmod +x /app/scripts/*.sh \
     && python3 /app/scripts/force_awg_userspace.py /usr/bin/awg-quick \
     && bash -n /usr/bin/awg-quick \
     && /usr/bin/awg --version
+RUN dnsmasq --version | grep -qw ipset
 
 # Expose default ports
 EXPOSE 80
