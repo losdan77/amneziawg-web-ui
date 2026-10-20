@@ -19,6 +19,10 @@ import time
 import requests
 from service_networks import (normalize_service_ip_profile, load_expanded_networks,
                               refresh_expanded_networks, expanded_network_status)
+from service_domains import (normalize_selected_services, selected_domain_rules,
+                             selected_service_rules, youtube_service_rules,
+                             selected_domain_matches, chatgpt_voice_rules)
+from domain_proxy import DomainProxy
 
 
 # Domain suffixes, deliberately avoiding entire shared CDNs/google.com.
@@ -161,8 +165,8 @@ def normalize_routing_policy(data):
         if isinstance(enabled, str):
             enabled = enabled.strip().lower() in ('true', '1', 'yes', 'on')
         return 'ru_split' if enabled else 'all'
-    if mode not in ('all', 'ru_split', 'ai_tiktok'):
-        raise ValueError('routing_mode must be all, ru_split or ai_tiktok')
+    if mode not in ('all', 'ru_split', 'ai_tiktok', 'selected_services'):
+        raise ValueError('routing_mode must be all, ru_split, ai_tiktok or selected_services')
     return mode
 
 

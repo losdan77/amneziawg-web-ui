@@ -87,6 +87,10 @@ async function run() {
     assert.match(app.getUpstreamRoutingLabel({ routing_mode: 'ai_tiktok' }), /all other traffic locally/);
     assert.match(app.getUpstreamRoutingLabel({ routing_mode: 'ai_tiktok', service_ip_profile: 'expanded' }), /shared CDN \/ cloud networks/);
     assert.equal(app.getUpstreamRoutingLabel({ routing_mode: 'all', service_ip_profile: 'expanded' }), 'All traffic through the tunnel');
+    assert.equal(app.getUpstreamRoutingMode({ routing_mode: 'selected_services', split_ru_local: true }), 'selected_services');
+    assert.equal(app.getUpstreamRoutingLabel({ routing_mode: 'selected_services' }), 'ChatGPT, Codex, Claude, TikTok through the tunnel by domain; YouTube and other traffic locally');
+    assert.equal(app.getUpstreamRoutingLabel({ routing_mode: 'selected_services', selected_services: [] }), 'No services selected; all traffic locally');
+    assert.equal(app.getUpstreamRoutingLabel({ routing_mode: 'selected_services', selected_services: ['claude', '<script>', 'claude'] }), 'Claude through the tunnel by domain; YouTube and other traffic locally');
 
     const serversList = makeElement('serversList');
     app.updateClientFilterSummary = () => {};
@@ -111,6 +115,7 @@ async function run() {
     const coverageGroup = makeElement('upstreamServiceIpProfileGroup');
     const coverage = makeElement('upstreamServiceIpProfile', 'standard');
     const expandedHint = makeElement('upstreamExpandedCoverageHint');
+    const selectedGroup = makeElement('upstreamSelectedServicesGroup');
     app.updateUpstreamRoutingHint();
     assert.equal(hint.classList.contains('hidden'), false);
     assert.equal(coverageGroup.classList.contains('hidden'), false);
@@ -126,6 +131,15 @@ async function run() {
     app.updateUpstreamRoutingHint();
     assert.equal(coverageGroup.classList.contains('hidden'), true);
     assert.equal(expandedHint.classList.contains('hidden'), true);
+    elements.get('upstreamRoutingMode').value = 'selected_services';
+    app.updateUpstreamRoutingHint();
+    assert.equal(selectedGroup.classList.contains('hidden'), false);
+    assert.equal(coverageGroup.classList.contains('hidden'), true);
+    assert.equal(expandedHint.classList.contains('hidden'), true);
+    assert.equal(hint.classList.contains('hidden'), true);
+    elements.get('upstreamRoutingMode').value = 'all';
+    app.updateUpstreamRoutingHint();
+    assert.equal(selectedGroup.classList.contains('hidden'), true);
     coverage.value = 'standard';
 
     for (const [version, config] of [['2', config2], ['3', config3]]) {
@@ -210,6 +224,48 @@ async function run() {
     assert.deepEqual(JSON.parse(requests.at(-1).body).service_cidrs, [], 'clearing the textarea removes custom addresses');
     assert.equal(JSON.parse(requests.at(-1).body).service_ip_profile, 'standard', 'maximum coverage can be disabled without replacing credentials');
 
+    const domainSelected = { ...selective, upstream: { ...selective.upstream, routing_mode: 'selected_services', selected_services: ['claude', 'tiktok'] } };
+    open(domainSelected);
+    assert.equal(elements.get('tunnelRoutingMode').value, 'selected_services');
+    assert.equal(elements.get('tunnelSelectedServicesGroup').classList.contains('hidden'), false);
+    assert.equal(elements.get('tunnelServiceIpProfileGroup').classList.contains('hidden'), true);
+    assert.equal(elements.get('tunnelServiceCidrsGroup').classList.contains('hidden'), true);
+    assert.equal(elements.get('tunnelSelectiveDnsHint').classList.contains('hidden'), true);
+    assert.equal(elements.get('tunnelService_claude').checked, true);
+    assert.equal(elements.get('tunnelService_tiktok').checked, true);
+    assert.equal(elements.get('tunnelService_chatgpt').checked, false);
+    assert.equal(elements.get('tunnelService_codex').checked, false);
+    elements.get('tunnelRoutingMode').value = 'ai_tiktok';
+    elements.get('tunnelRoutingMode').listeners.get('change')();
+    assert.equal(elements.get('tunnelSelectedServicesGroup').classList.contains('hidden'), true);
+    assert.equal(elements.get('tunnelServiceIpProfile').value, 'expanded', 'switching modes preserves the old broad profile');
+    assert.equal(elements.get('tunnelServiceCidrs').value, '160.79.104.0/23\n8.8.8.8/32');
+    elements.get('tunnelRoutingMode').value = 'selected_services';
+    elements.get('tunnelRoutingMode').listeners.get('change')();
+    assert.equal(elements.get('tunnelService_claude').checked, true, 'switching modes preserves checkbox choices');
+    elements.get('tunnelService_tiktok').checked = false;
+    elements.get('tunnelServiceCidrs').value = '0.0.0.0/0';
+    context.fetch = async (url, options) => {
+        requests.push({ url, ...options });
+        return { ok: false, status: 500, json: async () => ({ error: 'Domain router could not start' }) };
+    };
+    await app.saveUpstreamTunnel();
+    assert.equal(elements.get('tunnelService_claude').checked, true, 'failed apply keeps selected choices');
+    assert.equal(elements.get('tunnelService_tiktok').checked, false, 'failed apply keeps deselected choices');
+    assert.match(elements.get('tunnelFormError').textContent, /Domain router could not start/);
+    context.fetch = normalFetch;
+    await app.saveUpstreamTunnel();
+    assert.deepEqual(JSON.parse(requests.at(-1).body), { routing_mode: 'selected_services', failover_mode: 'fail_open', selected_services: ['claude'] }, 'hidden invalid CIDRs do not affect domain mode');
+    open({ ...domainSelected, upstream: { ...domainSelected.upstream, selected_services: [] } });
+    for (const id of ['chatgpt', 'codex', 'claude', 'tiktok']) assert.equal(elements.get(`tunnelService_${id}`).checked, false, 'saved empty selection must stay empty');
+    await app.saveUpstreamTunnel();
+    assert.deepEqual(JSON.parse(requests.at(-1).body).selected_services, [], 'explicitly empty selection is sent to the API');
+    open({ ...domainSelected, upstream: { routing_mode: 'selected_services' } });
+    for (const id of ['chatgpt', 'codex', 'claude', 'tiktok']) assert.equal(elements.get(`tunnelService_${id}`).checked, true, 'missing selection defaults to all four');
+    elements.get('tunnelRoutingMode').value = 'all';
+    await app.saveUpstreamTunnel();
+    assert.ok(!Object.hasOwn(JSON.parse(requests.at(-1).body), 'selected_services'), 'other modes preserve stored choices on the backend');
+
     open(selective);
     elements.get('tunnelServiceCidrs').value = '0.0.0.0/0';
     context.fetch = async () => ({ ok: false, status: 400, json: async () => ({ error: 'Only public IPv4 service networks are allowed' }) });
@@ -253,6 +309,29 @@ async function run() {
     assert.match(diagnosticResult.textContent, /provider network: yes/);
     assert.match(diagnosticResult.textContent, /<img src=x onerror=alert\(1\)>/);
     assert.equal(diagnosticResult.innerHTML, '', 'server messages are displayed as text, never HTML');
+    const domainDiagnostic = {
+        ...diagnostics, routing_mode: 'selected_services', selected_services: ['claude', '<unknown>'],
+        classifier: { engine: 'sing-box', proxy_running: true, rules_attached: true, private_key: 'must-not-render' },
+        destinations: [{ address: '104.18.31.77', matched: true, classification: 'domain_rule', route: 'upstream', egress: 'wg-up-test' }]
+    };
+    const domainText = app.formatUpstreamDiagnostics(domainDiagnostic);
+    assert.match(domainText, /Selected services: Claude/);
+    assert.match(domainText, /Domain router running: yes; capture rules installed: yes/);
+    assert.match(domainText, /selected domain rule: yes/);
+    assert.match(domainText, /Predicted route: upstream/);
+    assert.ok(!domainText.includes('Service pool entries:'));
+    assert.ok(!domainText.includes('Saved service IP coverage:'));
+    assert.ok(!domainText.includes('Provider networks:'));
+    assert.ok(!domainText.includes('must-not-render'));
+    const unknownText = app.formatUpstreamDiagnostics({ ...domainDiagnostic, selected_services: [],
+        destinations: [{ address: '104.18.31.77', matched: false, classification: 'unknown_without_domain', route: 'unknown', egress: '' }] });
+    assert.match(unknownText, /Selected services: none/);
+    assert.match(unknownText, /service unknown without a domain name/);
+    assert.match(unknownText, /Predicted route: unknown/);
+    const xrayText = app.formatUpstreamDiagnostics({ ...domainDiagnostic, classifier: { engine: 'xray' } });
+    assert.match(xrayText, /Domain routing engine: xray/);
+    assert.ok(!xrayText.includes('Domain router running:'));
+
     assert.ok(!diagnosticResult.textContent.includes('must-not-render'), 'unknown response fields are not exposed');
     assert.equal(elements.get('tunnelDiagnosticDestination').disabled, false);
     elements.get('tunnelDiagnosticDestination').value = ' 160.79.104.1 ';
@@ -365,8 +444,28 @@ async function run() {
     app.createServer();
     await new Promise(resolve => setImmediate(resolve));
     assert.ok(!Object.hasOwn(JSON.parse(requests.at(-1).body).upstream, 'service_ip_profile'), 'creation only sends coverage for the selective mode');
+    const template = fs.readFileSync(path.join(__dirname, '../web-ui/templates/index.html'), 'utf8');
+    assert.match(template, /option value="selected_services"/);
+    for (const id of ['chatgpt', 'codex', 'claude', 'tiktok']) {
+        assert.match(template, new RegExp(`id="upstreamService_${id}" type="checkbox" checked`), 'creation defaults all four choices on');
+        makeElement(`upstreamService_${id}`).checked = true;
+    }
+    elements.get('upstreamRoutingMode').value = 'selected_services';
+    for (const protocol of ['wireguard', 'vless']) {
+        elements.get('serverProtocol').value = protocol;
+        app.createServer();
+        await new Promise(resolve => setImmediate(resolve));
+        const payload = JSON.parse(requests.at(-1).body);
+        assert.equal(payload.upstream.routing_mode, 'selected_services');
+        assert.deepEqual(payload.upstream.selected_services, ['chatgpt', 'codex', 'claude', 'tiktok']);
+        assert.ok(!Object.hasOwn(payload.upstream, 'service_ip_profile'), 'domain mode does not submit hidden provider coverage');
+    }
+    for (const id of ['chatgpt', 'codex', 'claude', 'tiktok']) elements.get(`upstreamService_${id}`).checked = false;
+    app.createServer();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(JSON.parse(requests.at(-1).body).upstream.selected_services, []);
     assert.ok(reloads >= 6);
-    console.log('PASS upstream frontend: AWG2/AWG3 tunnels, opt-in maximum coverage, service address pools, safe diagnostics, errors, busy state and VLESS creation');
+    console.log('PASS upstream frontend: AWG2/AWG3 tunnels, domain service selection, opt-in maximum coverage, service address pools, safe diagnostics, errors, busy state and VLESS creation');
 }
 
 run().catch(error => { console.error(error); process.exitCode = 1; });

@@ -337,10 +337,22 @@
                             <option value="all">All traffic</option>
                             <option value="ru_split" selected>All except Russian destination IP ranges (Russian traffic stays local)</option>
                             <option value="ai_tiktok">AI services + TikTok (coverage settings below)</option>
+                            <option value="selected_services">Selected services (domains; YouTube stays local)</option>
                         </select>
                         <p class="text-gray-500 text-xs mt-1">AI services include ChatGPT, Codex, Claude and other supported services. Local traffic uses this server's ordinary network adapter.</p>
                         <p id="upstreamSelectiveDnsHint" class="text-amber-800 text-xs mt-2 hidden">AWG learns IPv4 addresses from DNS, pre-resolves known service hosts and includes documented API networks. Disable encrypted / Private DNS and browser Secure DNS for reliable learning. Shared IPs may send unrelated services through the tunnel; IPv6 outside the VPN is not covered. Reconnect clients and refresh their DNS after changing this mode. Use the server's tunnel settings to add verified service addresses or check routing.</p>
                     </div>
+                    <fieldset id="upstreamSelectedServicesGroup" class="mb-4 hidden rounded border border-indigo-200 bg-indigo-50 p-3">
+                        <legend class="text-xs font-medium text-gray-700">Services through the tunnel</legend>
+                        <div class="grid grid-cols-2 gap-3 mt-2">
+                            <label for="upstreamService_chatgpt" class="flex items-center gap-2 text-sm text-gray-800"><input id="upstreamService_chatgpt" type="checkbox" checked class="rounded border-gray-300 text-indigo-600"> ChatGPT</label>
+                            <label for="upstreamService_codex" class="flex items-center gap-2 text-sm text-gray-800"><input id="upstreamService_codex" type="checkbox" checked class="rounded border-gray-300 text-indigo-600"> Codex</label>
+                            <label for="upstreamService_claude" class="flex items-center gap-2 text-sm text-gray-800"><input id="upstreamService_claude" type="checkbox" checked class="rounded border-gray-300 text-indigo-600"> Claude</label>
+                            <label for="upstreamService_tiktok" class="flex items-center gap-2 text-sm text-gray-800"><input id="upstreamService_tiktok" type="checkbox" checked class="rounded border-gray-300 text-indigo-600"> TikTok</label>
+                        </div>
+                        <p class="text-gray-600 text-xs mt-3">YouTube and other destinations use this server's local network adapter. Select no services to keep all traffic local. Broad provider networks are not used in this mode.</p>
+                        <p class="text-gray-600 text-xs mt-2">For reliable domain detection, disable encrypted / Private DNS and browser Secure DNS on clients. Reconnect the VPN and restart apps after changing modes. ChatGPT and Codex share some OpenAI hosts: selecting either can also route shared connections used by the other.</p>
+                    </fieldset>
                     <div id="upstreamServiceIpProfileGroup" class="mb-4 hidden">
                         <label for="upstreamServiceIpProfile" class="block text-xs font-medium text-gray-700">Service IP coverage</label>
                         <select id="upstreamServiceIpProfile" class="mt-1 block w-full border border-gray-300 rounded-md px-2 py-1 text-sm">

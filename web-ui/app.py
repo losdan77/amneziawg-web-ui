@@ -31,7 +31,9 @@ from routing_policy import (AI_TIKTOK_DOMAINS, BUILTIN_SERVICE_CIDRS, SelectiveR
                             normalize_routing_policy, normalize_service_cidrs,
                             resolve_service_hosts, normalize_service_ip_profile,
                             service_destination_networks, load_expanded_networks, refresh_expanded_networks,
-                            expanded_network_status)
+                            expanded_network_status, DomainProxy, normalize_selected_services,
+                            selected_domain_rules, youtube_service_rules, selected_domain_matches,
+                            chatgpt_voice_rules)
 
 # Get the absolute path to the current directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1056,6 +1058,8 @@ class AmneziaManager:
                             failover_mode = server.get("linked_failover_mode", "fail_close")
                             if server.get('protocol') != 'vless' and normalize_routing_policy(server['upstream']) == 'ai_tiktok':
                                 self._selective_routing().ensure_dns(server)
+                            if server.get('protocol') != 'vless' and normalize_routing_policy(server['upstream']) == 'selected_services':
+                                self._domain_proxy().ensure_running(server)
                             healthy, handshake_age = self.is_upstream_healthy(server)
                             if healthy:
                                 # Restore the live route after fail-close blackholing.
@@ -1284,7 +1288,19 @@ class AmneziaManager:
                                                  if status.get(key) is None or isinstance(status.get(key), (int, float))}
                 warnings.append('Максимальное покрытие включает общие сети CDN и облаков. '
                                 'Посторонние сайты и проверки «мой IP» на этих сетях тоже могут идти через туннель.')
-            if hostname:
+            if policy == 'selected_services':
+                classifier['engine'] = 'xray' if is_vless else 'sing-box'
+                if not is_vless:
+                    proxy_status = self._domain_proxy().status(server)
+                    classifier['proxy_running'] = bool(proxy_status.get('running'))
+                    classifier['rules_attached'] = bool(proxy_status.get('capture_ready'))
+                    if not classifier['proxy_running'] or not classifier['rules_attached']:
+                        warnings.append('Доменный маршрутизатор или его правила не работают; проверьте запуск сервера.')
+                warnings.append('Проверка домена показывает решение правила, а не маршрут уже открытого соединения. '
+                                'Для AWG используйте DNS через VPN; защищённый DNS и скрытый домен могут мешать распознаванию.')
+                if not hostname:
+                    warnings.append('По одному IP нельзя определить сервис на общей CDN. Укажите домен назначения.')
+            if hostname and policy != 'selected_services':
                 warnings.append('Домен разрешён на сервере; у клиента может быть другой IP. '
                                 'Для точной проверки укажите IPv4 фактического соединения клиента.')
             if not addresses:
@@ -1353,7 +1369,10 @@ class AmneziaManager:
                 # Canonicalize even resolver output before constructing a command.
                 address = str(ipaddress.IPv4Address(address))
                 dns_match = pool_match = provider_match = explicit_pool_match = False
-                if policy == 'ai_tiktok':
+                if policy == 'selected_services':
+                    matched = selected_domain_matches(upstream, hostname) if hostname else None
+                    dns_match = bool(matched)
+                elif policy == 'ai_tiktok':
                     if is_vless:
                         dns_match = bool(hostname and any(hostname == suffix or hostname.endswith('.' + suffix)
                                                          for suffix in AI_TIKTOK_DOMAINS))
@@ -1379,7 +1398,7 @@ class AmneziaManager:
                 if is_vless and server.get('routing_state') == 'local':
                     mark = 0
                 query = f'ip -j -4 route get {address}'
-                if not is_vless and source:
+                if not is_vless and source and policy != 'selected_services':
                     query += f' from {source} iif {interface}'
                 query += f' mark {mark} 2>/dev/null'
                 output = self.execute_command(query)
@@ -1394,14 +1413,23 @@ class AmneziaManager:
                         route = 'upstream' if egress == upstream_interface else 'local'
                 except (TypeError, ValueError, AttributeError):
                     pass
+                if policy == 'selected_services':
+                    if not hostname:
+                        route, egress = 'unknown', ''
+                    elif not is_vless and (not classifier.get('proxy_running') or not classifier.get('rules_attached')):
+                        route, egress = 'unknown', ''
                 destinations.append({'address': address, 'matched': matched, 'dns_match': dns_match,
+                                     'classification': ('domain_rule' if hostname else 'unknown_without_domain')
+                                                       if policy == 'selected_services' else 'ip_rule',
                                      'pool_match': pool_match, 'provider_match': provider_match,
                                      'route': route, 'egress': egress})
-            if any(item['route'] == 'unknown' for item in destinations):
+            if any(item['route'] == 'unknown' and item.get('classification') != 'unknown_without_domain'
+                   for item in destinations):
                 warnings.append('Ядро не вернуло маршрут для части адресов: возможна блокировка fail_close '
                                 'или остановленный интерфейс. Это не подтверждает локальный выход.')
             return {'protocol': server.get('protocol', 'amneziawg'), 'routing_mode': policy,
                     'service_ip_profile': service_ip_profile,
+                    'selected_services': normalize_selected_services(upstream.get('selected_services')),
                     'routing_state': server.get('routing_state'),
                     'failover_mode': server.get('linked_failover_mode', 'fail_close'),
                     'upstream': {'interface': upstream_interface, 'healthy': healthy,
@@ -2316,7 +2344,8 @@ class AmneziaManager:
             })
 
             if self._server_has_linked_upstream(server):
-                selective = normalize_routing_policy(server['upstream']) == 'ai_tiktok'
+                policy = normalize_routing_policy(server['upstream'])
+                selective = policy == 'ai_tiktok'
                 outbound_tag = "direct"
                 if server.get("routing_state", "upstream") == "upstream":
                     upstream = server.get("upstream") or {}
@@ -2335,6 +2364,23 @@ class AmneziaManager:
                                 }
                             },
                         })
+                if policy == 'selected_services' and outbound_tag != 'direct':
+                    youtube = youtube_service_rules()
+                    direct_domains = (['domain:' + value for value in youtube.get('domain_suffix', [])]
+                                      + ['full:' + value for value in youtube.get('domain', [])]
+                                      + ['regexp:' + value for value in youtube.get('domain_regex', [])])
+                    routing_rules.append({'type': 'field', 'inboundTag': [inbound_tag],
+                                          'domain': direct_domains, 'outboundTag': 'direct'})
+                    voice = chatgpt_voice_rules(server['upstream'])
+                    if voice:
+                        routing_rules.append({'type': 'field', 'inboundTag': [inbound_tag],
+                                              'ip': voice['ip_cidr'], 'port': '3478',
+                                              'network': 'udp', 'outboundTag': outbound_tag})
+                    domains = selected_domain_rules(server['upstream'])
+                    if domains:
+                        routing_rules.append({'type': 'field', 'inboundTag': [inbound_tag],
+                                              'domain': domains, 'outboundTag': outbound_tag})
+                    outbound_tag = 'direct'
                 if selective and outbound_tag != 'direct':
                     routing_rules.append({
                         "type": "field",
@@ -4010,6 +4056,7 @@ class AmneziaManager:
         routing_mode = normalize_routing_policy(upstream_data)
         service_cidrs = normalize_service_cidrs(upstream_data.get('service_cidrs'))
         service_ip_profile = normalize_service_ip_profile(upstream_data.get('service_ip_profile'))
+        selected_services = normalize_selected_services(upstream_data.get('selected_services'))
         imported_obfuscation = {}
         interface_cfg, peer_cfg = self.parse_amnezia_config_text(import_config_text)
         endpoint_value = peer_cfg.get("Endpoint", "")
@@ -4083,6 +4130,7 @@ class AmneziaManager:
             "routing_mode": routing_mode,
             "service_cidrs": service_cidrs,
             "service_ip_profile": service_ip_profile,
+            "selected_services": selected_services,
             "split_ru_local": routing_mode == 'ru_split',
             "mtu": mtu,
             "awg_version": protocol_version(imported_obfuscation),
@@ -4132,6 +4180,20 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
     def _selective_routing(self):
         return SelectiveRouting(self.execute_command, os.path.join(CONFIG_DIR, 'routing'))
 
+    def _domain_proxy(self):
+        return DomainProxy(self.execute_command, os.path.join(CONFIG_DIR, 'routing'))
+
+    def _configure_domain_proxy(self, server, force_restart=False):
+        upstream = server['upstream']
+        mark = int(upstream.get('fwmark') or upstream['table_id'])
+        interface = upstream['interface']
+        rule = f'-m mark --mark {mark} -o {interface} -j MASQUERADE'
+        self._routing_command(f'iptables -t nat -C POSTROUTING {rule} 2>/dev/null || iptables -t nat -A POSTROUTING {rule}')
+        if force_restart:
+            self._domain_proxy().restart(server)
+        else:
+            self._domain_proxy().configure(server)
+
     def _other_upstream_table_owners(self, server):
         table = (server.get('upstream') or {}).get('table_id')
         return [other for other in self.config.get('servers', [])
@@ -4146,9 +4208,15 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
                    for line in output.splitlines())
 
     def configure_wireguard_local_routing(self, server):
-        selective = normalize_routing_policy(server['upstream']) == 'ai_tiktok'
+        policy = normalize_routing_policy(server['upstream'])
+        selective = policy in ('ai_tiktok', 'selected_services')
         self.cleanup_upstream_routing(server, preserve_classifier=selective)
-        if selective:
+        if policy == 'selected_services':
+            if server.get('routing_state') != 'local':
+                self._domain_proxy().restart(server)
+            else:
+                self._domain_proxy().configure(server)
+        elif selective:
             # Continue learning DNS answers during fail-open, so recovery can
             # route cached destinations without requiring client reconnection.
             self._selective_routing().configure(server)
@@ -4158,7 +4226,7 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         upstream = server['upstream']
         table = int(upstream['table_id'])
         priority = 10000 + table
-        if normalize_routing_policy(upstream) == 'ai_tiktok':
+        if normalize_routing_policy(upstream) in ('ai_tiktok', 'selected_services'):
             mark = int(upstream.get('fwmark') or table)
             match = f'fwmark {mark}'
             pattern = f'fwmark {hex(mark)} .*lookup {table}( |$)'
@@ -4178,6 +4246,8 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         self._install_awg_policy_rule(server)
         if normalize_routing_policy(upstream) == 'ai_tiktok':
             self._selective_routing().configure(server)
+        elif normalize_routing_policy(upstream) == 'selected_services':
+            self._configure_domain_proxy(server)
         else:
             gateway, device = self.get_default_route_info()
             self._install_vless_ru_split_routes(table, gateway, device, normalize_routing_policy(upstream) == 'ru_split')
@@ -4213,6 +4283,9 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
 
         if normalize_routing_policy(upstream) == 'ai_tiktok':
             self._selective_routing().configure(server)
+        elif normalize_routing_policy(upstream) == 'selected_services':
+            self._configure_domain_proxy(server, force_restart=(
+                server.get('routing_state') == 'local' or bool(server.get('_upstream_unhealthy'))))
 
         if default_device:
             if gateway:
@@ -4362,6 +4435,11 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         other_owners = self._other_upstream_table_owners(server)
         if normalize_routing_policy(upstream) == 'ai_tiktok' and not preserve_classifier and not other_owners:
             self._selective_routing().cleanup(server)
+        if normalize_routing_policy(upstream) == 'selected_services':
+            if not preserve_classifier and not other_owners:
+                self._domain_proxy().cleanup(server)
+            mark = int(upstream.get('fwmark') or table_id)
+            self.execute_command(f"iptables -t nat -D POSTROUTING -m mark --mark {mark} -o {upstream['interface']} -j MASQUERADE 2>/dev/null || true")
         fwmark = int(upstream.get('fwmark') or table_id)
         self.execute_command(f"ip -4 rule del fwmark {fwmark} table {table_id} priority {10000 + table_id} 2>/dev/null || true")
         if server_subnet:
@@ -4455,6 +4533,7 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         routing_mode = normalize_routing_policy(policy_data)
         service_cidrs = normalize_service_cidrs(upstream_data.get('service_cidrs', previous.get('service_cidrs')))
         service_ip_profile = normalize_service_ip_profile(upstream_data.get('service_ip_profile', previous.get('service_ip_profile')))
+        selected_services = normalize_selected_services(upstream_data.get('selected_services', previous.get('selected_services')))
         failover_mode = str(upstream_data.get('failover_mode', server.get('linked_failover_mode') or 'fail_close')).strip().lower()
         if failover_mode not in ('fail_close', 'fail_open'):
             raise ValueError('upstream.failover_mode must be fail_close or fail_open')
@@ -4494,6 +4573,7 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         upstream['routing_mode'] = routing_mode
         upstream['service_cidrs'] = service_cidrs
         upstream['service_ip_profile'] = service_ip_profile
+        upstream['selected_services'] = selected_services
         upstream['split_ru_local'] = routing_mode == 'ru_split'
         upstream_network = ipaddress.ip_interface(upstream['local_address']).network
         for other in self.config['servers']:
@@ -4550,6 +4630,9 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         if running and self.execute_command(f"if iptables -C FORWARD {guard} 2>/dev/null; then printf blocked; fi") == 'blocked':
             raise ValueError('A previous tunnel change needs recovery; stop and start this server before editing its tunnel')
         guarded = False
+        input_guarded = False
+        protect_input = any(normalize_routing_policy(value) == 'selected_services'
+                            for value in (old_upstream, new_upstream) if value)
         old_routes_touched = old_nat_touched = new_routes_touched = new_nat_touched = False
         touched_files = set()
         try:
@@ -4559,6 +4642,10 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
                 if self.execute_command(f'iptables -I FORWARD 1 {guard}') is None:
                     raise RuntimeError('Could not protect traffic during the tunnel change')
                 guarded = True
+                if protect_input:
+                    if self.execute_command(f'iptables -I INPUT 1 {guard}') is None:
+                        raise RuntimeError('Could not protect transparent traffic during the tunnel change')
+                    input_guarded = True
             if old_upstream and (running or old_upstream_running):
                 old_routes_touched = True
                 if not self.stop_upstream_link(old):
@@ -4587,6 +4674,10 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
                     os.unlink(path)
             touched_files.add(CONFIG_FILE)
             self.save_config()
+            if input_guarded:
+                if self.execute_command(f'iptables -D INPUT {guard}') is None:
+                    raise RuntimeError('Could not release the transparent traffic guard')
+                input_guarded = False
             if guarded:
                 if self.execute_command(f'iptables -D FORWARD {guard}') is None:
                     raise RuntimeError('Could not release the traffic guard')
@@ -4595,6 +4686,19 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
         except Exception as original:
             print(f"Upstream transaction failed for {server['id']}: {original}")
             rollback_errors = []
+            # A final guard deletion can fail after its companion was removed.
+            # Re-arm both paths before rollback tears down transparent routing.
+            if running and protect_input:
+                for chain in ('FORWARD', 'INPUT'):
+                    if self.execute_command(f'iptables -C {chain} {guard} 2>/dev/null || iptables -I {chain} 1 {guard}') is None:
+                        rollback_errors.append(f'protecting {chain} during rollback')
+                    elif chain == 'FORWARD':
+                        guarded = True
+                    else:
+                        input_guarded = True
+                if rollback_errors:
+                    if self.execute_command(f"/usr/bin/awg-quick down {server['interface']}") is None:
+                        raise RuntimeError('Tunnel recovery could not protect traffic; stop this server before retrying') from original
 
             def attempt(label, action):
                 try:
@@ -4632,6 +4736,8 @@ PersistentKeepalive = {upstream.get('persistent_keepalive', 25)}
                     old['interface'], old['subnet'], old.get('egress_interface', 'eth+')))
             # If restoration itself fails, retain the guard rather than allowing
             # private traffic onto an unintended path. The API reports this state.
+            if input_guarded and not rollback_errors:
+                attempt('releasing transparent traffic guard', lambda: self.execute_command(f'iptables -D INPUT {guard}') is not None)
             if guarded and not rollback_errors:
                 attempt('releasing traffic guard', lambda: self.execute_command(f'iptables -D FORWARD {guard}') is not None)
             if rollback_errors:
@@ -4984,6 +5090,10 @@ MTU = {mtu}
                 return False
             self.execute_command(
                 f"iptables -D FORWARD -i {server['interface']} "
+                "-m comment --comment awg-upstream-change -j DROP 2>/dev/null || true"
+            )
+            self.execute_command(
+                f"iptables -D INPUT -i {server['interface']} "
                 "-m comment --comment awg-upstream-change -j DROP 2>/dev/null || true"
             )
         except Exception as error:
@@ -5485,11 +5595,20 @@ PersistentKeepalive = {keepalive}
             return False
 
         entry_started = False
+        start_guarded = False
+        guard = f"-i {server['interface']} -m comment --comment awg-upstream-change -j DROP"
         try:
             mode = server.get("mode", "standalone")
             egress_interface = server.get("egress_interface", "eth+")
             failover_mode = server.get("linked_failover_mode", "fail_close")
 
+            if mode == 'edge_linked' and normalize_routing_policy(server['upstream']) == 'selected_services':
+                if self.is_interface_running(server['interface']):
+                    # An API retry must not guard an already working entry.
+                    return self.execute_command(f'if iptables -C FORWARD {guard} 2>/dev/null; then printf blocked; fi') != 'blocked'
+                for chain in ('FORWARD', 'INPUT'):
+                    self._routing_command(f'iptables -C {chain} {guard} 2>/dev/null || iptables -I {chain} 1 {guard}')
+                    start_guarded = True
             # Use awg-quick to bring up the interface
             result = self.execute_command(f"/usr/bin/awg-quick up {server['interface']}")
             if result is not None:
@@ -5520,6 +5639,10 @@ PersistentKeepalive = {keepalive}
                 if not iptables_success:
                     raise RuntimeError('Could not install forwarding rules')
 
+                if start_guarded:
+                    for chain in ('INPUT', 'FORWARD'):
+                        self._routing_command(f'iptables -D {chain} {guard}')
+                    start_guarded = False
                 server['status'] = 'running'
                 self.save_config()
 
@@ -5541,6 +5664,9 @@ PersistentKeepalive = {keepalive}
         except Exception as e:
             print(f"Failed to start server {server_id}: {e}")
             if entry_started:
+                if start_guarded or normalize_routing_policy(server.get('upstream') or {}) == 'selected_services':
+                    for chain in ('FORWARD', 'INPUT'):
+                        self.execute_command(f'iptables -C {chain} {guard} 2>/dev/null || iptables -I {chain} 1 {guard}')
                 # A failed policy install must not leave a newly started entry
                 # forwarding without its intended tunnel restrictions.
                 self.execute_command(f"iptables -I FORWARD 1 -i {server['interface']} -m comment --comment awg-upstream-change -j DROP")
@@ -5550,7 +5676,9 @@ PersistentKeepalive = {keepalive}
                     if self._server_has_linked_upstream(server):
                         self.stop_upstream_link(server)
                     if not self.is_interface_running(server['interface']):
-                        self.execute_command(f"iptables -D FORWARD -i {server['interface']} -m comment --comment awg-upstream-change -j DROP 2>/dev/null || true")
+                        self.execute_command(f'iptables -D FORWARD {guard} 2>/dev/null || true')
+                        for chain in ('INPUT', 'FORWARD'):
+                            self.execute_command(f'while iptables -D {chain} {guard} 2>/dev/null; do :; done')
                     server['status'] = 'stopped'
                     self.save_config()
                 except Exception as cleanup_error:
@@ -5569,6 +5697,10 @@ PersistentKeepalive = {keepalive}
             mode = server.get("mode", "standalone")
             egress_interface = server.get("egress_interface", "eth+")
 
+            if mode == 'edge_linked' and normalize_routing_policy(server['upstream']) == 'selected_services':
+                guard = f"-i {server['interface']} -m comment --comment awg-upstream-change -j DROP"
+                for chain in ('FORWARD', 'INPUT'):
+                    self._routing_command(f'iptables -C {chain} {guard} 2>/dev/null || iptables -I {chain} 1 {guard}')
             # Cleanup iptables rules first
             iptables_cleaned = self.cleanup_iptables(server['interface'], server['subnet'], egress_interface)
             if mode == "edge_linked":
@@ -5580,6 +5712,10 @@ PersistentKeepalive = {keepalive}
                 # Clear a retained recovery guard only after the entry is down.
                 self.execute_command(
                     f"while iptables -D FORWARD -i {server['interface']} "
+                    "-m comment --comment awg-upstream-change -j DROP 2>/dev/null; do :; done"
+                )
+                self.execute_command(
+                    f"while iptables -D INPUT -i {server['interface']} "
                     "-m comment --comment awg-upstream-change -j DROP 2>/dev/null; do :; done"
                 )
                 server['status'] = 'stopped'

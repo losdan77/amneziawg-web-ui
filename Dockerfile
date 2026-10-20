@@ -1,4 +1,18 @@
 FROM teddysun/xray:26.3.27 AS xray_tools
+FROM golang:1.26.8-alpine AS domain_router
+# sing-box 1.14.3, pinned source plus durable FakeIP metadata fix.
+ARG SING_BOX_COMMIT=7054cac5124465ffdb145870d7c01885566711b1
+RUN apk add --no-cache git python3
+WORKDIR /src/sing-box
+RUN git init && git remote add origin https://github.com/SagerNet/sing-box.git \
+    && git fetch --depth 1 origin "$SING_BOX_COMMIT" && git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "$SING_BOX_COMMIT" \
+    && go mod download && go mod verify
+COPY scripts/patch_sing_box_fakeip.py /tmp/patch_sing_box_fakeip.py
+RUN python3 /tmp/patch_sing_box_fakeip.py /src/sing-box \
+    && CGO_ENABLED=0 go build -trimpath -tags with_quic \
+       -ldflags '-X github.com/sagernet/sing-box/constant.Version=1.14.3-awg-domain1' \
+       -o /usr/bin/sing-box ./cmd/sing-box
 FROM golang:1.25-alpine AS awg_builder
 # Official AWG 3.0 release v3.0.20260805; pin the commit as tags can move.
 ARG AWG_GO_COMMIT=08d68cdae27762c3e07f36bbb12d2bad32f81926
@@ -31,10 +45,12 @@ RUN chmod +x /usr/bin/awg-quick \
 
 # Used by the Web UI to run `xray x25519` when creating VLESS REALITY servers (must match xray service image tag).
 COPY --from=xray_tools /usr/bin/xray /usr/bin/xray
+COPY --from=domain_router /usr/bin/sing-box /usr/bin/sing-box
 
 # Install dependencies for web UI
 RUN apk update && apk add \
     bash \
+    ca-certificates \
     iproute2 \
     iproute2-tc \
     iptables \
