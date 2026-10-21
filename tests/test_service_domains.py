@@ -71,6 +71,28 @@ class ServiceDomainTests(unittest.TestCase):
                 self.assertTrue(domains.selected_domain_matches({'selected_services': ['tiktok']}, host))
         self.assertFalse(domains.selected_domain_matches({}, 'random.ibyteimg.com'))
 
+    def test_strava_is_opt_in_and_does_not_capture_shared_cdn_neighbors(self):
+        upstream = {'selected_services': ['strava']}
+        self.assertEqual(domains.normalize_selected_services(['strava', 'strava']), ['strava'])
+        for host in ('strava.com', 'www.strava.com', 'api.strava.com',
+                     'web-assets.strava.com', 'd21y75miwcfqoq.cloudfront.net',
+                     'd3nn82uaxijpm6.cloudfront.net'):
+            with self.subTest(host=host):
+                self.assertTrue(domains.selected_domain_matches(upstream, host))
+                self.assertFalse(domains.selected_domain_matches({}, host))
+                self.assertFalse(domains.selected_domain_matches({'selected_services': []}, host))
+        for host in ('notstrava.com', 'strava.com.evil.test',
+                     'sub.d21y75miwcfqoq.cloudfront.net',
+                     'd21y75miwcfqoq.cloudfront.net.evil.test',
+                     'other.cloudfront.net', 'youtube.com', 'video.googlevideo.com',
+                     'accounts.google.com', 'chatgpt.com'):
+            with self.subTest(host=host):
+                self.assertFalse(domains.selected_domain_matches(upstream, host))
+        rules = domains.selected_domain_rules(upstream)
+        self.assertIn('domain:strava.com', rules)
+        self.assertIn('full:d21y75miwcfqoq.cloudfront.net', rules)
+        self.assertNotIn('domain:cloudfront.net', rules)
+
     def test_exact_hosts_suffix_boundaries_and_regex_are_preserved(self):
         self.assertTrue(domains.selected_domain_matches({}, 'chatgpt-async-webps-prod-east-1.webpubsub.azure.com'))
         self.assertFalse(domains.selected_domain_matches({}, 'chatgpt-async-webps-prod-east-1.webpubsub.azure.com.evil.test'))

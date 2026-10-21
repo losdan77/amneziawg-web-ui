@@ -1,6 +1,7 @@
 # Service routing data
 
-The four `.txt` files are unmodified source lists from
+The `openai.txt`, `anthropic.txt`, `tiktok.txt` and `youtube.txt` files are
+unmodified source lists from
 [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community),
 commit `275abb3bfb908a7883f1e839a62424e6cd8cd184`, retrieved on 2026-10-20.
 They are distributed under the MIT license reproduced in `LICENSE`.
@@ -9,6 +10,15 @@ They are distributed under the MIT license reproduced in `LICENSE`.
 - [Anthropic](https://github.com/v2fly/domain-list-community/blob/275abb3bfb908a7883f1e839a62424e6cd8cd184/data/anthropic)
 - [TikTok](https://github.com/v2fly/domain-list-community/blob/275abb3bfb908a7883f1e839a62424e6cd8cd184/data/tiktok)
 - [YouTube](https://github.com/v2fly/domain-list-community/blob/275abb3bfb908a7883f1e839a62424e6cd8cd184/data/youtube)
+
+`strava.txt` is a locally maintained list reviewed on 2026-10-21. It covers
+`strava.com` and its subdomains (including the API documented by
+[Strava](https://developers.strava.com/docs/reference/)), plus the exact asset
+hosts `d21y75miwcfqoq.cloudfront.net` and `d3nn82uaxijpm6.cloudfront.net`
+referenced by the [official Strava homepage](https://www.strava.com/).
+These are hostname rules, not provider IP ranges or a `cloudfront.net` wildcard.
+Shared Google/Apple sign-in and unrelated third-party domains remain local.
+Strava is opt-in; missing saved selections retain the original four services.
 
 `service_domains.py` preserves suffix, exact-host and regex semantics. It omits
 entries marked `@ads` and the distinct OpenAI-category products `sora.com` and

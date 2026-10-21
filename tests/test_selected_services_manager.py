@@ -37,8 +37,10 @@ class SelectedServiceManagementTests(unittest.TestCase):
                 upstream_before = copy.deepcopy(server['upstream'])
                 content = Path(upstream_before['config_path']).read_bytes()
                 self.manager.update_server_upstream(server['id'], {
-                    'selected_services': ['claude', 'tiktok', 'claude']})
-                self.assertEqual(server['upstream']['selected_services'], ['claude', 'tiktok'])
+                    'selected_services': ['claude', 'tiktok', 'strava', 'claude']})
+                self.assertEqual(server['upstream']['selected_services'], ['claude', 'tiktok', 'strava'])
+                reloaded = self.manager.load_config()
+                self.assertEqual(reloaded['servers'][0]['upstream']['selected_services'], ['claude', 'tiktok', 'strava'])
                 for key in ('private_key', 'public_key', 'preshared_key', 'table_id', 'fwmark', 'interface'):
                     self.assertEqual(server['upstream'].get(key), upstream_before.get(key))
                 self.assertEqual({key: server.get(key) for key in original_keys}, original_keys)
@@ -57,14 +59,14 @@ class SelectedServiceManagementTests(unittest.TestCase):
                 self.assertTrue(any(c.startswith('iptables -D INPUT ') for c in self.commands))
 
     def test_new_linked_server_persists_default_and_explicit_empty_selection(self):
-        for services in (None, []):
+        for services in (None, [], ['strava']):
             with self.subTest(services=services):
                 self.setUp()
                 data = {'import_config': self.imported_config(), 'routing_mode': 'selected_services'}
                 if services is not None:
                     data['selected_services'] = services
                 server = self.server(mode='edge_linked', upstream=data)
-                expected = list(DEFAULT_SELECTED_SERVICES) if services is None else []
+                expected = list(DEFAULT_SELECTED_SERVICES) if services is None else services
                 self.assertEqual(server['upstream']['selected_services'], expected)
                 self.assertEqual(json.loads(Path(manager_module.CONFIG_FILE).read_text())['servers'][0]['upstream']['selected_services'], expected)
 

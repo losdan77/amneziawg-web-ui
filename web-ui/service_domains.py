@@ -15,12 +15,15 @@ DATA_PATH = Path(__file__).resolve().parent / 'data' / 'service_domains'
 CATALOG_REVISION = '275abb3bfb908a7883f1e839a62424e6cd8cd184'
 CATALOG_DATE = '2026-10-20'
 DEFAULT_SELECTED_SERVICES = ('chatgpt', 'codex', 'claude', 'tiktok')
-SELECTABLE_SERVICE_IDS = DEFAULT_SELECTED_SERVICES
+# Keep missing selections backward compatible when adding opt-in services.
+SELECTABLE_SERVICE_IDS = (*DEFAULT_SELECTED_SERVICES, 'strava')
 SERVICE_LABELS = {
     'chatgpt': 'ChatGPT', 'codex': 'Codex', 'claude': 'Claude', 'tiktok': 'TikTok',
+    'strava': 'Strava',
 }
 _SERVICE_GROUPS = {
     'chatgpt': 'openai', 'codex': 'openai', 'claude': 'anthropic', 'tiktok': 'tiktok',
+    'strava': 'strava',
 }
 _RULE_KINDS = ('domain_suffix', 'domain', 'domain_regex')
 _DOMAIN_LABEL = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z')
@@ -46,7 +49,7 @@ def normalize_selected_services(value):
     result = []
     for service in value:
         if not isinstance(service, str) or service not in _SERVICE_GROUPS:
-            raise ValueError('Unknown selected service; use chatgpt, codex, claude or tiktok')
+            raise ValueError('Unknown selected service; use ' + ', '.join(SELECTABLE_SERVICE_IDS))
         if service not in result:
             result.append(service)
     return result
@@ -91,9 +94,9 @@ def _parse_geosite(text):
     return tuple(tuple(rules[kind]) for kind in _RULE_KINDS)
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=5)
 def _catalog(group):
-    if group not in ('openai', 'anthropic', 'tiktok', 'youtube'):
+    if group not in ('openai', 'anthropic', 'tiktok', 'strava', 'youtube'):
         raise ValueError('Unknown bundled service catalog')
     result = _parse_geosite((DATA_PATH / (group + '.txt')).read_text(encoding='utf-8'))
     if group == 'openai':

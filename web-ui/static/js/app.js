@@ -491,14 +491,15 @@ class AmneziaApp {
     }
 
     getServiceChoices() {
-        return { chatgpt: 'ChatGPT', codex: 'Codex', claude: 'Claude', tiktok: 'TikTok' };
+        return { chatgpt: 'ChatGPT', codex: 'Codex', claude: 'Claude', tiktok: 'TikTok', strava: 'Strava' };
     }
 
     getSelectedServices(upstream = {}) {
         const ids = Object.keys(this.getServiceChoices());
+        // New optional services must not expand existing configurations.
         return Array.isArray(upstream.selected_services)
             ? ids.filter(id => upstream.selected_services.includes(id))
-            : ids;
+            : ['chatgpt', 'codex', 'claude', 'tiktok'];
     }
 
     readSelectedServices(prefix) {

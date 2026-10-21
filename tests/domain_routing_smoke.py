@@ -169,7 +169,7 @@ def exercise(directory, names, version, cache_phase=None):
                      'table_id': 210, 'fwmark': 210, 'service_cidrs': [],
                      'config_path': str(Path(directory) / 'awg-out.conf'),
                      'routing_mode': 'selected_services',
-                     'selected_services': ['chatgpt', 'codex', 'claude', 'tiktok']},
+                     'selected_services': ['chatgpt', 'codex', 'claude', 'tiktok', 'strava']},
     }
     manager.config['servers'] = [server]
     proxy = manager._domain_proxy()
@@ -208,6 +208,9 @@ def exercise(directory, names, version, cache_phase=None):
             for hostname, expected in (
                 ('chatgpt.com', 'remote'), ('api.openai.com', 'remote'),
                 ('claude.ai', 'remote'), ('www.tiktok.com', 'remote'),
+                ('www.strava.com', 'remote'), ('web-assets.strava.com', 'remote'),
+                ('d21y75miwcfqoq.cloudfront.net', 'remote'),
+                ('other.cloudfront.net', 'direct'),
                 ('www.youtube.com', 'direct'), ('r1.video.googlevideo.com', 'direct'),
                 ('ordinary.example', 'direct'),
             ):
@@ -226,6 +229,10 @@ def exercise(directory, names, version, cache_phase=None):
         # FakeIP association can select the correct exit.
         for protocol in ('http', 'tls', 'opaque', 'udp'):
             lab.request('client-a', fake, 'chatgpt.com', 'remote', protocol)
+        strava_fake = lab.query('client-a', 'www.strava.com')['addresses'][0]
+        assert ipaddress.ip_address(strava_fake) in ipaddress.ip_network(FAKE_POOL)
+        for protocol in ('opaque', 'udp'):
+            lab.request('client-a', strava_fake, 'unused', 'remote', protocol)
         lab.request('client-a', SHARED_IP, 'unused', 'direct', 'udp')
         print(f'AWG{version}: UDP/TCP DNS, FakeIP opaque TCP/UDP and IPv6/hint filtering verified', flush=True)
 
@@ -249,7 +256,8 @@ def exercise(directory, names, version, cache_phase=None):
         server['upstream']['selected_services'] = ['claude']
         assert manager.configure_upstream_routing(server) is not False
         for hostname, expected in (('claude.ai', 'remote'), ('chatgpt.com', 'direct'),
-                                   ('www.tiktok.com', 'direct'), ('www.youtube.com', 'direct')):
+                                   ('www.tiktok.com', 'direct'), ('www.strava.com', 'direct'),
+                                   ('www.youtube.com', 'direct')):
             lab.request('client-a', SHARED_IP, hostname, expected, 'tls')
         lab.request('client-a', fake, 'unused', 'direct', 'opaque')
         server['upstream']['selected_services'] = []
@@ -257,7 +265,7 @@ def exercise(directory, names, version, cache_phase=None):
         lab.request('client-a', SHARED_IP, 'claude.ai', 'direct', 'tls')
         lab.request('client-a', fake, 'unused', 'direct', 'opaque')
         assert lab.query('client-a', 'chatgpt.com')['addresses'] == [SHARED_IP]
-        server['upstream']['selected_services'] = ['chatgpt', 'codex', 'claude', 'tiktok']
+        server['upstream']['selected_services'] = ['chatgpt', 'codex', 'claude', 'tiktok', 'strava']
         assert manager.configure_upstream_routing(server) is not False
         lab.request('client-a', fake, 'unused', 'remote', 'opaque')
         print(f'AWG{version}: service selection, empty selection and cached FakeIP changes verified', flush=True)

@@ -1,0 +1,5 @@
+# Service-owned domain and exact CDN hosts referenced by https://www.strava.com/.
+# Reviewed 2026-10-21; see SOURCES.md. Never include all of cloudfront.net.
+strava.com
+full:d21y75miwcfqoq.cloudfront.net
+full:d3nn82uaxijpm6.cloudfront.net

@@ -90,6 +90,9 @@ async function run() {
     assert.equal(app.getUpstreamRoutingMode({ routing_mode: 'selected_services', split_ru_local: true }), 'selected_services');
     assert.equal(app.getUpstreamRoutingLabel({ routing_mode: 'selected_services' }), 'ChatGPT, Codex, Claude, TikTok through the tunnel by domain; YouTube and other traffic locally');
     assert.equal(app.getUpstreamRoutingLabel({ routing_mode: 'selected_services', selected_services: [] }), 'No services selected; all traffic locally');
+    assert.equal(app.getServiceChoices().strava, 'Strava');
+    assert.deepEqual(Array.from(app.getSelectedServices({})), ['chatgpt', 'codex', 'claude', 'tiktok'], 'optional services do not expand missing-field defaults');
+    assert.equal(app.getUpstreamRoutingLabel({ routing_mode: 'selected_services', selected_services: ['strava'] }), 'Strava through the tunnel by domain; YouTube and other traffic locally');
     assert.equal(app.getUpstreamRoutingLabel({ routing_mode: 'selected_services', selected_services: ['claude', '<script>', 'claude'] }), 'Claude through the tunnel by domain; YouTube and other traffic locally');
 
     const serversList = makeElement('serversList');
@@ -235,6 +238,7 @@ async function run() {
     assert.equal(elements.get('tunnelService_tiktok').checked, true);
     assert.equal(elements.get('tunnelService_chatgpt').checked, false);
     assert.equal(elements.get('tunnelService_codex').checked, false);
+    assert.equal(elements.get('tunnelService_strava').checked, false, 'existing selections do not opt in to Strava');
     elements.get('tunnelRoutingMode').value = 'ai_tiktok';
     elements.get('tunnelRoutingMode').listeners.get('change')();
     assert.equal(elements.get('tunnelSelectedServicesGroup').classList.contains('hidden'), true);
@@ -257,14 +261,31 @@ async function run() {
     await app.saveUpstreamTunnel();
     assert.deepEqual(JSON.parse(requests.at(-1).body), { routing_mode: 'selected_services', failover_mode: 'fail_open', selected_services: ['claude'] }, 'hidden invalid CIDRs do not affect domain mode');
     open({ ...domainSelected, upstream: { ...domainSelected.upstream, selected_services: [] } });
-    for (const id of ['chatgpt', 'codex', 'claude', 'tiktok']) assert.equal(elements.get(`tunnelService_${id}`).checked, false, 'saved empty selection must stay empty');
+    for (const id of ['chatgpt', 'codex', 'claude', 'tiktok', 'strava']) assert.equal(elements.get(`tunnelService_${id}`).checked, false, 'saved empty selection must stay empty');
     await app.saveUpstreamTunnel();
     assert.deepEqual(JSON.parse(requests.at(-1).body).selected_services, [], 'explicitly empty selection is sent to the API');
     open({ ...domainSelected, upstream: { routing_mode: 'selected_services' } });
     for (const id of ['chatgpt', 'codex', 'claude', 'tiktok']) assert.equal(elements.get(`tunnelService_${id}`).checked, true, 'missing selection defaults to all four');
+    assert.equal(elements.get('tunnelService_strava').checked, false, 'missing selection leaves Strava disabled');
     elements.get('tunnelRoutingMode').value = 'all';
     await app.saveUpstreamTunnel();
     assert.ok(!Object.hasOwn(JSON.parse(requests.at(-1).body), 'selected_services'), 'other modes preserve stored choices on the backend');
+
+    const stravaSelected = { ...domainSelected, upstream: { ...domainSelected.upstream, selected_services: ['strava'] } };
+    open(stravaSelected);
+    assert.equal(elements.get('tunnelService_strava').checked, true, 'saved Strava choice is restored');
+    for (const id of ['chatgpt', 'codex', 'claude', 'tiktok']) assert.equal(elements.get(`tunnelService_${id}`).checked, false, 'Strava can be selected independently');
+    elements.get('tunnelRoutingMode').value = 'ai_tiktok';
+    elements.get('tunnelRoutingMode').listeners.get('change')();
+    elements.get('tunnelRoutingMode').value = 'selected_services';
+    elements.get('tunnelRoutingMode').listeners.get('change')();
+    assert.equal(elements.get('tunnelService_strava').checked, true, 'switching modes preserves the optional service choice');
+    await app.saveUpstreamTunnel();
+    assert.deepEqual(JSON.parse(requests.at(-1).body), { routing_mode: 'selected_services', failover_mode: 'fail_open', selected_services: ['strava'] });
+    open(stravaSelected);
+    elements.get('tunnelService_strava').checked = false;
+    await app.saveUpstreamTunnel();
+    assert.deepEqual(JSON.parse(requests.at(-1).body).selected_services, [], 'Strava can be explicitly deselected');
 
     open(selective);
     elements.get('tunnelServiceCidrs').value = '0.0.0.0/0';
@@ -316,6 +337,7 @@ async function run() {
     };
     const domainText = app.formatUpstreamDiagnostics(domainDiagnostic);
     assert.match(domainText, /Selected services: Claude/);
+    assert.match(app.formatUpstreamDiagnostics({ ...domainDiagnostic, selected_services: ['strava'] }), /Selected services: Strava/);
     assert.match(domainText, /Domain router running: yes; capture rules installed: yes/);
     assert.match(domainText, /selected domain rule: yes/);
     assert.match(domainText, /Predicted route: upstream/);
@@ -446,6 +468,10 @@ async function run() {
     assert.ok(!Object.hasOwn(JSON.parse(requests.at(-1).body).upstream, 'service_ip_profile'), 'creation only sends coverage for the selective mode');
     const template = fs.readFileSync(path.join(__dirname, '../web-ui/templates/index.html'), 'utf8');
     assert.match(template, /option value="selected_services"/);
+    const stravaCheckbox = template.match(/<input\b[^>]*id="upstreamService_strava"[^>]*>/)?.[0];
+    assert.ok(stravaCheckbox, 'creation form offers Strava');
+    assert.doesNotMatch(stravaCheckbox, /\bchecked\b/, 'creation leaves Strava disabled by default');
+    makeElement('upstreamService_strava').checked = false;
     for (const id of ['chatgpt', 'codex', 'claude', 'tiktok']) {
         assert.match(template, new RegExp(`id="upstreamService_${id}" type="checkbox" checked`), 'creation defaults all four choices on');
         makeElement(`upstreamService_${id}`).checked = true;
@@ -461,6 +487,14 @@ async function run() {
         assert.ok(!Object.hasOwn(payload.upstream, 'service_ip_profile'), 'domain mode does not submit hidden provider coverage');
     }
     for (const id of ['chatgpt', 'codex', 'claude', 'tiktok']) elements.get(`upstreamService_${id}`).checked = false;
+    elements.get('upstreamService_strava').checked = true;
+    for (const protocol of ['wireguard', 'vless']) {
+        elements.get('serverProtocol').value = protocol;
+        app.createServer();
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(JSON.parse(requests.at(-1).body).upstream.selected_services, ['strava'], 'creation submits optional Strava for AWG and VLESS');
+    }
+    elements.get('upstreamService_strava').checked = false;
     app.createServer();
     await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(JSON.parse(requests.at(-1).body).upstream.selected_services, []);
